@@ -26,6 +26,11 @@ import {
   mergeProductCosts,
   EVENT_PRODUCT_COSTS_UPDATED,
 } from '../utils/productCostsService';
+import {
+  detectSearchCategoryIntent,
+  filterCatalogProducts,
+  normalizeSearchText,
+} from '../data/productCatalog';
 
 export interface ProductGroup {
   id: string;
@@ -932,22 +937,37 @@ export const ProdutosScreen: React.FC<ProdutosScreenProps> = ({ currentUserName 
         (!p.groupId || p.groupId === '' || p.groupId === 'sem_grupo')
     );
 
-    const matchingGroups = catGroups.filter((g) => {
-      if (!searchTerm) return true;
-      const term = searchTerm.toLowerCase();
-      const groupMatches = g.name.toLowerCase().includes(term);
-      const groupProducts = products.filter((p) => p.groupId === g.id);
-      const productMatches = groupProducts.some((p) =>
-        p.name.toLowerCase().includes(term)
-      );
-      return groupMatches || productMatches;
+    const trimmedQuery = searchTerm.trim();
+    const normQuery = normalizeSearchText(trimmedQuery);
+    const intent = detectSearchCategoryIntent(trimmedQuery);
+
+    const enrichProduct = (p: GroupProductItem, fallbackGroupName?: string) => ({
+      ...p,
+      category: cat.name,
+      groupName: fallbackGroupName || p.groupName,
     });
 
-    const matchingSemGrupoProducts = catSemGrupoProducts.filter((p) => {
-      if (!searchTerm) return true;
-      const term = searchTerm.toLowerCase();
-      return p.name.toLowerCase().includes(term) || 'sem grupo'.includes(term);
+    const matchingGroups = catGroups.filter((g) => {
+      if (!trimmedQuery) return true;
+      const groupProducts = products
+        .filter((p) => p.groupId === g.id)
+        .map((p) => enrichProduct(p, g.name));
+      const matchedProds = filterCatalogProducts(groupProducts, trimmedQuery);
+      if (matchedProds.length > 0) return true;
+
+      // Se a busca não exige categoria específica, permite casar diretamente pelo nome do grupo/marca
+      if (!intent && normalizeSearchText(g.name).includes(normQuery)) {
+        return true;
+      }
+      return false;
     });
+
+    const matchingSemGrupoProducts = !trimmedQuery
+      ? catSemGrupoProducts
+      : filterCatalogProducts(
+          catSemGrupoProducts.map((p) => enrichProduct(p)),
+          trimmedQuery
+        );
 
     return {
       ...cat,
@@ -1235,7 +1255,23 @@ export const ProdutosScreen: React.FC<ProdutosScreenProps> = ({ currentUserName 
                       {cat.groups.map((group) => {
                         const contrast = getContrastStyles(group.color);
                         const isExpanded = !!expandedGroups[group.id];
-                        const groupProducts = products.filter((p) => p.groupId === group.id);
+                        const rawGroupProducts = products.filter((p) => p.groupId === group.id);
+                        const trimmedSearch = searchTerm.trim();
+                        const groupNameMatchesOnly =
+                          trimmedSearch &&
+                          !detectSearchCategoryIntent(trimmedSearch) &&
+                          normalizeSearchText(group.name).includes(normalizeSearchText(trimmedSearch));
+                        const groupProducts =
+                          !trimmedSearch || groupNameMatchesOnly
+                            ? rawGroupProducts
+                            : filterCatalogProducts(
+                                rawGroupProducts.map((p) => ({
+                                  ...p,
+                                  category: cat.name,
+                                  groupName: group.name,
+                                })),
+                                trimmedSearch
+                              );
 
                         return (
                           <div

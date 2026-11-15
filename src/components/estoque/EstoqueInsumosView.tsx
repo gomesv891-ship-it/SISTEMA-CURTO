@@ -373,7 +373,7 @@ export function EstoqueInsumosView({ currentUserName }: EstoqueInsumosViewProps)
             className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold shadow-xs transition-all flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>+ Entrada de Insumo</span>
+            <span>Entrada de Insumo</span>
           </button>
           <button
             type="button"
@@ -381,7 +381,7 @@ export function EstoqueInsumosView({ currentUserName }: EstoqueInsumosViewProps)
             className="px-3.5 py-2 bg-rose-700 hover:bg-rose-800 text-white rounded-xl text-xs font-bold shadow-xs transition-all flex items-center gap-1.5 cursor-pointer"
           >
             <Minus className="w-3.5 h-3.5" />
-            <span>- Registrar Consumo</span>
+            <span>Registrar Consumo</span>
           </button>
           <button
             type="button"
@@ -389,7 +389,7 @@ export function EstoqueInsumosView({ currentUserName }: EstoqueInsumosViewProps)
             className="px-3.5 py-2 bg-[#0B2046] hover:bg-[#123366] text-white rounded-xl text-xs font-bold shadow-xs transition-all flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>+ Novo Insumo</span>
+            <span>Novo Insumo</span>
           </button>
         </div>
       </div>

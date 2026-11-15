@@ -19,6 +19,8 @@ export interface EspelhoItem {
   unidade: string;
   precoUnitario: number;
   total: number;
+  requestedMl?: number;
+  barLengthMeters?: number;
 }
 
 export interface EspelhoOrcamentoProps {
@@ -76,17 +78,10 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
 
   const hasFrete = freteValor > 0;
 
-  // REGRA OFICIAL: No espelho do orçamento, NÃO exibir a porcentagem (mesmo que informada em %).
-  // Exibir somente o valor correspondente em R$ + a mensagem de desconto correspondente.
-  const rawDescontoTexto =
+  const displayDescontoTexto =
     descontoTexto && descontoTexto.trim().length > 0
       ? descontoTexto.trim()
-      : 'DESCONTO ESPECIAL APLICADO:';
-  const displayDescontoTexto =
-    rawDescontoTexto
-      .replace(/\s*\(\s*\d+(?:[.,]\d+)?\s*%\s*\)/gi, '')
-      .replace(/\s*\d+(?:[.,]\d+)?\s*%/gi, '')
-      .trim() || 'DESCONTO ESPECIAL APLICADO:';
+      : 'DESCONTO PARA PAGAMENTO VIA PIX';
 
   return (
     <div
@@ -319,19 +314,31 @@ export const EspelhoOrcamento: React.FC<EspelhoOrcamentoProps> = ({
 
                     {/* DESCRIÇÃO DO PRODUTO + Subtítulo / Detalhe */}
                     <td className="py-2.5 px-4 text-left border-r border-[#e2eef7]">
-                      <div className="text-slate-900 font-normal leading-tight">
-                        {item.descricao}
-                      </div>
-                      {item.subtitulo && (
-                        <div className="text-[10.5px] font-medium text-slate-500 uppercase tracking-wide mt-0.5 whitespace-pre-line">
-                          {item.subtitulo}
-                        </div>
-                      )}
-                      {!item.subtitulo?.includes(item.qtdDetalhe || '') && item.qtdDetalhe && (
-                        <div className="text-[10.5px] font-bold text-slate-600 uppercase tracking-wide mt-0.5">
-                          {item.qtdDetalhe}
-                        </div>
-                      )}
+                      {(() => {
+                        const isRodapeItem = isRodapeProduct(item.descricao);
+                        const visibleSubtitulo = isRodapeItem
+                          ? stripRodapeAutoDetail(item.subtitulo)
+                          : item.subtitulo;
+                        return (
+                          <>
+                            <div className="text-slate-900 font-normal leading-tight">
+                              {item.descricao}
+                            </div>
+                            {visibleSubtitulo && (
+                              <div className="text-[10.5px] font-medium text-slate-500 uppercase tracking-wide mt-0.5 whitespace-pre-line">
+                                {visibleSubtitulo}
+                              </div>
+                            )}
+                            {!isRodapeItem &&
+                              !visibleSubtitulo?.includes(item.qtdDetalhe || '') &&
+                              item.qtdDetalhe && (
+                                <div className="text-[10.5px] font-bold text-slate-600 uppercase tracking-wide mt-0.5">
+                                  {item.qtdDetalhe}
+                                </div>
+                              )}
+                          </>
+                        );
+                      })()}
                     </td>
 
                     {/* UNID. */}

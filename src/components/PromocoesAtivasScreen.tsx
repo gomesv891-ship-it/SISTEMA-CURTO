@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Plus,
   Search,
@@ -33,18 +33,24 @@ import {
   PromoCampaignStatus,
   PromoCategory,
   PromoFloorLot,
+  PromoLotGroup,
   PromoModality,
   PromoOfferItem,
   PromoProgressiveTier,
   PromoSheetModel,
   PromoSheetSettings,
   PromoSubcategory,
+  buildDefaultLotGroupsForCampaign,
   canManagePromocoes,
   computeLotMetrics,
   createEmptyConditionsByModality,
   createEmptyOffersByModality,
   createEmptyTierQuantitiesByModality,
+  createLotGroupInSupabase,
+  createLotInSupabase,
   deleteCampaignFromSupabase,
+  deleteLotGroupInSupabase,
+  deleteLotInSupabase,
   duplicateCampaignInSupabase,
   fetchPromocoesFromSupabase,
   formatCurrencyBRL,
@@ -52,9 +58,11 @@ import {
   formatSqmBR,
   getDefaultSheetSettings,
   getTodayIsoDate,
+  initializeLotGroupsInSupabase,
   parseNumberFlexible,
   parsePromocoesPayload,
   saveCampaignToSupabase,
+  updateLotGroupInSupabase,
   updateLotStockInSupabase,
 } from '../utils/promocoesService';
 import { PromocaoFolhaDivulgacao } from './PromocaoFolhaDivulgacao';
@@ -199,13 +207,27 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     revenda: false,
   });
 
-  // Aba 3: Modal Editar Lote no Controle Administrativo
-  const [adminEditingLot, setAdminEditingLot] = useState<PromoFloorLot | null>(null);
+  // Aba 3: Controle Administrativo organizado por Grupos de Lotes
+  const [adminLotSearch, setAdminLotSearch] = useState('');
+  const [isCreatingGroupInline, setIsCreatingGroupInline] = useState(false);
+  const [newGroupName, setNewGroupName] = useState('');
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [editingGroupName, setEditingGroupName] = useState('');
+  const [groupToDelete, setGroupToDelete] = useState<{
+    group: PromoLotGroup;
+    productCount: number;
+  } | null>(null);
+
+  const [adminEditingLotId, setAdminEditingLotId] = useState<string | null>(null);
+  const [adminCreatingGroupId, setAdminCreatingGroupId] = useState<string | null>(null);
+  const [adminLotGroupId, setAdminLotGroupId] = useState<string>('');
   const [adminLotDesc, setAdminLotDesc] = useState('');
   const [adminLotSqmPerBox, setAdminLotSqmPerBox] = useState('');
   const [adminLotInitialBoxes, setAdminLotInitialBoxes] = useState('');
   const [adminLotSoldBoxes, setAdminLotSoldBoxes] = useState('');
   const [adminLotError, setAdminLotError] = useState<string | null>(null);
+  const [adminLotToDelete, setAdminLotToDelete] = useState<PromoFloorLot | null>(null);
+  const initializedGroupCampaignsRef = useRef<Set<string>>(new Set());
 
   const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
     setToast({ text, type });
@@ -277,6 +299,134 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       setConditionDraft('');
     }
   }, [selectedCampaign, activeModality]);
+
+  // Inicialização idempotente dos grupos padrão de lotes no Supabase quando a campanha ainda não possui lotGroups
+  useEffect(() => {
+    if (activeTab !== 'controle' || !selectedCampaign) return;
+    if (Array.isArray(selectedCampaign.lotGroups)) return;
+    if (initializedGroupCampaignsRef.current.has(selectedCampaign.id)) return;
+
+    initializedGroupCampaignsRef.current.add(selectedCampaign.id);
+    initializeLotGroupsInSupabase({
+      campaignId: selectedCampaign.id,
+      updatedBy: currentUserName,
+    }).then((res) => {
+      if (res.success) {
+        setCampaigns(res.campaigns);
+      }
+    });
+  }, [activeTab, selectedCampaign, currentUserName]);
+
+  const adminOrgData = useMemo(() => {
+    if (!selectedCampaign) {
+      return { groups: [] as PromoLotGroup[], lots: [] as PromoFloorLot[] };
+    }
+    if (Array.isArray(selectedCampaign.lotGroups)) {
+      return {
+        groups: [...selectedCampaign.lotGroups].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+        lots: selectedCampaign.lots || [],
+      };
+    }
+    const fallback = buildDefaultLotGroupsForCampaign(selectedCampaign);
+    return {
+      groups: [...fallback.lotGroups].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+      lots: fallback.lots,
+    };
+  }, [selectedCampaign]);
+
+  const adminGroupedView = useMemo(() => {
+    const normalizeText = (s: string) =>
+      (s || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim();
+
+    const query = normalizeText(adminLotSearch);
+    const groupIds = new Set(adminOrgData.groups.map((g) => g.id));
+
+    const sortLotsAsc = (list: PromoFloorLot[]) =>
+      [...list].sort((a, b) => {
+        const diff = (Number(a.sqmPerBox) || 0) - (Number(b.sqmPerBox) || 0);
+        if (diff !== 0) return diff;
+        return (a.description || '').localeCompare(b.description || '', 'pt-BR', {
+          sensitivity: 'base',
+        });
+      });
+
+    const sections: {
+      group: PromoLotGroup;
+      isSyntheticUngrouped: boolean;
+      lots: PromoFloorLot[];
+      allLotsCount: number;
+      matchedByGroupName: boolean;
+    }[] = adminOrgData.groups.map((grp) => {
+      const groupLots = sortLotsAsc(adminOrgData.lots.filter((l) => l.lotGroupId === grp.id));
+      return {
+        group: grp,
+        isSyntheticUngrouped: false,
+        lots: groupLots,
+        allLotsCount: groupLots.length,
+        matchedByGroupName: false,
+      };
+    });
+
+    const ungroupedLots = sortLotsAsc(
+      adminOrgData.lots.filter((l) => !l.lotGroupId || !groupIds.has(l.lotGroupId))
+    );
+    if (ungroupedLots.length > 0) {
+      sections.push({
+        group: {
+          id: '__ungrouped__',
+          name: 'OUTROS PRODUTOS / SEM LOTE',
+          order: 99999,
+        },
+        isSyntheticUngrouped: true,
+        lots: ungroupedLots,
+        allLotsCount: ungroupedLots.length,
+        matchedByGroupName: false,
+      });
+    }
+
+    if (!query) {
+      return {
+        sections,
+        isFiltering: false,
+        totalMatches: adminOrgData.lots.length,
+      };
+    }
+
+    const filteredSections = sections
+      .map((sec) => {
+        const groupMatches = normalizeText(sec.group.name).includes(query);
+        if (groupMatches) {
+          return {
+            ...sec,
+            matchedByGroupName: true,
+          };
+        }
+        const matchingLots = sec.lots.filter(
+          (l) =>
+            normalizeText(l.description).includes(query) ||
+            normalizeText(l.pattern || '').includes(query) ||
+            normalizeText(l.thickness || '').includes(query)
+        );
+        if (matchingLots.length === 0) return null;
+        return {
+          ...sec,
+          lots: matchingLots,
+          matchedByGroupName: false,
+        };
+      })
+      .filter((s): s is NonNullable<typeof s> => s !== null);
+
+    const totalMatches = filteredSections.reduce((sum, s) => sum + s.lots.length, 0);
+    return {
+      sections: filteredSections,
+      isFiltering: true,
+      totalMatches,
+    };
+  }, [adminOrgData, adminLotSearch]);
 
   const activeModalityOffers = useMemo(() => {
     if (!selectedCampaign) return [];
@@ -1313,28 +1463,152 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
   };
 
   // =========================================================================
-  // 4. CONTROLE ADMINISTRATIVO DE LOTES (Exclusivo Piso Vinílico)
+  // 4. CONTROLE ADMINISTRATIVO POR GRUPOS DE LOTES (Supabase)
   // =========================================================================
-  const openAdminEditLotModal = (lot: PromoFloorLot) => {
-    setAdminEditingLot(lot);
+  const cancelGroupForms = () => {
+    setIsCreatingGroupInline(false);
+    setNewGroupName('');
+    setEditingGroupId(null);
+    setEditingGroupName('');
+  };
+
+  const openCreateLotGroupForm = () => {
+    setEditingGroupId(null);
+    setEditingGroupName('');
+    setAdminLotError(null);
+    setIsCreatingGroupInline(true);
+    setNewGroupName('');
+  };
+
+  const handleCreateLotGroup = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!selectedCampaign) return;
+    const name = newGroupName.trim();
+    if (!name) {
+      setAdminLotError('Informe o nome do novo lote.');
+      return;
+    }
+
+    setIsSaving(true);
+    const res = await createLotGroupInSupabase({
+      campaignId: selectedCampaign.id,
+      name,
+      createdBy: currentUserName,
+    });
+    setIsSaving(false);
+
+    if (!res.success) {
+      setAdminLotError(res.error || 'Erro ao criar lote no Supabase.');
+      return;
+    }
+
+    setCampaigns(res.campaigns);
+    setIsCreatingGroupInline(false);
+    setNewGroupName('');
+    setAdminLotError(null);
+    showToast(`Lote "${name}" criado com sucesso!`);
+  };
+
+  const openEditLotGroup = (group: PromoLotGroup) => {
+    setIsCreatingGroupInline(false);
+    setAdminLotError(null);
+    setEditingGroupId(group.id);
+    setEditingGroupName(group.name);
+  };
+
+  const handleSaveEditLotGroup = async (groupId: string) => {
+    if (!selectedCampaign) return;
+    const name = editingGroupName.trim();
+    if (!name) {
+      setAdminLotError('Informe o nome do lote.');
+      return;
+    }
+
+    setIsSaving(true);
+    const res = await updateLotGroupInSupabase({
+      campaignId: selectedCampaign.id,
+      groupId,
+      name,
+      updatedBy: currentUserName,
+    });
+    setIsSaving(false);
+
+    if (!res.success) {
+      setAdminLotError(res.error || 'Erro ao renomear lote no Supabase.');
+      return;
+    }
+
+    setCampaigns(res.campaigns);
+    setEditingGroupId(null);
+    setEditingGroupName('');
+    setAdminLotError(null);
+    showToast('Nome do lote atualizado!');
+  };
+
+  const handleConfirmDeleteLotGroup = async () => {
+    if (!selectedCampaign || !groupToDelete) return;
+    setIsSaving(true);
+    const res = await deleteLotGroupInSupabase({
+      campaignId: selectedCampaign.id,
+      groupId: groupToDelete.group.id,
+      deletedBy: currentUserName,
+    });
+    setIsSaving(false);
+
+    if (!res.success) {
+      showToast(res.error || 'Erro ao excluir lote.', 'error');
+      return;
+    }
+
+    setCampaigns(res.campaigns);
+    if (adminCreatingGroupId === groupToDelete.group.id) {
+      setAdminCreatingGroupId(null);
+    }
+    if (editingGroupId === groupToDelete.group.id) {
+      setEditingGroupId(null);
+    }
+    setGroupToDelete(null);
+    showToast('Lote excluído. Histórico de vendas preservado.');
+  };
+
+  const openInlineNewLot = (groupId: string) => {
+    setAdminEditingLotId(null);
+    setAdminCreatingGroupId(groupId);
+    setAdminLotGroupId(groupId);
+    setAdminLotDesc('');
+    setAdminLotSqmPerBox('2,50');
+    setAdminLotInitialBoxes('0');
+    setAdminLotSoldBoxes('0');
+    setAdminLotError(null);
+  };
+
+  const openInlineEditLot = (lot: PromoFloorLot) => {
+    setAdminCreatingGroupId(null);
+    setAdminEditingLotId(lot.id);
+    setAdminLotGroupId(lot.lotGroupId || '');
     setAdminLotDesc(lot.description);
-    setAdminLotSqmPerBox(String(lot.sqmPerBox));
+    setAdminLotSqmPerBox(String(lot.sqmPerBox).replace('.', ','));
     setAdminLotInitialBoxes(String(lot.initialBoxes));
     setAdminLotSoldBoxes(String(lot.soldBoxes));
     setAdminLotError(null);
   };
 
-  const handleSaveAdminLot = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedCampaign || !adminEditingLot) return;
+  const cancelInlineLotForm = () => {
+    setAdminCreatingGroupId(null);
+    setAdminEditingLotId(null);
+    setAdminLotGroupId('');
+    setAdminLotError(null);
+  };
 
+  const handleSaveInlineNewLot = async () => {
+    if (!selectedCampaign || !adminCreatingGroupId) return;
     const desc = adminLotDesc.trim();
     const sqm = parseNumberFlexible(adminLotSqmPerBox);
     const initialBoxes = Math.max(0, Math.floor(parseNumberFlexible(adminLotInitialBoxes)));
     const soldBoxes = Math.max(0, Math.floor(parseNumberFlexible(adminLotSoldBoxes)));
 
     if (!desc) {
-      setAdminLotError('Informe o nome do produto / lote.');
+      setAdminLotError('Informe o nome do produto.');
       return;
     }
     if (sqm <= 0) {
@@ -1343,7 +1617,53 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     }
     if (soldBoxes > initialBoxes) {
       setAdminLotError(
-        `A quantidade vendida (${soldBoxes}) não pode ser maior que a quantidade inicial (${initialBoxes}).`
+        `A quantidade vendida (${soldBoxes}) não pode ultrapassar a quantidade inicial (${initialBoxes}).`
+      );
+      return;
+    }
+
+    setIsSaving(true);
+    const res = await createLotInSupabase({
+      campaignId: selectedCampaign.id,
+      lotGroupId: adminCreatingGroupId === '__ungrouped__' ? undefined : adminCreatingGroupId,
+      description: desc,
+      sqmPerBox: sqm,
+      initialBoxes,
+      soldBoxes,
+      createdBy: currentUserName,
+    });
+    setIsSaving(false);
+
+    if (!res.success) {
+      setAdminLotError(res.error || 'Erro ao cadastrar produto no Supabase.');
+      return;
+    }
+
+    setCampaigns(res.campaigns);
+    setAdminCreatingGroupId(null);
+    setAdminLotGroupId('');
+    setAdminLotError(null);
+    showToast('Produto cadastrado no lote!');
+  };
+
+  const handleSaveInlineEditLot = async (lotId: string) => {
+    if (!selectedCampaign) return;
+    const desc = adminLotDesc.trim();
+    const sqm = parseNumberFlexible(adminLotSqmPerBox);
+    const initialBoxes = Math.max(0, Math.floor(parseNumberFlexible(adminLotInitialBoxes)));
+    const soldBoxes = Math.max(0, Math.floor(parseNumberFlexible(adminLotSoldBoxes)));
+
+    if (!desc) {
+      setAdminLotError('Informe o nome do produto.');
+      return;
+    }
+    if (sqm <= 0) {
+      setAdminLotError('Informe m² / Caixa maior que zero.');
+      return;
+    }
+    if (soldBoxes > initialBoxes) {
+      setAdminLotError(
+        `A quantidade vendida (${soldBoxes}) não pode ultrapassar a quantidade inicial (${initialBoxes}).`
       );
       return;
     }
@@ -1351,7 +1671,8 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     setIsSaving(true);
     const res = await updateLotStockInSupabase({
       campaignId: selectedCampaign.id,
-      lotId: adminEditingLot.id,
+      lotId,
+      lotGroupId: adminLotGroupId || undefined,
       description: desc,
       sqmPerBox: sqm,
       initialBoxes,
@@ -1361,13 +1682,38 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     setIsSaving(false);
 
     if (!res.success) {
-      setAdminLotError(res.error || 'Erro ao atualizar lote no Supabase.');
+      setAdminLotError(res.error || 'Erro ao atualizar produto no Supabase.');
       return;
     }
 
     setCampaigns(res.campaigns);
-    setAdminEditingLot(null);
-    showToast('Estoque do lote atualizado!');
+    setAdminEditingLotId(null);
+    setAdminLotGroupId('');
+    setAdminLotError(null);
+    showToast('Produto atualizado com sucesso!');
+  };
+
+  const handleConfirmDeleteLot = async () => {
+    if (!selectedCampaign || !adminLotToDelete) return;
+    setIsSaving(true);
+    const res = await deleteLotInSupabase({
+      campaignId: selectedCampaign.id,
+      lotId: adminLotToDelete.id,
+      deletedBy: currentUserName,
+    });
+    setIsSaving(false);
+
+    if (!res.success) {
+      showToast(res.error || 'Erro ao excluir produto.', 'error');
+      return;
+    }
+
+    setCampaigns(res.campaigns);
+    if (adminEditingLotId === adminLotToDelete.id) {
+      setAdminEditingLotId(null);
+    }
+    setAdminLotToDelete(null);
+    showToast('Produto excluído. Histórico de vendas preservado.');
   };
 
   // Acesso restrito
@@ -1398,7 +1744,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       : null;
 
   return (
-    <div className="w-full max-w-[1440px] mx-auto px-3 sm:px-6 lg:px-8 pt-5 pb-12 space-y-5">
+    <div className="w-full max-w-[1760px] mx-auto px-3 sm:px-6 lg:px-8 pt-5 pb-12 space-y-5">
       {/* Toast Notification */}
       {toast && (
         <div
@@ -1490,7 +1836,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
               className="h-10 px-4 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs sm:text-sm font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <Plus className="w-4 h-4 stroke-[2.5]" />
-              <span>+ Nova Campanha</span>
+              <span>Nova Campanha</span>
             </button>
 
             {selectedCampaign && (
@@ -1574,7 +1920,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
             Nenhuma campanha cadastrada no sistema
           </h3>
           <p className="text-xs sm:text-sm text-slate-500 max-w-md mx-auto">
-            Clique em <strong>+ Nova Campanha</strong> para criar sua primeira campanha promocional
+            Clique em <strong>Nova Campanha</strong> para criar sua primeira campanha promocional
             com tabelas para Revenda, Construtora e Cliente Final.
           </p>
           <button
@@ -1583,7 +1929,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
             className="px-4 py-2.5 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs sm:text-sm font-bold inline-flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            <span>+ Nova Campanha</span>
+            <span>Nova Campanha</span>
           </button>
         </div>
       ) : (
@@ -1629,7 +1975,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
               {/* Layout em 2 colunas: Coluna lateral de Categorias + Área principal da categoria */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
                 {/* Coluna Lateral: As 5 Categorias Oficiais */}
-                <aside className="lg:col-span-3 bg-white rounded-2xl border border-slate-200 p-3 space-y-1">
+                <aside className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-3 space-y-1">
                   <div className="px-3 py-1.5 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
                     Categorias
                   </div>
@@ -1665,7 +2011,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                 </aside>
 
                 {/* Área Principal: Tabela da Categoria Selecionada */}
-                <div className="lg:col-span-9 space-y-4 min-w-0">
+                <div className="lg:col-span-10 space-y-4 min-w-0">
                   <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
                     {/* Cabeçalho da Categoria Selecionada */}
                     <div className="px-4 sm:px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -2210,102 +2556,659 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
           )}
 
           {/* =============================================================== */}
-          {/* ABA 3: CONTROLE ADMINISTRATIVO (EXTREMAMENTE SIMPLES)           */}
+          {/* ABA 3: CONTROLE ADMINISTRATIVO POR GRUPOS DE LOTES              */}
           {/* =============================================================== */}
           {activeTab === 'controle' && (
-            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
-              {/* Topo: Título Controle Administrativo + Seletor da Campanha */}
-              <div className="px-4 sm:px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <h2 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
-                  Controle Administrativo
-                </h2>
+            <div className="space-y-4">
+              {/* Cabeçalho + Seletor de Campanha + Barra de Busca + Botão Novo Lote */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:px-6 sm:py-4 space-y-3.5">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
+                      Controle Administrativo
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      Gerencie grupos de lotes e produtos ordenados automaticamente do menor para o maior m² por caixa. Saldos atualizados em tempo real.
+                    </p>
+                  </div>
 
-                <div className="flex items-center gap-2">
-                  <label
-                    htmlFor="admin-campaign-selector"
-                    className="text-xs font-bold text-slate-500 whitespace-nowrap"
-                  >
-                    Campanha:
-                  </label>
-                  <select
-                    id="admin-campaign-selector"
-                    value={selectedCampaign.id}
-                    onChange={(e) => setSelectedCampaignId(e.target.value)}
-                    className="h-9 px-3 rounded-xl border border-slate-200 bg-slate-50 text-xs sm:text-sm font-bold text-[#0B2046] outline-none focus:border-[#0052cc] cursor-pointer max-w-xs"
-                  >
-                    {campaigns.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label
+                      htmlFor="admin-campaign-selector"
+                      className="text-xs font-bold text-slate-500 whitespace-nowrap"
+                    >
+                      Campanha:
+                    </label>
+                    <select
+                      id="admin-campaign-selector"
+                      value={selectedCampaign.id}
+                      onChange={(e) => {
+                        setSelectedCampaignId(e.target.value);
+                        cancelInlineLotForm();
+                        cancelGroupForms();
+                        setAdminLotSearch('');
+                      }}
+                      className="h-9 px-3 rounded-xl border border-slate-200 bg-slate-50 text-xs sm:text-sm font-bold text-[#0B2046] outline-none focus:border-[#0052cc] cursor-pointer max-w-xs"
+                    >
+                      {campaigns.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <button
+                      type="button"
+                      onClick={openCreateLotGroupForm}
+                      className="h-9 px-3.5 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <FolderPlus className="w-4 h-4" />
+                      <span>Novo Lote</span>
+                    </button>
+                  </div>
                 </div>
+
+                {/* Barra de Busca (Produto ou Lote) */}
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 pt-1">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={adminLotSearch}
+                      onChange={(e) => setAdminLotSearch(e.target.value)}
+                      placeholder="Buscar por nome do produto ou do lote..."
+                      className="w-full h-10 pl-10 pr-9 rounded-xl border border-slate-200 bg-slate-50/70 focus:bg-white text-xs sm:text-sm font-medium text-[#0B2046] placeholder:text-slate-400 outline-none focus:border-[#0052cc]"
+                    />
+                    {adminLotSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setAdminLotSearch('')}
+                        title="Limpar busca"
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full hover:bg-slate-200 flex items-center justify-center text-slate-500 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {adminGroupedView.isFiltering && (
+                    <div className="flex items-center gap-2 text-xs text-slate-600 whitespace-nowrap">
+                      <span>
+                        <strong className="text-[#0B2046]">{adminGroupedView.totalMatches}</strong>{' '}
+                        {adminGroupedView.totalMatches === 1 ? 'produto encontrado' : 'produtos encontrados'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setAdminLotSearch('')}
+                        className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-bold text-[#0052cc] cursor-pointer"
+                      >
+                        Limpar busca
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Formulário inline para criar Novo Grupo de Lote */}
+                {isCreatingGroupInline && (
+                  <form
+                    onSubmit={handleCreateLotGroup}
+                    className="p-3.5 rounded-xl bg-blue-50/70 border border-blue-200 flex flex-col sm:flex-row sm:items-center gap-2.5"
+                  >
+                    <div className="flex-1">
+                      <label className="block text-[11px] font-bold text-[#0B2046] uppercase tracking-wider mb-1">
+                        Nome do Novo Grupo de Lote
+                      </label>
+                      <input
+                        type="text"
+                        value={newGroupName}
+                        onChange={(e) => {
+                          setNewGroupName(e.target.value);
+                          setAdminLotError(null);
+                        }}
+                        placeholder="Ex: TARKETT AMBIENTA"
+                        className="w-full h-9 px-3 rounded-lg border border-blue-300 bg-white text-xs sm:text-sm font-bold text-[#0B2046] outline-none focus:border-[#0052cc]"
+                        autoFocus
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 sm:self-end">
+                      <button
+                        type="submit"
+                        disabled={isSaving}
+                        className="h-9 px-4 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Criar Lote</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={cancelGroupForms}
+                        className="h-9 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 text-xs font-bold cursor-pointer"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {adminLotError && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700 flex items-center justify-between gap-2">
+                    <span>{adminLotError}</span>
+                    <button
+                      type="button"
+                      onClick={() => setAdminLotError(null)}
+                      className="text-rose-500 hover:text-rose-700 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* Tabela exclusiva de lotes de Piso Vinílico */}
-              {selectedCampaign.lots.length === 0 ? (
-                <div className="p-10 text-center text-xs sm:text-sm text-slate-500">
-                  Nenhum lote de Piso Vinílico cadastrado nesta campanha.
+              {/* Lista de Grupos de Lotes (Todos abertos por padrão, um abaixo do outro) */}
+              {adminGroupedView.sections.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center space-y-3">
+                  {adminGroupedView.isFiltering ? (
+                    <>
+                      <p className="text-sm font-bold text-[#0B2046]">
+                        Nenhum produto ou lote encontrado para &ldquo;{adminLotSearch}&rdquo;.
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        Tente outro termo ou limpe a busca para visualizar todos os lotes.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setAdminLotSearch('')}
+                        className="px-4 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Limpar busca</span>
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs sm:text-sm text-slate-500">
+                        Nenhum lote cadastrado nesta campanha.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={openCreateLotGroupForm}
+                        className="px-4 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <FolderPlus className="w-4 h-4" />
+                        <span>Criar Primeiro Lote</span>
+                      </button>
+                    </>
+                  )}
                 </div>
               ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse tabular-nums">
-                    <thead>
-                      <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-600 uppercase tracking-wider">
-                        <th className="py-3 px-4">Produto / Lote</th>
-                        <th className="py-3 px-3 text-center whitespace-nowrap">m² / Caixa</th>
-                        <th className="py-3 px-3 text-center whitespace-nowrap">
-                          Inicial (Caixas)
-                        </th>
-                        <th className="py-3 px-3 text-center whitespace-nowrap">
-                          Vendido (Caixas)
-                        </th>
-                        <th className="py-3 px-3 text-center whitespace-nowrap">Saldo (Caixas)</th>
-                        <th className="py-3 px-3 text-center whitespace-nowrap">Saldo (m²)</th>
-                        <th className="py-3 px-4 text-right whitespace-nowrap">Editar</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
-                      {selectedCampaign.lots.map((lot) => {
-                        const metrics = computeLotMetrics(lot);
-                        return (
-                          <tr key={lot.id} className="hover:bg-slate-50/70">
-                            <td className="py-3 px-4 font-bold text-[#0B2046]">
-                              {lot.description}
-                            </td>
-                            <td className="py-3 px-3 text-center font-medium text-slate-700">
-                              {lot.sqmPerBox.toLocaleString('pt-BR', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              })}
-                            </td>
-                            <td className="py-3 px-3 text-center font-semibold text-slate-700">
-                              {metrics.initialBoxes}
-                            </td>
-                            <td className="py-3 px-3 text-center font-semibold text-slate-700">
-                              {metrics.soldBoxes}
-                            </td>
-                            <td className="py-3 px-3 text-center font-extrabold text-[#0B2046]">
-                              {metrics.availableBoxes}
-                            </td>
-                            <td className="py-3 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap">
-                              {formatSqmBR(metrics.availableSqm)}
-                            </td>
-                            <td className="py-3 px-4 text-right">
+                <div className="space-y-4">
+                  {adminGroupedView.sections.map((section) => {
+                    const { group, isSyntheticUngrouped, lots } = section;
+                    const isEditingThisGroup = editingGroupId === group.id;
+                    const isAddingProductHere = adminCreatingGroupId === group.id;
+
+                    const groupTotals = lots.reduce(
+                      (acc, lot) => {
+                        const m = computeLotMetrics(lot);
+                        return {
+                          availableBoxes: acc.availableBoxes + m.availableBoxes,
+                          availableSqm: Math.round((acc.availableSqm + m.availableSqm) * 100) / 100,
+                        };
+                      },
+                      { availableBoxes: 0, availableSqm: 0 }
+                    );
+
+                    return (
+                      <div
+                        key={group.id}
+                        className="bg-white rounded-2xl border border-slate-200 overflow-hidden"
+                      >
+                        {/* Cabeçalho do Grupo de Lote (sempre aberto) */}
+                        <div className="px-4 sm:px-6 py-3.5 bg-slate-50/90 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                          <div className="flex flex-wrap items-center gap-2.5 min-w-0">
+                            {isEditingThisGroup ? (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <input
+                                  type="text"
+                                  value={editingGroupName}
+                                  onChange={(e) => {
+                                    setEditingGroupName(e.target.value);
+                                    setAdminLotError(null);
+                                  }}
+                                  className="h-8 px-3 rounded-lg border border-blue-300 bg-white text-xs sm:text-sm font-extrabold text-[#0B2046] outline-none focus:border-[#0052cc]"
+                                  autoFocus
+                                />
+                                <button
+                                  type="button"
+                                  disabled={isSaving}
+                                  onClick={() => handleSaveEditLotGroup(group.id)}
+                                  className="h-8 px-2.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  <span>Salvar</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingGroupId(null);
+                                    setEditingGroupName('');
+                                  }}
+                                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 text-xs font-bold cursor-pointer"
+                                >
+                                  Cancelar
+                                </button>
+                              </div>
+                            ) : (
+                              <>
+                                <h3 className="text-sm sm:text-base font-extrabold text-[#0B2046] tracking-wide uppercase">
+                                  {group.name}
+                                </h3>
+                                <span className="px-2 py-0.5 rounded-md bg-blue-50 border border-blue-100 text-[11px] font-bold text-[#0052cc] whitespace-nowrap">
+                                  {lots.length} {lots.length === 1 ? 'produto' : 'produtos'}
+                                </span>
+                                <span className="text-xs font-semibold text-slate-600 whitespace-nowrap tabular-nums">
+                                  Saldo do lote: <strong className="text-[#0B2046]">{groupTotals.availableBoxes} cx</strong>{' '}
+                                  ({formatSqmBR(groupTotals.availableSqm)})
+                                </span>
+                              </>
+                            )}
+                          </div>
+
+                          {!isSyntheticUngrouped && (
+                            <div className="flex flex-wrap items-center gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => openAdminEditLotModal(lot)}
-                                className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                                onClick={() => openInlineNewLot(group.id)}
+                                className="px-3 py-1.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
+                                <span>Adicionar Produto</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => openEditLotGroup(group)}
+                                title="Editar nome do lote"
+                                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[#0B2046] text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
                               >
                                 <Pencil className="w-3.5 h-3.5" />
-                                <span>Editar</span>
+                                <span>Editar Lote</span>
                               </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setGroupToDelete({
+                                    group,
+                                    productCount: section.allLotsCount,
+                                  })
+                                }
+                                title="Excluir lote"
+                                className="px-2.5 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Excluir Lote</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Tabela de Produtos deste Lote (ordenada por m²/caixa crescente) */}
+                        {lots.length === 0 && !isAddingProductHere ? (
+                          <div className="px-4 sm:px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+                            <span>Nenhum produto cadastrado neste lote.</span>
+                            {!isSyntheticUngrouped && (
+                              <button
+                                type="button"
+                                onClick={() => openInlineNewLot(group.id)}
+                                className="px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
+                                <span>Adicionar Primeiro Produto</span>
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left border-collapse tabular-nums">
+                              <thead>
+                                <tr className="border-b border-slate-200 bg-white text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                                  <th className="py-2.5 px-4">Produto</th>
+                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">m² / Caixa</th>
+                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
+                                    Inicial (Caixas)
+                                  </th>
+                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
+                                    Vendido (Caixas)
+                                  </th>
+                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
+                                    Saldo (Caixas)
+                                  </th>
+                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">Saldo (m²)</th>
+                                  <th className="py-2.5 px-4 text-right whitespace-nowrap">Ações</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                                {isAddingProductHere && (() => {
+                                  const sqmVal = parseNumberFlexible(adminLotSqmPerBox);
+                                  const initVal = Math.max(
+                                    0,
+                                    Math.floor(parseNumberFlexible(adminLotInitialBoxes))
+                                  );
+                                  const soldVal = Math.max(
+                                    0,
+                                    Math.floor(parseNumberFlexible(adminLotSoldBoxes))
+                                  );
+                                  const saldoCx = Math.max(0, initVal - soldVal);
+                                  const saldoSqm = Math.round(saldoCx * sqmVal * 100) / 100;
+                                  return (
+                                    <tr className="bg-blue-50/60">
+                                      <td className="py-2.5 px-4">
+                                        <input
+                                          type="text"
+                                          value={adminLotDesc}
+                                          onChange={(e) => {
+                                            setAdminLotDesc(e.target.value);
+                                            setAdminLotError(null);
+                                          }}
+                                          placeholder={`Novo produto em ${group.name}`}
+                                          className="w-full h-9 px-3 rounded-lg border border-blue-300 bg-white text-xs sm:text-sm font-bold text-[#0B2046] outline-none focus:border-[#0052cc]"
+                                          autoFocus
+                                        />
+                                      </td>
+                                      <td className="py-2.5 px-3 text-center">
+                                        <input
+                                          type="text"
+                                          value={adminLotSqmPerBox}
+                                          onChange={(e) => {
+                                            setAdminLotSqmPerBox(e.target.value);
+                                            setAdminLotError(null);
+                                          }}
+                                          placeholder="2,50"
+                                          className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                        />
+                                      </td>
+                                      <td className="py-2.5 px-3 text-center">
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          value={adminLotInitialBoxes}
+                                          onChange={(e) => {
+                                            setAdminLotInitialBoxes(e.target.value);
+                                            setAdminLotError(null);
+                                          }}
+                                          className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                        />
+                                      </td>
+                                      <td className="py-2.5 px-3 text-center">
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          value={adminLotSoldBoxes}
+                                          onChange={(e) => {
+                                            setAdminLotSoldBoxes(e.target.value);
+                                            setAdminLotError(null);
+                                          }}
+                                          className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                        />
+                                      </td>
+                                      <td className="py-2.5 px-3 text-center font-extrabold text-[#0B2046]">
+                                        {saldoCx}
+                                      </td>
+                                      <td className="py-2.5 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap">
+                                        {formatSqmBR(saldoSqm)}
+                                      </td>
+                                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                                        <div className="inline-flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            disabled={isSaving}
+                                            onClick={handleSaveInlineNewLot}
+                                            className="px-3 py-1.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                          >
+                                            <Check className="w-3.5 h-3.5" />
+                                            <span>Salvar</span>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={cancelInlineLotForm}
+                                            className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 text-xs font-bold cursor-pointer"
+                                          >
+                                            Cancelar
+                                          </button>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })()}
+
+                                {lots.map((lot) => {
+                                  const isInlineEditing = adminEditingLotId === lot.id;
+                                  if (isInlineEditing) {
+                                    const sqmVal = parseNumberFlexible(adminLotSqmPerBox);
+                                    const initVal = Math.max(
+                                      0,
+                                      Math.floor(parseNumberFlexible(adminLotInitialBoxes))
+                                    );
+                                    const soldVal = Math.max(
+                                      0,
+                                      Math.floor(parseNumberFlexible(adminLotSoldBoxes))
+                                    );
+                                    const saldoCx = Math.max(0, initVal - soldVal);
+                                    const saldoSqm = Math.round(saldoCx * sqmVal * 100) / 100;
+
+                                    return (
+                                      <tr key={lot.id} className="bg-amber-50/50">
+                                        <td className="py-2.5 px-4 space-y-1.5">
+                                          <input
+                                            type="text"
+                                            value={adminLotDesc}
+                                            onChange={(e) => {
+                                              setAdminLotDesc(e.target.value);
+                                              setAdminLotError(null);
+                                            }}
+                                            className="w-full h-9 px-3 rounded-lg border border-blue-300 bg-white text-xs sm:text-sm font-bold text-[#0B2046] outline-none focus:border-[#0052cc]"
+                                            autoFocus
+                                          />
+                                          {adminOrgData.groups.length > 0 && (
+                                            <div className="flex items-center gap-1.5">
+                                              <span className="text-[11px] font-bold text-slate-500">
+                                                Lote:
+                                              </span>
+                                              <select
+                                                value={adminLotGroupId}
+                                                onChange={(e) => setAdminLotGroupId(e.target.value)}
+                                                className="h-7 px-2 rounded-md border border-slate-200 bg-white text-[11px] font-bold text-[#0B2046] outline-none focus:border-[#0052cc] cursor-pointer"
+                                              >
+                                                <option value="">Sem lote definido</option>
+                                                {adminOrgData.groups.map((g) => (
+                                                  <option key={g.id} value={g.id}>
+                                                    {g.name}
+                                                  </option>
+                                                ))}
+                                              </select>
+                                            </div>
+                                          )}
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center">
+                                          <input
+                                            type="text"
+                                            value={adminLotSqmPerBox}
+                                            onChange={(e) => {
+                                              setAdminLotSqmPerBox(e.target.value);
+                                              setAdminLotError(null);
+                                            }}
+                                            className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                          />
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center">
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            value={adminLotInitialBoxes}
+                                            onChange={(e) => {
+                                              setAdminLotInitialBoxes(e.target.value);
+                                              setAdminLotError(null);
+                                            }}
+                                            className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                          />
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center">
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            value={adminLotSoldBoxes}
+                                            onChange={(e) => {
+                                              setAdminLotSoldBoxes(e.target.value);
+                                              setAdminLotError(null);
+                                            }}
+                                            className="w-24 mx-auto h-9 px-2.5 rounded-lg border border-blue-300 bg-white text-center text-xs sm:text-sm font-bold text-slate-800 outline-none focus:border-[#0052cc]"
+                                          />
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center font-extrabold text-[#0B2046]">
+                                          {saldoCx}
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap">
+                                          {formatSqmBR(saldoSqm)}
+                                        </td>
+                                        <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                                          <div className="inline-flex items-center gap-1.5">
+                                            <button
+                                              type="button"
+                                              disabled={isSaving}
+                                              onClick={() => handleSaveInlineEditLot(lot.id)}
+                                              className="px-3 py-1.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                            >
+                                              <Check className="w-3.5 h-3.5" />
+                                              <span>Salvar</span>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={cancelInlineLotForm}
+                                              className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 text-xs font-bold cursor-pointer"
+                                            >
+                                              Cancelar
+                                            </button>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    );
+                                  }
+
+                                  const metrics = computeLotMetrics(lot);
+                                  return (
+                                    <tr key={lot.id} className="hover:bg-slate-50/70">
+                                      <td className="py-3 px-4 font-bold text-[#0B2046]">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                          <span>{lot.description}</span>
+                                          {adminGroupedView.isFiltering && (
+                                            <span className="px-2 py-0.5 rounded bg-slate-100 text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+                                              Lote: {group.name}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </td>
+                                      <td className="py-3 px-3 text-center font-medium text-slate-700">
+                                        {lot.sqmPerBox.toLocaleString('pt-BR', {
+                                          minimumFractionDigits: 2,
+                                          maximumFractionDigits: 2,
+                                        })}
+                                      </td>
+                                      <td className="py-3 px-3 text-center font-semibold text-slate-700">
+                                        {metrics.initialBoxes}
+                                      </td>
+                                      <td className="py-3 px-3 text-center font-semibold text-slate-700">
+                                        {metrics.soldBoxes}
+                                      </td>
+                                      <td className="py-3 px-3 text-center font-extrabold text-[#0B2046]">
+                                        {metrics.availableBoxes}
+                                      </td>
+                                      <td className="py-3 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap">
+                                        {formatSqmBR(metrics.availableSqm)}
+                                      </td>
+                                      <td className="py-3 px-4 text-right whitespace-nowrap">
+                                        <div className="inline-flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => openInlineEditLot(lot)}
+                                            className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                                          >
+                                            <Pencil className="w-3.5 h-3.5" />
+                                            <span>Editar</span>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setAdminLotToDelete(lot)}
+                                            className="px-2.5 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                                            title="Excluir produto"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                            <span>Excluir</span>
+                                          </button>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Histórico de Vendas Preservado */}
+              {selectedCampaign.lotSales && selectedCampaign.lotSales.length > 0 && (
+                <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+                  <div className="px-4 sm:px-6 py-3.5 border-b border-slate-200 flex items-center justify-between gap-2">
+                    <h3 className="text-sm font-extrabold text-[#0B2046]">
+                      Histórico de Vendas de Lotes ({selectedCampaign.lotSales.length})
+                    </h3>
+                    <span className="text-[11px] font-semibold text-slate-500">
+                      Registros preservados mesmo após alterações ou exclusões de lotes
+                    </span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse tabular-nums text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-600 uppercase tracking-wider">
+                          <th className="py-2.5 px-4">Data</th>
+                          <th className="py-2.5 px-3">Produto / Lote</th>
+                          <th className="py-2.5 px-3">Público</th>
+                          <th className="py-2.5 px-3 text-center">Caixas</th>
+                          <th className="py-2.5 px-3 text-center">m²</th>
+                          <th className="py-2.5 px-4">Cliente / Responsável</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {selectedCampaign.lotSales.map((sale) => (
+                          <tr key={sale.id} className="hover:bg-slate-50/70">
+                            <td className="py-2.5 px-4 text-slate-600 whitespace-nowrap">
+                              {formatDateBR(sale.soldAt)}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-[#0B2046]">
+                              {sale.lotDescription}
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-600">
+                              {PROMO_MODALITIES.find((m) => m.id === sale.modality)?.shortLabel ||
+                                sale.modality}
+                            </td>
+                            <td className="py-2.5 px-3 text-center font-bold text-slate-800">
+                              {sale.boxesSold}
+                            </td>
+                            <td className="py-2.5 px-3 text-center font-semibold text-[#0052cc]">
+                              {formatSqmBR(sale.sqmSold)}
+                            </td>
+                            <td className="py-2.5 px-4 text-slate-600">
+                              {sale.customerName ? `${sale.customerName} · ` : ''}
+                              {sale.soldBy}
                             </td>
                           </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
             </div>
@@ -3338,124 +4241,108 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       )}
 
       {/* =================================================================== */}
-      {/* MODAL: EDITAR LOTE NO CONTROLE ADMINISTRATIVO                       */}
+      {/* MODAL: CONFIRMAÇÃO DE EXCLUSÃO DE PRODUTO (PRESERVANDO HISTÓRICO)   */}
       {/* =================================================================== */}
-      {adminEditingLot && selectedCampaign && (
+      {adminLotToDelete && selectedCampaign && (
         <div
           className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
-          onClick={() => setAdminEditingLot(null)}
+          onClick={() => setAdminLotToDelete(null)}
         >
           <div
-            className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4"
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <h3 className="text-base font-extrabold text-[#0B2046]">Editar Lote</h3>
-              <button
-                type="button"
-                onClick={() => setAdminEditingLot(null)}
-                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-base font-extrabold text-[#0B2046]">Excluir produto?</h3>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Tem certeza que deseja excluir o produto{' '}
+                  <strong className="text-[#0B2046]">{adminLotToDelete.description}</strong> deste
+                  lote?
+                </p>
+                <p className="text-xs text-slate-500">
+                  Os históricos de vendas vinculados a este produto serão preservados integralmente.
+                </p>
+              </div>
             </div>
 
-            {(() => {
-              const sqmVal = parseNumberFlexible(adminLotSqmPerBox);
-              const initVal = Math.max(0, Math.floor(parseNumberFlexible(adminLotInitialBoxes)));
-              const soldVal = Math.max(0, Math.floor(parseNumberFlexible(adminLotSoldBoxes)));
-              const saldoCx = Math.max(0, initVal - soldVal);
-              const saldoSqm = Math.round(saldoCx * sqmVal * 100) / 100;
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setAdminLotToDelete(null)}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={handleConfirmDeleteLot}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isSaving ? 'Excluindo...' : 'Confirmar Exclusão'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
-              return (
-                <form onSubmit={handleSaveAdminLot} className="space-y-3.5">
-                  <div>
-                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                      Produto / Lote *
-                    </label>
-                    <input
-                      type="text"
-                      value={adminLotDesc}
-                      onChange={(e) => setAdminLotDesc(e.target.value)}
-                      className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-semibold text-[#0B2046] outline-none focus:border-[#0052cc]"
-                    />
-                  </div>
+      {/* =================================================================== */}
+      {/* MODAL: CONFIRMAÇÃO DE EXCLUSÃO DE GRUPO DE LOTE (PRESERVA HISTÓRICO)*/}
+      {/* =================================================================== */}
+      {groupToDelete && selectedCampaign && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setGroupToDelete(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-base font-extrabold text-[#0B2046]">Excluir lote?</h3>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Tem certeza que deseja excluir o lote{' '}
+                  <strong className="text-[#0B2046]">{groupToDelete.group.name}</strong>
+                  {groupToDelete.productCount > 0
+                    ? ` e os ${groupToDelete.productCount} ${
+                        groupToDelete.productCount === 1 ? 'produto vinculado' : 'produtos vinculados'
+                      } a ele`
+                    : ''}
+                  ?
+                </p>
+                <p className="text-xs text-slate-500">
+                  Os históricos de vendas registrados anteriormente serão preservados integralmente.
+                </p>
+              </div>
+            </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                      m² / Caixa *
-                    </label>
-                    <input
-                      type="text"
-                      value={adminLotSqmPerBox}
-                      onChange={(e) => setAdminLotSqmPerBox(e.target.value)}
-                      className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums outline-none focus:border-[#0052cc]"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                        Inicial (Caixas) *
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        value={adminLotInitialBoxes}
-                        onChange={(e) => {
-                          setAdminLotInitialBoxes(e.target.value);
-                          setAdminLotError(null);
-                        }}
-                        className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums outline-none focus:border-[#0052cc]"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                        Vendido (Caixas) *
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        value={adminLotSoldBoxes}
-                        onChange={(e) => {
-                          setAdminLotSoldBoxes(e.target.value);
-                          setAdminLotError(null);
-                        }}
-                        className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums outline-none focus:border-[#0052cc]"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs font-bold text-[#0B2046] tabular-nums">
-                    <span>Saldo (Caixas): {saldoCx}</span>
-                    <span className="text-[#0052cc]">Saldo (m²): {formatSqmBR(saldoSqm)}</span>
-                  </div>
-
-                  {adminLotError && (
-                    <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
-                      {adminLotError}
-                    </div>
-                  )}
-
-                  <div className="flex justify-end gap-2 pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setAdminEditingLot(null)}
-                      className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
-                    >
-                      Cancelar
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={isSaving}
-                      className="px-5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
-                    >
-                      {isSaving ? 'Salvando...' : 'Salvar'}
-                    </button>
-                  </div>
-                </form>
-              );
-            })()}
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setGroupToDelete(null)}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={handleConfirmDeleteLotGroup}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isSaving ? 'Excluindo...' : 'Confirmar Exclusão'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

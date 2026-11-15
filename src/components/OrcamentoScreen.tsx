@@ -46,6 +46,8 @@ import {
   formatOrcamentoMessage,
 } from '../utils/configOrcamentoEMetas';
 import {
+  fetchCatalogFromSupabase,
+  filterCatalogProducts,
   getProductDetailsFromCatalog,
   getDynamicProductCatalog,
   getOfficialCategories,
@@ -53,6 +55,7 @@ import {
   normalizePriceTier,
   getPriceTierFromClientType,
   getOfficialPriceTableLabel,
+  searchProductsInSupabase,
   CatalogProduct,
 } from '../data/productCatalog';
 import { ProductSelectionModal } from './ProductSelectionModal';
@@ -74,6 +77,7 @@ import {
   extractBarLengthFromProductName,
   parseBarCountFromInput,
   formatRodapeDetailText,
+  stripRodapeAutoDetail,
   parseRodapeDetails,
   isRodapeColaCatalogProduct,
   isRodapeCalafetarCatalogProduct,
@@ -307,7 +311,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         setObservacoes('');
         setObservacoesRodape('');
         setDescontoInput('0,00');
-        setDescontoTexto('DESCONTO ESPECIAL APLICADO:');
+        setDescontoTexto('DESCONTO PARA PAGAMENTO VIA PIX');
         setHasDescontoEnabled(false);
         setHasFreteEnabled(false);
         setFreteValorInput('0,00');
@@ -359,7 +363,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         setObservacoes('');
         setObservacoesRodape('');
         setDescontoInput('0,00');
-        setDescontoTexto('DESCONTO ESPECIAL APLICADO:');
+        setDescontoTexto('DESCONTO PARA PAGAMENTO VIA PIX');
         setHasDescontoEnabled(false);
         setHasFreteEnabled(false);
         setFreteValorInput('0,00');
@@ -569,7 +573,22 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     };
   }, []);
 
-  // Dynamic catalog directly from official PRODUTOS database
+  // Sincroniza catálogo oficial diretamente do Supabase quando atualizado
+  useEffect(() => {
+    let active = true;
+    fetchCatalogFromSupabase(catalogRevision > 0)
+      .then(() => {
+        if (active && catalogRevision === 0) {
+          setCatalogRevision((r) => (r === 0 ? 1 : r));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [catalogRevision, isProductModalOpen]);
+
+  // Dynamic catalog directly from official PRODUTOS database (alimentado pelo Supabase)
   const dynamicCatalog = useMemo(
     () => getDynamicProductCatalog(),
     [isProductModalOpen, catalogRevision]
@@ -1079,20 +1098,36 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   ]);
 
   // Categorias oficiais da base
-  const categoriesList = useMemo(() => getOfficialCategories(), [isProductModalOpen]);
+  const categoriesList = useMemo(() => getOfficialCategories(), [isProductModalOpen, catalogRevision]);
 
-  // Resultados da busca com dropdown embaixo
+  const [supabaseSearchResults, setSupabaseSearchResults] = useState<CatalogProduct[] | null>(null);
+
+  useEffect(() => {
+    const q = searchProductQuery.trim();
+    if (!q) {
+      setSupabaseSearchResults(null);
+      return;
+    }
+    let active = true;
+    const timer = setTimeout(() => {
+      searchProductsInSupabase(q, { limit: 20 })
+        .then((res) => {
+          if (active) setSupabaseSearchResults(res);
+        })
+        .catch(() => {});
+    }, 130);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [searchProductQuery, catalogRevision]);
+
+  // Resultados da busca com dropdown embaixo (filtrados na consulta ao Supabase por categoria real, nome, marca e modelo)
   const searchResults = useMemo(() => {
     if (!searchProductQuery.trim()) return [];
-    const q = searchProductQuery.toLowerCase().trim();
-    return dynamicCatalog
-      .filter((p) => {
-        const nameMatch = p.name.toLowerCase().includes(q);
-        const catMatch = p.category.toLowerCase().includes(q);
-        return nameMatch || catMatch;
-      })
-      .slice(0, 15);
-  }, [searchProductQuery, dynamicCatalog]);
+    const source = supabaseSearchResults !== null ? supabaseSearchResults : dynamicCatalog;
+    return filterCatalogProducts(source, searchProductQuery, { limit: 20 });
+  }, [searchProductQuery, dynamicCatalog, supabaseSearchResults]);
 
   // Modal para Cadastrar Novo Produto
   const [isCadastrarProdutoModalOpen, setIsCadastrarProdutoModalOpen] = useState(false);
@@ -1107,7 +1142,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   // Drafts para edição direta do preço unitário e quantidade na tabela do orçamento
   const [itemPrecoDrafts, setItemPrecoDrafts] = useState<Record<string, string>>({});
   const [itemQtdDrafts, setItemQtdDrafts] = useState<Record<string, string>>({});
-  const tableRodapeDebounceMapRef = useRef<Map<string, any>>(new Map());
+  const [rodapeMlModalItem, setRodapeMlModalItem] = useState<EspelhoItem | null>(null);
+  const [rodapeMlModalInput, setRodapeMlModalInput] = useState('');
+  const [rodapeMlModalError, setRodapeMlModalError] = useState<string | null>(null);
 
   // Objeto da categoria ativa
   const activeCategoryObj = useMemo(() => {
@@ -1118,15 +1155,14 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   // Produtos filtrados apenas da categoria escolhida (ex: Pisos)
   const categoryProducts = useMemo(() => {
     if (!selectedCategoryId) return [];
-    let list = dynamicCatalog.filter((p) => {
+    const list = dynamicCatalog.filter((p) => {
       return (
         p.categoryId === selectedCategoryId ||
         p.category.toLowerCase() === (activeCategoryObj?.name || '').toLowerCase()
       );
     });
     if (categoryFilterQuery.trim()) {
-      const q = categoryFilterQuery.toLowerCase().trim();
-      list = list.filter((p) => p.name.toLowerCase().includes(q));
+      return filterCatalogProducts(list, categoryFilterQuery);
     }
     return list;
   }, [selectedCategoryId, activeCategoryObj, dynamicCatalog, categoryFilterQuery]);
@@ -1577,6 +1613,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       unidade: unit || 'barras',
       precoUnitario: unitPrice,
       total: rodapeTotal,
+      requestedMl: plan.insumoMl > 0 ? plan.insumoMl : undefined,
+      barLengthMeters: plan.barLengthMeters,
     };
 
     const includeColar = Boolean(selection?.includeColar);
@@ -1832,6 +1870,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       unidade: prod.unit,
       precoUnitario: safeProdPrice,
       total: itemTotal,
+      ...(isRodape
+        ? {
+            requestedMl: requestedRodapeMl,
+            barLengthMeters: extractBarLengthFromProductName(prod.name, 2.4),
+          }
+        : {}),
     };
 
     setItems((prev) => [...prev, newItem]);
@@ -1955,6 +1999,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       unidade: finalUnit,
       precoUnitario: tierPrice,
       total: itemTotal,
+      ...(isRodape
+        ? {
+            requestedMl: requestedRodapeMl,
+            barLengthMeters: extractBarLengthFromProductName(newProd.name, 2.4),
+          }
+        : {}),
     };
 
     setItems((prev) => [...prev, newItem]);
@@ -1977,8 +2027,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     resetRodapeConversionRefs();
     setEditingItemId(item.id);
     setSelectedProductCatalog(item.descricao);
-    setNewSubtitulo(item.subtitulo || '');
-    setNewQtd(item.qtd);
+    const isRodapeItem = isRodapeProduct(item.descricao);
+    setNewSubtitulo(
+      isRodapeItem ? stripRodapeAutoDetail(item.subtitulo) || '' : item.subtitulo || ''
+    );
     setNewUnid(item.unidade || 'unidades');
     setNewPrecoUnitario(formatPriceToBrl(item.precoUnitario));
 
@@ -1986,16 +2038,26 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     if (parsedQty > 0 && isPisoVinilicoProduct(item.descricao) && isSquareMeterUnit(item.unidade)) {
       pisoLastRealSqmRef.current = parsedQty;
       pisoRequestedSqmRef.current = parsedQty;
-    }
-    if (parsedQty > 0 && isRodapeProduct(item.descricao)) {
-      const barLen = extractBarLengthFromProductName(item.descricao, 2.4);
+      setNewQtd(item.qtd);
+    } else if (isRodapeItem) {
+      const barLen =
+        item.barLengthMeters || extractBarLengthFromProductName(item.descricao, 2.4);
       const existingLink = rodapeInsumoLinksRef.current.get(item.id);
       const parsedDet = parseRodapeDetails(item.subtitulo);
-      rodapeLastBarrasRef.current = parsedQty;
-      rodapeRequestedMlRef.current =
-        existingLink?.requestedMl ||
-        parsedDet?.metrosDesejados ||
-        Math.round(parsedQty * barLen * 100) / 100;
+      const resolvedMl =
+        (item.requestedMl && item.requestedMl > 0 ? item.requestedMl : undefined) ??
+        (existingLink?.requestedMl && existingLink.requestedMl > 0
+          ? existingLink.requestedMl
+          : undefined) ??
+        (parsedDet?.metrosDesejados && parsedDet.metrosDesejados > 0
+          ? parsedDet.metrosDesejados
+          : undefined) ??
+        (parsedQty > 0 ? Math.round(parsedQty * barLen * 100) / 100 : 0);
+      rodapeLastBarrasRef.current = parsedQty > 0 ? parsedQty : null;
+      rodapeRequestedMlRef.current = resolvedMl > 0 ? resolvedMl : null;
+      setNewQtd(resolvedMl > 0 ? String(resolvedMl).replace('.', ',') : item.qtd);
+    } else {
+      setNewQtd(item.qtd);
     }
 
     setProductSubTab('produtos');
@@ -2131,6 +2193,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         unidade: activeQuickRodapeProduct.unit || 'barras',
         precoUnitario: rodapeUnitPrice,
         total: rodapeTotal,
+        requestedMl: rodapePlan.insumoMl > 0 ? rodapePlan.insumoMl : undefined,
+        barLengthMeters: rodapePlan.barLengthMeters,
       };
       rodapeInsumoLinksRef.current.set(rodapeItem.id, {
         barLengthMeters: rodapePlan.barLengthMeters,
@@ -2291,6 +2355,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                 unidade: finalUnid,
                 precoUnitario: numPreco,
                 total: itemTotal,
+                ...(isCurrentProductRodape
+                  ? {
+                      requestedMl: rodapeRequestedMl,
+                      barLengthMeters: rodapeBarLen,
+                    }
+                  : {}),
               }
             : it
         );
@@ -2406,6 +2476,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         unidade: finalUnid,
         precoUnitario: numPreco,
         total: itemTotal,
+        ...(isCurrentProductRodape
+          ? {
+              requestedMl: rodapeRequestedMl,
+              barLengthMeters: rodapeBarLen,
+            }
+          : {}),
       };
 
       setItems((prev) => [...prev, newItem]);
@@ -2565,8 +2641,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
           item: targetItem,
           rawQtdVal: newQtdVal,
           existingLink,
-          barLengthMeters: existingLink?.barLengthMeters,
-          forceTreatAsMl: true,
+          barLengthMeters: targetItem.barLengthMeters ?? existingLink?.barLengthMeters,
+          forceTreatAsMl: false,
+          inputMode: 'barras',
         });
         if (existingLink) {
           existingLink.requestedMl = conv.requestedMl > 0 ? conv.requestedMl : undefined;
@@ -2619,6 +2696,104 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
           : item
       );
     });
+  };
+
+  // Abrir modal de edição de metragem em metros lineares (ml) pelo ícone de lápis na coluna Ações
+  const openRodapeMlEditModal = (item: EspelhoItem) => {
+    const barLen =
+      item.barLengthMeters || extractBarLengthFromProductName(item.descricao, 2.4);
+    const existingLink = rodapeInsumoLinksRef.current.get(item.id);
+    const parsedDet = parseRodapeDetails(item.subtitulo);
+    const currentBars = Math.max(0, parsePtBrNumeric(item.qtd));
+    const initialMl =
+      (item.requestedMl && item.requestedMl > 0 ? item.requestedMl : undefined) ??
+      (existingLink?.requestedMl && existingLink.requestedMl > 0
+        ? existingLink.requestedMl
+        : undefined) ??
+      (parsedDet?.metrosDesejados && parsedDet.metrosDesejados > 0
+        ? parsedDet.metrosDesejados
+        : undefined) ??
+      (currentBars > 0 ? Math.round(currentBars * barLen * 100) / 100 : 0);
+
+    setRodapeMlModalItem(item);
+    setRodapeMlModalInput(initialMl > 0 ? String(initialMl).replace('.', ',') : '');
+    setRodapeMlModalError(null);
+  };
+
+  const handleConfirmRodapeMlModal = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!rodapeMlModalItem) return;
+
+    const targetId = rodapeMlModalItem.id;
+    const parsedMl = parsePtBrNumeric(rodapeMlModalInput);
+    if (!rodapeMlModalInput.trim() || parsedMl <= 0) {
+      setRodapeMlModalError('Informe uma metragem válida em metros lineares (ml).');
+      return;
+    }
+
+    const barLen =
+      rodapeMlModalItem.barLengthMeters ||
+      extractBarLengthFromProductName(rodapeMlModalItem.descricao, 2.4);
+    const newBars = Math.max(1, Math.ceil(parsedMl / barLen - 1e-9));
+
+    setItems((prev) => {
+      const targetItem = prev.find((it) => it.id === targetId);
+      if (!targetItem) return prev;
+
+      ensureRodapeLinkForExistingBudget(prev, targetItem);
+      const existingLink = rodapeInsumoLinksRef.current.get(targetId);
+      const conv = applyRodapeTableQuantityChange({
+        item: targetItem,
+        rawQtdVal: String(parsedMl),
+        existingLink,
+        barLengthMeters: barLen,
+        forceTreatAsMl: true,
+        inputMode: 'ml',
+      });
+
+      if (existingLink) {
+        existingLink.requestedMl = parsedMl;
+        existingLink.lastBarras = conv.bars;
+        existingLink.barLengthMeters = conv.barLen;
+      } else {
+        rodapeInsumoLinksRef.current.set(targetId, {
+          barLengthMeters: conv.barLen,
+          requestedMl: parsedMl,
+          lastBarras: conv.bars,
+          includeColar: false,
+          includeCalafetar: false,
+          calafetarProductId: '',
+        });
+      }
+
+      const updated = prev.map((it) => (it.id === targetId ? conv.updatedItem : it));
+      const activeLink = rodapeInsumoLinksRef.current.get(targetId);
+      return activeLink && (activeLink.includeColar || activeLink.includeCalafetar)
+        ? syncRodapeInsumosInList(updated, targetItem.descricao)
+        : updated;
+    });
+
+    setItemQtdDrafts((prev) => {
+      if (prev[targetId] === undefined) return prev;
+      const next = { ...prev };
+      delete next[targetId];
+      return next;
+    });
+
+    if (editingItemId === targetId) {
+      rodapeRequestedMlRef.current = parsedMl;
+      rodapeLastBarrasRef.current = newBars;
+      setNewQtd(String(parsedMl).replace('.', ','));
+    }
+
+    setRodapeMlModalItem(null);
+    setRodapeMlModalInput('');
+    setRodapeMlModalError(null);
+    showToast(
+      `Metragem atualizada: ${formatMlPtBr(parsedMl)} ml → ${newBars} ${
+        newBars === 1 ? 'barra' : 'barras'
+      }.`
+    );
   };
 
   // Edit item unit price directly in the budget
@@ -2811,7 +2986,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     return (
       initialOrcamento?.descontoTexto ||
       initialDraft?.descontoTexto ||
-      'DESCONTO ESPECIAL APLICADO:'
+      'DESCONTO PARA PAGAMENTO VIA PIX'
     );
   });
   const [hasDescontoEnabled, setHasDescontoEnabled] = useState<boolean>(() => {
@@ -3133,7 +3308,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       setFreteUf('');
       setFreteEndereco('');
       setDescontoInput('0,00');
-      setDescontoTexto('DESCONTO ESPECIAL APLICADO:');
+      setDescontoTexto('DESCONTO PARA PAGAMENTO VIA PIX');
       setHasDescontoEnabled(false);
       showToast('Rascunho descartado. Orçamento limpo para novo preenchimento.');
     }
@@ -3234,9 +3409,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       freteCidade: hasFreteEnabled ? freteCidade : '',
       freteUf: hasFreteEnabled ? freteUf : '',
       descontoValor,
-      descontoTexto: hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO ESPECIAL APLICADO:') : undefined,
+      descontoTexto: hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined,
       totalFinal,
-      status: initialOrcamento?.status || 'Em aberto',
+      status: initialOrcamento?.status || 'Orçamento Enviado',
       savedAt: initialOrcamento?.savedAt || now.toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -3574,7 +3749,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       freteValor,
       freteEndereco,
       descontoValor: hasDescontoEnabled ? descontoValor : 0,
-      descontoTexto: hasDescontoEnabled ? (descontoTexto || 'DESCONTO ESPECIAL APLICADO:') : undefined,
+      descontoTexto: hasDescontoEnabled ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined,
       numeroOrcamento: nomeOrcamento || '',
     });
 
@@ -4574,6 +4749,11 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                                 <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-600 group-hover:bg-blue-100 group-hover:text-blue-700">
                                   {prod.category}
                                 </span>
+                                {prod.groupName && prod.groupName.trim().toUpperCase() !== 'SEM GRUPO' && (
+                                  <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-amber-50 text-amber-700">
+                                    {prod.groupName}
+                                  </span>
+                                )}
                               </div>
                               <div className="flex items-center gap-3 text-xs text-slate-500">
                                 <span>Unidade: <strong className="text-slate-700">{prod.unit}</strong></span>
@@ -5115,6 +5295,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
               ) : (
                 items.map((item, index) => {
                   const isEditingThis = editingItemId === item.id;
+                  const isRodapeItem = isRodapeProduct(item.descricao);
+                  const visibleSubtitulo = isRodapeItem
+                    ? stripRodapeAutoDetail(item.subtitulo)
+                    : item.subtitulo;
                   return (
                     <tr
                       key={item.id}
@@ -5144,48 +5328,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                           onChange={(e) => {
                             const val = e.target.value;
                             setItemQtdDrafts((prev) => ({ ...prev, [item.id]: val }));
-                            if (isRodapeProduct(item.descricao)) {
-                              const existingTimer = tableRodapeDebounceMapRef.current.get(item.id);
-                              if (existingTimer) {
-                                clearTimeout(existingTimer);
-                                tableRodapeDebounceMapRef.current.delete(item.id);
-                              }
-                              const trimmed = val.trim();
-                              const explicit = parseBarCountFromInput(trimmed);
-                              const parsed = parsePtBrNumeric(trimmed);
-                              if ((explicit && explicit > 0) || parsed > 0) {
-                                const timer = setTimeout(() => {
-                                  tableRodapeDebounceMapRef.current.delete(item.id);
-                                  handleItemQtdChange(item.id, val);
-                                  setItemQtdDrafts((prev) => {
-                                    if (prev[item.id] === undefined) return prev;
-                                    const next = { ...prev };
-                                    delete next[item.id];
-                                    return next;
-                                  });
-                                }, 650);
-                                tableRodapeDebounceMapRef.current.set(item.id, timer);
-                              }
-                            } else {
-                              handleItemQtdChange(item.id, val);
-                            }
+                            handleItemQtdChange(item.id, val);
                           }}
                           onBlur={() => {
-                            if (isRodapeProduct(item.descricao)) {
-                              const existingTimer = tableRodapeDebounceMapRef.current.get(item.id);
-                              if (existingTimer) {
-                                clearTimeout(existingTimer);
-                                tableRodapeDebounceMapRef.current.delete(item.id);
-                              }
-                              const draftVal = itemQtdDrafts[item.id];
-                              if (
-                                draftVal !== undefined &&
-                                draftVal.trim() !== '' &&
-                                draftVal !== item.qtd
-                              ) {
-                                handleItemQtdChange(item.id, draftVal);
-                              }
-                            }
                             setItemQtdDrafts((prev) => {
                               if (prev[item.id] === undefined) return prev;
                               const next = { ...prev };
@@ -5198,6 +5343,11 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                               (e.target as HTMLInputElement).blur();
                             }
                           }}
+                          title={
+                            isRodapeItem
+                              ? 'Quantidade de barras de rodapé (use o lápis em Ações para editar por metros lineares)'
+                              : 'Editar quantidade'
+                          }
                           className="w-16 h-8 text-center font-bold text-slate-900 border border-slate-200 rounded-lg outline-none focus:border-blue-500"
                         />
                       </td>
@@ -5207,16 +5357,18 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                             <span className="font-semibold text-slate-900 hover:text-[#0057ff] transition-colors">
                               {item.descricao}
                             </span>
-                            {item.subtitulo && (
+                            {visibleSubtitulo && (
                               <span className="block text-[11px] text-slate-500 font-medium whitespace-pre-line">
-                                {item.subtitulo}
+                                {visibleSubtitulo}
                               </span>
                             )}
-                            {!item.subtitulo?.includes(item.qtdDetalhe || '') && item.qtdDetalhe && (
-                              <span className="block text-[11px] font-bold text-slate-600 uppercase tracking-wide mt-0.5">
-                                {item.qtdDetalhe}
-                              </span>
-                            )}
+                            {!isRodapeItem &&
+                              !visibleSubtitulo?.includes(item.qtdDetalhe || '') &&
+                              item.qtdDetalhe && (
+                                <span className="block text-[11px] font-bold text-slate-600 uppercase tracking-wide mt-0.5">
+                                  {item.qtdDetalhe}
+                                </span>
+                              )}
                           </div>
                           {isEditingThis && (
                             <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-amber-200 text-amber-900 shrink-0">
@@ -5273,10 +5425,20 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                         <div className="flex items-center justify-center gap-1">
                           <button
                             type="button"
-                            onClick={() => handleEditItem(item)}
+                            onClick={() =>
+                              isRodapeItem ? openRodapeMlEditModal(item) : handleEditItem(item)
+                            }
                             className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-100 transition-colors cursor-pointer"
-                            title="Editar este produto no formulário"
-                            aria-label="Editar este produto"
+                            title={
+                              isRodapeItem
+                                ? 'Editar metragem em metros lineares (ml)'
+                                : 'Editar este produto no formulário'
+                            }
+                            aria-label={
+                              isRodapeItem
+                                ? 'Editar metragem em metros lineares (ml)'
+                                : 'Editar este produto'
+                            }
                           >
                             <Edit3 className="w-3.5 h-3.5" />
                           </button>
@@ -5614,52 +5776,35 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
             )}
           </div>
 
-          {/* Configuração de Desconto & Subtotal Oficial */}
+          {/* Configuração de Desconto */}
           <div className="space-y-3 p-4 rounded-xl bg-slate-50 border border-slate-200">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-bold text-slate-800 flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={hasDescontoEnabled}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setHasDescontoEnabled(checked);
-                    if (!checked) {
-                      setDescontoInput('0,00');
-                    }
-                  }}
-                  className="w-4 h-4 rounded text-[#0057ff] focus:ring-blue-500 cursor-pointer"
-                />
-                <Tag className="w-4 h-4 text-[#0057ff]" />
-                <span>Adicionar Desconto</span>
-              </label>
-              {!hasDescontoEnabled ? (
-                <span className="text-[11px] font-semibold text-slate-600 bg-slate-200/80 px-2 py-0.5 rounded-md">
-                  Desativado
-                </span>
-              ) : (
-                <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
-                  Ativado
-                </span>
-              )}
-            </div>
+            <label className="text-xs font-bold text-slate-800 flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={hasDescontoEnabled}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setHasDescontoEnabled(checked);
+                  if (checked && !descontoTexto.trim()) {
+                    setDescontoTexto('DESCONTO PARA PAGAMENTO VIA PIX');
+                  }
+                  if (!checked) {
+                    setDescontoInput('0,00');
+                  }
+                }}
+                className="w-4 h-4 rounded text-[#0057ff] focus:ring-blue-500 cursor-pointer"
+              />
+              <Tag className="w-4 h-4 text-[#0057ff]" />
+              <span>Adicionar Desconto</span>
+            </label>
 
-            {!hasDescontoEnabled ? (
-              <div className="p-3 rounded-lg bg-slate-100 border border-slate-200 text-slate-600 text-xs flex items-center gap-2">
-                <Tag className="w-4 h-4 text-slate-400 shrink-0" />
-                <span>
-                  Sem desconto aplicado. O espelho exibirá apenas os produtos, frete e o total normal.
-                </span>
-              </div>
-            ) : (
+            {hasDescontoEnabled && (
               <div className="space-y-3 pt-1">
-                {/* 1. Valor do Desconto */}
+                {/* 1. Valor do desconto (R$ ou %) */}
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
                     <label className="text-[11px] font-bold text-slate-700">
-                      {descontoTipo === 'reais'
-                        ? 'Valor do Desconto (R$)'
-                        : 'Percentual do Desconto (%)'}
+                      Valor do desconto ({descontoTipo === 'reais' ? 'R$' : '%'})
                     </label>
                     <div className="flex items-center gap-1 bg-white p-0.5 rounded-lg border border-slate-200">
                       <button
@@ -5690,67 +5835,23 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                     type="text"
                     value={descontoInput || ''}
                     onChange={(e) => setDescontoInput(e.target.value)}
-                    placeholder="200,00"
+                    placeholder={descontoTipo === 'reais' ? '0,00' : '0'}
                     className="w-full h-10 rounded-lg border border-slate-300 bg-white px-3 text-xs sm:text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff]"
                   />
                 </div>
 
-                {/* 2. Texto do Desconto — Totalmente Editável */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <label className="text-[11px] font-bold text-slate-700">
-                      Texto do Desconto (Frase exibida no espelho)
-                    </label>
-                    <span className="text-[10px] text-blue-600 font-medium">
-                      Totalmente editável
-                    </span>
-                  </div>
+                {/* 2. Texto do desconto */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold text-slate-700 block">
+                    Texto do desconto
+                  </label>
                   <input
                     type="text"
                     value={descontoTexto}
                     onChange={(e) => setDescontoTexto(e.target.value)}
-                    placeholder="DESCONTO ESPECIAL APLICADO:"
+                    placeholder="DESCONTO PARA PAGAMENTO VIA PIX"
                     className="w-full h-10 rounded-lg border border-slate-300 bg-white px-3 text-xs sm:text-sm font-semibold text-slate-900 outline-none focus:border-[#0057ff]"
                   />
-
-                  {/* Sugestões rápidas de texto */}
-                  <div className="pt-1">
-                    <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide block mb-1">
-                      Sugestões rápidas (clique para aplicar):
-                    </span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {[
-                        'DESCONTO ESPECIAL APLICADO:',
-                        'CONDIÇÃO ESPECIAL:',
-                        'DESCONTO COMERCIAL:',
-                        'DESCONTO NEGOCIADO:',
-                        'DESCONTO PARA FECHAMENTO:',
-                        'DESCONTO PROMOCIONAL:',
-                        'CONDIÇÃO EXCLUSIVA:',
-                      ].map((sugestao) => (
-                        <button
-                          key={sugestao}
-                          type="button"
-                          onClick={() => setDescontoTexto(sugestao)}
-                          className={`text-[10px] px-2 py-1 rounded-md border transition-all cursor-pointer ${
-                            descontoTexto === sugestao
-                              ? 'bg-blue-50 border-blue-400 text-blue-800 font-bold'
-                              : 'bg-white border-slate-200 text-slate-600 hover:border-slate-400 font-medium'
-                          }`}
-                        >
-                          {sugestao}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Nota explicativa oficial */}
-                <div className="text-[11px] text-emerald-800 bg-emerald-50/80 p-2.5 rounded-lg border border-emerald-200/80 leading-snug">
-                  <strong>Regra do Espelho:</strong> O espelho exibirá o bloco verde com o texto{' '}
-                  <span className="font-bold underline">{descontoTexto || 'DESCONTO ESPECIAL APLICADO:'}</span> e o valor{' '}
-                  <span className="font-bold">- R$ {formatPriceToBrl(descontoValor)}</span> ao lado do bloco de{' '}
-                  <span className="font-bold">SUBTOTAL</span>.
                 </div>
               </div>
             )}
@@ -5839,7 +5940,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
               freteEndereco={hasFreteEnabled ? freteEndereco : ''}
               subtotal={subtotal}
               descontoValor={hasDescontoEnabled && descontoValor > 0 ? descontoValor : undefined}
-              descontoTexto={hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO ESPECIAL APLICADO:') : undefined}
+              descontoTexto={hasDescontoEnabled && descontoValor > 0 ? (descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX') : undefined}
               totalFinal={totalFinal}
             />
           </div>
@@ -5985,6 +6086,139 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         onConfirmRodapeOnly={() => commitRodapePrompt(null)}
         onConfirmWithInsumos={(selection) => commitRodapePrompt(selection)}
       />
+
+      {/* Modal de Edição de Metros Lineares (ml) para Rodapé pelo ícone de Lápis */}
+      {rodapeMlModalItem && (() => {
+        const barLen =
+          rodapeMlModalItem.barLengthMeters ||
+          extractBarLengthFromProductName(rodapeMlModalItem.descricao, 2.4);
+        const parsedMl = parsePtBrNumeric(rodapeMlModalInput);
+        const calcBars = parsedMl > 0 ? Math.max(1, Math.ceil(parsedMl / barLen - 1e-9)) : 0;
+        const effectiveMl = Math.round(calcBars * barLen * 100) / 100;
+        const previewTotal = Math.round(calcBars * rodapeMlModalItem.precoUnitario * 100) / 100;
+
+        return (
+          <div
+            className="no-print fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
+            onClick={() => {
+              setRodapeMlModalItem(null);
+              setRodapeMlModalError(null);
+            }}
+          >
+            <form
+              onSubmit={handleConfirmRodapeMlModal}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md overflow-hidden"
+            >
+              <div className="px-5 py-4 bg-[#0B2046] text-white flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm sm:text-base font-extrabold">
+                    Editar Metragem Linear (ml)
+                  </h3>
+                  <p className="text-[11px] text-sky-200 font-medium truncate max-w-[300px]">
+                    {rodapeMlModalItem.descricao}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRodapeMlModalItem(null);
+                    setRodapeMlModalError(null);
+                  }}
+                  className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="flex items-center justify-between text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5">
+                  <span>
+                    Comprimento da barra:{' '}
+                    <strong className="text-[#0B2046]">
+                      {barLen.toFixed(2).replace('.', ',')} m
+                    </strong>
+                  </span>
+                  <span>
+                    Valor por barra:{' '}
+                    <strong className="text-[#0B2046]">
+                      R$ {formatPriceToBrl(rodapeMlModalItem.precoUnitario)}
+                    </strong>
+                  </span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-bold text-[#0B2046]">
+                    Metragem desejada em metros lineares (ml)
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={rodapeMlModalInput}
+                    onChange={(e) => {
+                      setRodapeMlModalInput(e.target.value);
+                      setRodapeMlModalError(null);
+                    }}
+                    placeholder="Ex: 20,00"
+                    className="w-full h-11 px-3.5 rounded-xl border border-slate-300 focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/15 text-sm font-extrabold text-[#0B2046] outline-none"
+                    autoFocus
+                  />
+                </div>
+
+                {rodapeMlModalError && (
+                  <p className="text-xs font-semibold text-rose-600">{rodapeMlModalError}</p>
+                )}
+
+                <div className="rounded-xl bg-blue-50/70 border border-blue-200 p-3.5 space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-600 font-medium">
+                      Barras necessárias (arredondado para cima):
+                    </span>
+                    <span className="text-sm font-black text-[#0052cc] tabular-nums">
+                      {calcBars} {calcBars === 1 ? 'barra' : 'barras'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-slate-500">
+                    <span>Metragem efetiva das barras:</span>
+                    <span className="font-semibold tabular-nums">
+                      {formatMlPtBr(effectiveMl)} ml
+                    </span>
+                  </div>
+                  <div className="pt-1.5 border-t border-blue-200/70 flex items-center justify-between">
+                    <span className="font-bold text-[#0B2046]">Novo valor do item:</span>
+                    <span className="text-sm font-black text-[#0B2046] tabular-nums">
+                      {previewTotal.toLocaleString('pt-BR', {
+                        style: 'currency',
+                        currency: 'BRL',
+                      })}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRodapeMlModalItem(null);
+                    setRodapeMlModalError(null);
+                  }}
+                  className="px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-bold text-slate-600 cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-xl bg-[#0057ff] hover:bg-[#0047db] text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Atualizar Orçamento</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
     </div>
   );
 };

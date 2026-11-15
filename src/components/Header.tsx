@@ -47,6 +47,13 @@ import {
 import officeBg from '../assets/images/fenix_office_bg_1788695593982.jpg';
 import { ClientRecord } from '../types';
 import {
+  CatalogProduct,
+  fetchCatalogFromSupabase,
+  filterCatalogProducts,
+  getDynamicProductCatalog,
+  searchProductsInSupabase,
+} from '../data/productCatalog';
+import {
   getUserNotifications,
   markNotificationAsRead,
   markAllNotificationsAsReadForUser,
@@ -139,18 +146,7 @@ export interface GlobalSearchResult {
   targetRecordId?: string;
 }
 
-// Dados padrão representativos de todo o sistema para a Busca Global
-const DEFAULT_PRODUCTS_LIST = [
-  { id: 'pr_1', nome: 'Piso Vinílico SPC Click 5mm Carvalho Europeu', categoria: 'PISOS VINÍLICOS', preco: 'R$ 139,90/m²' },
-  { id: 'pr_2', nome: 'Piso Vinílico LVT Colado 2mm VinilForte', categoria: 'PISOS VINÍLICOS', preco: 'R$ 79,90/m²' },
-  { id: 'pr_3', nome: 'Rodapé Poliestireno Santa Luzia 10cm Branco', categoria: 'RODAPÉS', preco: 'R$ 38,50/barra' },
-  { id: 'pr_4', nome: 'Rodapé MDF Ultra Durafloor 8cm – Barra 2,10m', categoria: 'RODAPÉS', preco: 'R$ 36,90/barra' },
-  { id: 'pr_5', nome: 'Teto Vinílico Pix Revestimentos 217 x 50 x 8mm', categoria: 'TETO VINÍLICO', preco: 'R$ 89,90/m²' },
-  { id: 'pr_6', nome: 'Painel Ripado Poliestireno Freijó – Barra 2,80m', categoria: 'PAINEL RIPADO', preco: 'R$ 69,90/barra' },
-  { id: 'pr_7', nome: 'Manta Hospitalar Tarkett 2,0mm – Rolo 40m²', categoria: 'MANTA HOSPITALAR', preco: 'R$ 119,00/m²' },
-  { id: 'pr_8', nome: 'Autonivelante FLEXFLOOR Secagem Rápida 12h – 20kg', categoria: 'ARGAMASSAS & COLAS', preco: 'R$ 85,90/saco' },
-  { id: 'pr_9', nome: 'Cola para Piso Vinílico FLEXFLOOR 4kg', categoria: 'ARGAMASSAS & COLAS', preco: 'R$ 59,90/un' },
-];
+// Produtos carregados dinamicamente do Supabase na inicialização do Header
 
 const DEFAULT_ORCAMENTOS_LIST = [
   { id: 'orc_1043', numero: '1043', cliente: 'Studio ArqDesign Interiores', valor: 'R$ 15.800,00', produto: 'SPC Click 5mm Carvalho Europeu', status: 'Orçamento Enviado' },
@@ -301,8 +297,53 @@ export const Header: React.FC<HeaderProps> = ({
   const [boletosDb, setBoletosDb] = useState<any[]>([]);
   const [notasDb, setNotasDb] = useState<any[]>([]);
   const [pendenciasDb, setPendenciasDb] = useState<any[]>([]);
+  const [productsDb, setProductsDb] = useState<CatalogProduct[]>(() => getDynamicProductCatalog());
+  const [supabaseProductSearchResults, setSupabaseProductSearchResults] = useState<CatalogProduct[] | null>(null);
 
-  // Carregar dados reais do localStorage
+  // Carregar catálogo oficial de produtos diretamente do Supabase
+  useEffect(() => {
+    let active = true;
+    const syncProductsFromSupabase = (force = false) => {
+      fetchCatalogFromSupabase(force)
+        .then((res) => {
+          if (active && res.catalog.length > 0) {
+            setProductsDb(res.catalog);
+          }
+        })
+        .catch(() => {});
+    };
+
+    syncProductsFromSupabase(false);
+    const handleProductsUpdated = () => syncProductsFromSupabase(true);
+    window.addEventListener('fenix_products_updated', handleProductsUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener('fenix_products_updated', handleProductsUpdated);
+    };
+  }, []);
+
+  // Filtragem na consulta ao Supabase quando o usuário digita na busca global
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setSupabaseProductSearchResults(null);
+      return;
+    }
+    let active = true;
+    const timer = setTimeout(() => {
+      searchProductsInSupabase(q, { limit: 10 })
+        .then((res) => {
+          if (active) setSupabaseProductSearchResults(res);
+        })
+        .catch(() => {});
+    }, 140);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [searchQuery]);
+
+  // Carregar dados reais do CRM
   useEffect(() => {
     const loadSystemData = () => {
       try {
@@ -855,28 +896,51 @@ export const Header: React.FC<HeaderProps> = ({
       }
     });
 
-    // 8. PRODUTOS
-    DEFAULT_PRODUCTS_LIST.forEach((pr) => {
-      if (pr.nome.toLowerCase().includes(q) || pr.categoria.toLowerCase().includes(q)) {
-        results.push({
-          id: `prd_${pr.id}`,
-          origin: 'Produtos',
-          title: pr.nome,
-          subtitle: `${pr.categoria} • ${pr.preco}`,
-          detail: 'Catálogo de Produtos Fênix',
-          targetTab: 'Produtos',
-          rawItem: pr,
-          targetRecordId: String(pr.id || pr.nome),
-          badgeBg: 'bg-orange-50 border-orange-200 text-orange-700',
-          badgeText: 'Produtos',
-          Icon: Package,
-        });
-      }
+    // 8. PRODUTOS (Filtrado do catálogo oficial do Supabase respeitando categoria real, nome, marca e modelo)
+    const sourceProducts: CatalogProduct[] =
+      supabaseProductSearchResults !== null ? supabaseProductSearchResults : productsDb;
+    const matchedProducts = filterCatalogProducts<CatalogProduct>(sourceProducts, searchQuery, {
+      limit: 8,
+    });
+
+    matchedProducts.forEach((pr) => {
+      const precoFmt = (pr.priceClienteFinal || pr.price || 0).toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: 'BRL',
+      });
+      const brandLabel =
+        pr.groupName && pr.groupName.trim().toUpperCase() !== 'SEM GRUPO'
+          ? ` • ${pr.groupName}`
+          : '';
+      results.push({
+        id: `prd_${pr.id}`,
+        origin: 'Produtos',
+        title: pr.name,
+        subtitle: `${pr.category}${brandLabel} • ${precoFmt}/${pr.unit}`,
+        detail: pr.details || 'Catálogo Oficial de Produtos Fênix',
+        targetTab: 'Produtos',
+        rawItem: pr,
+        targetRecordId: String(pr.id || pr.name),
+        badgeBg: 'bg-orange-50 border-orange-200 text-orange-700',
+        badgeText: 'Produtos',
+        Icon: Package,
+      });
     });
 
     // Limitar para não poluir o dropdown
     return results.slice(0, 16);
-  }, [searchQuery, clientsDb, orcamentosDb, followUpDb, tarefasDb, boletosDb, notasDb, pendenciasDb]);
+  }, [
+    searchQuery,
+    clientsDb,
+    orcamentosDb,
+    followUpDb,
+    tarefasDb,
+    boletosDb,
+    notasDb,
+    pendenciasDb,
+    productsDb,
+    supabaseProductSearchResults,
+  ]);
 
   // Ao clicar em um resultado da busca geral
   const handleSelectSearchResult = (result: GlobalSearchResult) => {

@@ -554,7 +554,7 @@ export const ModalEditarPedido: React.FC<ModalEditarPedidoProps> = ({
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>+ Linha Manual</span>
+                  <span>Linha Manual</span>
                 </button>
               </div>
             </div>

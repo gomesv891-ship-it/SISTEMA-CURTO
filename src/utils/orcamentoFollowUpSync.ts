@@ -258,7 +258,7 @@ export function resolveOrcamentoResponsible(
 }
 
 /**
- * Converte status do orçamento para status do follow-up
+ * Converte status do orçamento ou legado para um dos 5 status oficiais do Follow-up
  */
 export function mapOrcamentoStatusToFollowUp(orcStatus?: string): FollowUpStatus {
   if (!orcStatus) return 'Orçamento Enviado';
@@ -274,7 +274,14 @@ export function mapOrcamentoStatusToFollowUp(orcStatus?: string): FollowUpStatus
   ) {
     return 'Vendido';
   }
-  if (s === 'perdido' || s === 'perdidos' || s === 'recusado' || s === 'cancelado') {
+  if (
+    s === 'perdido' ||
+    s === 'perdidos' ||
+    s === 'recusado' ||
+    s === 'cancelado' ||
+    s === 'não vendido' ||
+    s === 'nao vendido'
+  ) {
     return 'Perdido';
   }
   if (s === 'negociando' || s === 'negociação' || s === 'negociacao' || s === 'em negociação') {
@@ -284,6 +291,58 @@ export function mapOrcamentoStatusToFollowUp(orcStatus?: string): FollowUpStatus
     return 'Aguardando Retorno';
   }
   return 'Orçamento Enviado';
+}
+
+/**
+ * Extrai o código/número exibível de um orçamento para busca e exibição
+ */
+export function getDisplayOrcamentoNumber(orc?: { id?: string; numeroOrcamento?: string; pedido?: string } | null, rawId?: string): string {
+  const explicit = (orc?.numeroOrcamento || '').trim();
+  if (explicit) return explicit.replace(/^#+/, '');
+  const id = String(orc?.id || rawId || '').trim();
+  if (!id) return '';
+  const bare = id.replace(/^fup_/, '').replace(/^orc_/, '');
+  const firstSegment = bare.split('_')[0] || bare;
+  const digits = firstSegment.replace(/\D/g, '');
+  if (digits.length >= 4) {
+    return digits.slice(-6);
+  }
+  return bare.slice(-6).toUpperCase();
+}
+
+/**
+ * Gera o próximo número de pedido sequencial com base nos pedidos já registrados no CRM
+ */
+export function generateNextPedidoNumber(): string {
+  let maxNum = 1000;
+  const inspectList = (key: string, fields: string[]) => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return;
+      const list = JSON.parse(raw);
+      if (!Array.isArray(list)) return;
+      list.forEach((item: any) => {
+        if (!item) return;
+        fields.forEach((f) => {
+          const val = String(item[f] || '').replace(/\D/g, '');
+          if (val && val.length <= 7) {
+            const n = parseInt(val, 10);
+            if (!isNaN(n) && n > maxNum && n < 9000000) {
+              maxNum = n;
+            }
+          }
+        });
+      });
+    } catch {}
+  };
+
+  inspectList(FOLLOWUP_STORAGE_KEY, ['pedido']);
+  inspectList('fenix_metas_sales_db', ['pedido']);
+  inspectList('fenix_vendas_gerencial', ['numeroPedido', 'pedido']);
+  inspectList(ORCAMENTOS_HISTORY_KEY, ['pedido']);
+  inspectList(ORCAMENTOS_SAVED_KEY, ['pedido']);
+
+  return String(maxNum + 1);
 }
 
 /**
@@ -494,10 +553,14 @@ export async function syncSingleOrcamentoToFollowUp(
     const titleChanged = Boolean(budgetTitle && existing.nomeOrcamento !== budgetTitle);
     const clientChanged = Boolean(clientName && existing.cliente !== clientName);
 
-    // Atualiza status se o orçamento foi vendido ou perdido, mantendo o status do follow-up se já em negociação
-    let resolvedStatus: FollowUpStatus = existing.status;
+    // Atualiza status respeitando o status mais recente do Follow-up ou do Orçamento
+    let resolvedStatus: FollowUpStatus = mapOrcamentoStatusToFollowUp(existing.status);
     const orcStatusMapped = mapOrcamentoStatusToFollowUp(orcamento.status);
+    const orcUpdatedTs = new Date(orcamento.updatedAt || orcamento.savedAt || 0).getTime() || 0;
+    const fupUpdatedTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
     if (orcStatusMapped === 'Vendido' || orcStatusMapped === 'Perdido') {
+      resolvedStatus = orcStatusMapped;
+    } else if (orcUpdatedTs > fupUpdatedTs + 1000) {
       resolvedStatus = orcStatusMapped;
     }
 
@@ -760,14 +823,15 @@ export async function syncAllSavedOrcamentosToFollowUp(options?: {
     if (existingIndex >= 0) {
       const existing = updatedFollowUpList[existingIndex];
       const orcStatusMapped = mapOrcamentoStatusToFollowUp(orc.status);
-      const nextStatus: FollowUpStatus =
-        orcStatusMapped === 'Vendido' || orcStatusMapped === 'Perdido'
-          ? orcStatusMapped
-          : existing.status;
-
       const orcUpdatedTs = new Date(orc.updatedAt || orc.savedAt || 0).getTime() || 0;
       const fupUpdatedTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
       const orcIsNewer = orcUpdatedTs > fupUpdatedTs + 1000;
+      const nextStatus: FollowUpStatus =
+        orcStatusMapped === 'Vendido' || orcStatusMapped === 'Perdido'
+          ? orcStatusMapped
+          : orcIsNewer
+          ? orcStatusMapped
+          : mapOrcamentoStatusToFollowUp(existing.status);
 
       const nextPhone = clientPhone || existing.telefone || '';
       const nextValor =

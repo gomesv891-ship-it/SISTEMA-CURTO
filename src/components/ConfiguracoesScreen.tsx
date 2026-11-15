@@ -42,15 +42,13 @@ import {
   Music,
   Square,
   FileAudio,
-  Sliders,
-  Calculator,
+  Truck,
   Smartphone,
   Send,
+  Sliders,
   Sun,
   Trophy,
-  Truck,
 } from 'lucide-react';
-import { CustosTarkettTab } from './custos/CustosTarkettTab';
 import { UserAvatar } from './UserAvatar';
 import { AudioSnippetEditor } from './AudioSnippetEditor';
 import { saveWholeCollectionToSupabase } from '../utils/supabaseClient';
@@ -102,16 +100,10 @@ import {
   getWhatsAppMessageTemplate,
   saveWhatsAppMessageTemplate,
   loadWhatsAppTemplatesFromSupabase,
-  loadMetasConfigsFromSupabase,
   WhatsAppCategory,
   WHATSAPP_CATEGORIES,
   DEFAULT_WHATSAPP_TEMPLATES_BY_CATEGORY,
   getDynamicGreeting,
-  getMetasParametersConfig,
-  saveMetasParametersConfig,
-  calculateCurrentMetasDates,
-  DEFAULT_METAS_CONFIG,
-  MetasParametersConfig,
 } from '../utils/configOrcamentoEMetas';
 
 interface ConfiguracoesScreenProps {
@@ -123,12 +115,10 @@ interface ConfiguracoesScreenProps {
 
 type TabType =
   | 'Gestão de Usuários'
-  | 'Tarkett'
   | 'Notificações & Alertas'
   | 'Segurança & Acesso'
   | 'Mensagem WhatsApp'
-  | 'Mensagem de Orçamento'
-  | 'Configurações de Metas';
+  | 'Mensagem de Orçamento';
 
 export interface FenixUser {
   id: string;
@@ -290,30 +280,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
     });
   }, [categoryTemplates, currentUserName, selectedWhatsAppCategory]);
 
-  // ==========================================
-  // ESTADO: CONFIGURAÇÕES DE METAS
-  // ==========================================
-  const [metasConfig, setMetasConfig] = useState<MetasParametersConfig>(() =>
-    getMetasParametersConfig()
-  );
-
-  // Cálculos reativos considerando sempre a data atual
-  const metasCalculated = useMemo(() => {
-    return calculateCurrentMetasDates(metasConfig);
-  }, [metasConfig]);
-
-  const handleSaveMetasConfig = () => {
-    saveMetasParametersConfig(metasConfig);
-    showToast('✓ Parâmetros e dias úteis da meta salvos com sucesso!');
-  };
-
-  const handleResetMetasConfig = () => {
-    setMetasConfig(DEFAULT_METAS_CONFIG);
-    saveMetasParametersConfig(DEFAULT_METAS_CONFIG);
-    showToast('✓ Configurações de metas restauradas para o cálculo automático oficial!');
-  };
-
-  // Sincronização em tempo real de WhatsApp e Metas com o Supabase
+  // Sincronização em tempo real de WhatsApp com o Supabase
   useEffect(() => {
     loadWhatsAppTemplatesFromSupabase().then((loaded) => {
       if (loaded && typeof loaded === 'object') {
@@ -328,9 +295,6 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         });
       }
     });
-    loadMetasConfigsFromSupabase().then(() => {
-      setMetasConfig(getMetasParametersConfig());
-    });
 
     const handleMsgUpdate = () => {
       setCategoryTemplates((prev) => {
@@ -341,14 +305,9 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         return next;
       });
     };
-    const handleMetasUpdate = () => {
-      setMetasConfig(getMetasParametersConfig());
-    };
     window.addEventListener('fenix_orcamento_msg_updated', handleMsgUpdate);
-    window.addEventListener('fenix_metas_config_updated', handleMetasUpdate);
     return () => {
       window.removeEventListener('fenix_orcamento_msg_updated', handleMsgUpdate);
-      window.removeEventListener('fenix_metas_config_updated', handleMetasUpdate);
     };
   }, []);
 
@@ -1414,11 +1373,9 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         {(
           [
             { id: 'Gestão de Usuários', label: 'Gestão de Usuários', icon: Users },
-            { id: 'Tarkett', label: 'Simulador Tarkett', icon: Calculator },
             { id: 'Notificações & Alertas', label: 'Notificações & Alertas', icon: Bell },
             { id: 'Segurança & Acesso', label: 'Segurança & Acesso', icon: Shield },
             { id: 'Mensagem WhatsApp', label: 'Mensagem WhatsApp', icon: MessageSquare },
-            { id: 'Configurações de Metas', label: 'Configurações de Metas', icon: Target },
           ] as { id: TabType; label: string; icon: React.FC<{ className?: string }> }[]
         ).map((tab) => {
           const Icon = tab.icon;
@@ -1444,33 +1401,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
       {/* 3. CONTEÚDO DA ABA 1: GESTÃO DE USUÁRIOS */}
       {activeTab === 'Gestão de Usuários' && (
         <div className="space-y-4 animate-in fade-in duration-200">
-          {/* BANNER EXCLUSIVO DA DIRETORIA (EDER PEREZ) */}
-          {isDirector ? (
-            <div className="bg-gradient-to-r from-amber-50 via-blue-50 to-indigo-50 border border-amber-200/90 rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-xs">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center font-bold text-base shadow-xs flex-shrink-0">
-                  👑
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-bold text-slate-900">Painel de Gestão da Diretoria — Eder Perez</p>
-                    <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold border border-amber-200">
-                      Gestão Central de Logins
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-600 mt-0.5">
-                    Como Diretor Geral, você pode <strong>mexer no login, redefinir senhas, ativar/inativar e configurar permissões</strong> de cada funcionário da equipe.
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                <span className="text-xs text-amber-900 bg-amber-100/90 border border-amber-200 px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5 shadow-2xs">
-                  <span>🔒</span>
-                  <span>Modo Administrador Ativo</span>
-                </span>
-              </div>
-            </div>
-          ) : (
+          {!isDirector && (
             <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 flex items-center gap-3 text-xs text-slate-600">
               <Shield className="w-4 h-4 text-slate-400 flex-shrink-0" />
               <span>
@@ -2746,348 +2677,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         </div>
       )}
 
-      {/* 7. CONTEÚDO DA ABA 5: CONFIGURAÇÕES DE METAS */}
-      {activeTab === 'Configurações de Metas' && (
-        <div className="space-y-6 animate-in fade-in duration-200">
-          {/* Banner: Status Dinâmico da Data Atual */}
-          <div className="bg-gradient-to-r from-[#07162e] via-[#0b2146] to-[#07162e] text-white rounded-2xl p-6 sm:p-7 shadow-lg border border-slate-800 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-blue-500/20 text-blue-400 border border-blue-400/30 flex items-center justify-center flex-shrink-0">
-                  <Calendar className="w-5 h-5 stroke-[2.2]" />
-                </div>
-                <div>
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-blue-300">
-                    Cálculo Inteligente Baseado na Data Atual
-                  </span>
-                  <h2 className="text-lg sm:text-xl font-black text-white">
-                    Período Comercial: {metasCalculated.monthYearLabel}
-                  </h2>
-                </div>
-              </div>
 
-              <div className="flex items-center gap-2">
-                <span className="px-3 py-1 rounded-full text-xs font-bold bg-blue-500/20 text-blue-300 border border-blue-400/40">
-                  Hoje: {metasCalculated.currentDateFormatted} ({metasCalculated.dayOfWeekName})
-                </span>
-              </div>
-            </div>
-
-            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed max-w-3xl font-normal">
-              A aba <strong>Metas</strong> sincroniza em tempo real com a <strong>data atual</strong>. Os cálculos de <strong>dias decorridos</strong>, <strong>dias restantes</strong>, <strong>dias úteis restantes</strong> e <strong>ritmo diário necessário</strong> são recalculados dinamicamente conforme os dias passam, garantindo que o ritmo comercial nunca fique desatualizado.
-            </p>
-          </div>
-
-          {/* Cards Resumo dos Cálculos da Data Atual */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-            {/* 1. Dias Decorridos */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                  Dias Decorridos
-                </span>
-                <Clock className="w-4 h-4 text-slate-400" />
-              </div>
-              <div className="text-2xl sm:text-3xl font-black text-slate-900 mt-2">
-                {metasCalculated.diasDecorridos} <span className="text-xs font-normal text-slate-400">dias</span>
-              </div>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Do dia 1 até hoje ({metasCalculated.currentDay} de {metasCalculated.monthName})
-              </p>
-            </div>
-
-            {/* 2. Dias Restantes */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                  Dias Restantes
-                </span>
-                <Calendar className="w-4 h-4 text-blue-500" />
-              </div>
-              <div className="text-2xl sm:text-3xl font-black text-[#1D4ED8] mt-2">
-                {metasCalculated.diasRestantes} <span className="text-xs font-normal text-slate-400">dias</span>
-              </div>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Até o fim do mês ({metasCalculated.totalDaysInMonth} dias no total)
-              </p>
-            </div>
-
-            {/* 3. Dias Úteis no Mês */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                  Dias Úteis no Mês
-                </span>
-                <Target className="w-4 h-4 text-purple-500" />
-              </div>
-              <div className="text-2xl sm:text-3xl font-black text-purple-900 mt-2">
-                {metasCalculated.totalWorkingDays} <span className="text-xs font-normal text-slate-400">úteis</span>
-              </div>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Segunda a Sexta-feira
-              </p>
-            </div>
-
-            {/* 4. Dias Úteis Restantes */}
-            <div className="bg-white rounded-2xl border border-emerald-200 bg-emerald-50/20 p-4 sm:p-5 shadow-2xs">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-emerald-800 uppercase tracking-wider">
-                  Dias Úteis Restantes
-                </span>
-                <TrendingUp className="w-4 h-4 text-emerald-600" />
-              </div>
-              <div className="text-2xl sm:text-3xl font-black text-emerald-700 mt-2">
-                {metasCalculated.remainingWorkingDays} <span className="text-xs font-normal text-emerald-600">úteis</span>
-              </div>
-              <p className="text-[11px] text-emerald-700 mt-1 font-medium">
-                Base para o ritmo diário da meta
-              </p>
-            </div>
-          </div>
-
-          {/* Configurações dos Parâmetros da Meta */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-xs space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-5">
-              <div>
-                <h3 className="text-base font-bold text-slate-900">
-                  Parâmetros de Cálculo da Meta
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Defina como os dias úteis e o valor padrão devem ser calculados pela aba Metas.
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleResetMetasConfig}
-                  className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1.5 shadow-2xs"
-                  title="Restaurar padrão automático"
-                >
-                  <RotateCcw className="w-3.5 h-3.5 text-slate-500" />
-                  <span>Restaurar Padrão</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSaveMetasConfig}
-                  className="px-4 py-2 rounded-xl bg-[#1D4ED8] hover:bg-[#1e40af] text-white text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>Salvar Configurações</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Modo de Cálculo: Automático vs Manual */}
-            <div className="space-y-3">
-              <label className="block text-xs font-bold text-slate-700">
-                Modo de Determinação dos Dias Úteis *
-              </label>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {/* Opção 1: Automático */}
-                <div
-                  onClick={() => setMetasConfig((prev) => ({ ...prev, usarCalculoAutomatico: true }))}
-                  className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-start gap-3 ${
-                    metasConfig.usarCalculoAutomatico
-                      ? 'border-[#1D4ED8] bg-blue-50/40 shadow-xs'
-                      : 'border-slate-200 bg-white hover:border-slate-300'
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="modo_dias_uteis"
-                    checked={metasConfig.usarCalculoAutomatico}
-                    onChange={() => setMetasConfig((prev) => ({ ...prev, usarCalculoAutomatico: true }))}
-                    className="mt-0.5 text-[#1D4ED8] focus:ring-blue-500"
-                  />
-                  <div className="space-y-1">
-                    <div className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
-                      <span>Cálculo Automático por Data Atual</span>
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">
-                        Recomendado
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Calcula diariamente com precisão matemática os dias úteis (Segunda a Sexta) a partir da data de hoje ({metasCalculated.currentDateFormatted}) até o final do mês.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Opção 2: Manual */}
-                <div
-                  onClick={() => setMetasConfig((prev) => ({ ...prev, usarCalculoAutomatico: false }))}
-                  className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-start gap-3 ${
-                    !metasConfig.usarCalculoAutomatico
-                      ? 'border-[#1D4ED8] bg-blue-50/40 shadow-xs'
-                      : 'border-slate-200 bg-white hover:border-slate-300'
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="modo_dias_uteis"
-                    checked={!metasConfig.usarCalculoAutomatico}
-                    onChange={() => setMetasConfig((prev) => ({ ...prev, usarCalculoAutomatico: false }))}
-                    className="mt-0.5 text-[#1D4ED8] focus:ring-blue-500"
-                  />
-                  <div className="space-y-1">
-                    <div className="text-xs font-bold text-slate-900">
-                      Definição Manual dos Dias Úteis
-                    </div>
-                    <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Permite estipular manualmente os dias úteis do período comercial (ideal para compensar feriados prolongados ou calendários especiais).
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Campos de ajuste manual quando ativo */}
-            {!metasConfig.usarCalculoAutomatico && (
-              <div className="p-4 sm:p-5 rounded-2xl bg-amber-50/60 border border-amber-200/90 space-y-4 animate-in fade-in duration-200">
-                <div className="flex items-center gap-2 text-xs font-bold text-amber-900">
-                  <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
-                  <span>Ajuste Manual dos Dias Úteis do Período</span>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                      Total de Dias Úteis do Período
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={31}
-                      value={metasConfig.diasUteisTotaisManual ?? metasCalculated.totalWorkingDays ?? 22}
-                      onChange={(e) =>
-                        setMetasConfig((prev) => ({
-                          ...prev,
-                          diasUteisTotaisManual: Math.max(1, parseInt(e.target.value) || 22),
-                        }))
-                      }
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs sm:text-sm text-slate-800 bg-white font-medium focus:outline-none focus:border-[#1D4ED8]"
-                    />
-                    <span className="text-[10px] text-slate-500 mt-1 block">
-                      Total de dias úteis comerciais considerados no mês completo.
-                    </span>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                      Dias Úteis Restantes do Período
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={31}
-                      value={metasConfig.diasUteisRestantesManual ?? metasCalculated.remainingWorkingDays ?? 1}
-                      onChange={(e) =>
-                        setMetasConfig((prev) => ({
-                          ...prev,
-                          diasUteisRestantesManual: Math.max(1, parseInt(e.target.value) || 1),
-                        }))
-                      }
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs sm:text-sm text-slate-800 bg-white font-medium focus:outline-none focus:border-[#1D4ED8]"
-                    />
-                    <span className="text-[10px] text-slate-500 mt-1 block">
-                      Dias restantes a partir de hoje para dividir o valor faltante.
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Parâmetros Globais: Valor da Meta e Semanas Comerciais */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  Valor Padrão da Meta Mensal (R$) *
-                </label>
-                <div className="relative">
-                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
-                    R$
-                  </span>
-                  <input
-                    type="number"
-                    step="1000"
-                    min="1000"
-                    value={metasConfig.metaValor ?? 400000}
-                    onChange={(e) =>
-                      setMetasConfig((prev) => ({
-                        ...prev,
-                        metaValor: Math.max(1000, parseFloat(e.target.value) || 400000),
-                      }))
-                    }
-                    className="w-full pl-10 pr-3.5 py-2.5 rounded-xl border border-slate-300 text-xs sm:text-sm text-slate-800 bg-white font-bold focus:outline-none focus:border-[#1D4ED8]"
-                  />
-                </div>
-                <span className="text-[10px] text-slate-500 mt-1 block">
-                  Valor utilizado como objetivo da equipe comercial na aba Metas.
-                </span>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  Semanas Comerciais no Mês *
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  max="6"
-                  value={metasConfig.semanasComerciais ?? 4}
-                  onChange={(e) =>
-                    setMetasConfig((prev) => ({
-                      ...prev,
-                      semanasComerciais: Math.max(1, parseInt(e.target.value) || 4),
-                    }))
-                  }
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs sm:text-sm text-slate-800 bg-white font-medium focus:outline-none focus:border-[#1D4ED8]"
-                />
-                <span className="text-[10px] text-slate-500 mt-1 block">
-                  Divisor utilizado no Card de Ritmo Semanal (padrão: 4 semanas).
-                </span>
-              </div>
-            </div>
-
-            {/* Simulação em Tempo Real do Ritmo com estes parâmetros */}
-            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/90 space-y-2">
-              <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                <Info className="w-3.5 h-3.5 text-[#1D4ED8]" />
-                <span>Simulação do Ritmo Diário com os Parâmetros Atuais:</span>
-              </div>
-              <p className="text-xs text-slate-600 leading-relaxed">
-                Considerando uma meta de <strong>R$ {metasConfig.metaValor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong> com <strong>{metasCalculated.remainingWorkingDays} dias úteis restantes</strong>, o ritmo médio necessário para atingir o objetivo é de aproximadamente:
-              </p>
-              <div className="flex items-center gap-4 pt-1 flex-wrap">
-                <div className="px-3.5 py-2 rounded-xl bg-white border border-slate-200 shadow-2xs">
-                  <span className="text-[10px] font-bold text-slate-400 uppercase block">Ritmo Diário / Dia Útil</span>
-                  <span className="text-base font-black text-[#1D4ED8]">
-                    R$ {(metasConfig.metaValor / metasCalculated.remainingWorkingDays).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </span>
-                </div>
-                <div className="px-3.5 py-2 rounded-xl bg-white border border-slate-200 shadow-2xs">
-                  <span className="text-[10px] font-bold text-slate-400 uppercase block">Ritmo Semanal / Semana</span>
-                  <span className="text-base font-black text-purple-700">
-                    R$ {(metasConfig.metaValor / (metasConfig.semanasComerciais || 4)).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ======================================================== */}
-      {/* 6. SIMULAÇÃO TARKETT                                     */}
-      {/* ======================================================== */}
-      {activeTab === 'Tarkett' && (
-        <CustosTarkettTab
-          currentUserName={currentUserName}
-          isDirector={false}
-          showToast={showToast}
-        />
-      )}
 
       {/* ======================================================== */}
       {/* DRAWER LATERAL: "Cadastrar / Editar Usuário"             */}

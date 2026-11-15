@@ -1,15 +1,22 @@
 import {
   INITIAL_PRODUCT_CATEGORIES,
+  INITIAL_PRODUCT_GROUPS,
   INITIAL_PRODUCT_ITEMS,
   GroupProductItem,
   ProductCategory,
+  ProductGroup,
 } from './initialProductsSeed';
+import { getSupabaseClient } from '../utils/supabaseClient';
 
 export interface CatalogProduct {
   id: string;
   name: string;
   category: string;
   categoryId?: string;
+  groupId?: string;
+  groupName?: string;
+  details?: string;
+  description?: string;
   unit: string;
   price: number; // Base / Consumidor Final
   priceClienteFinal: number;
@@ -19,6 +26,14 @@ export interface CatalogProduct {
   custo?: number; // Custo do produto (salvo separadamente, visão exclusiva da Diretoria)
   defaultSubtitle?: string;
 }
+
+export type ProductSearchCategoryBucket =
+  | 'piso'
+  | 'rodape'
+  | 'ripado'
+  | 'insumo'
+  | 'manta'
+  | 'outro';
 
 /**
  * REGRA OFICIAL FÊNIX WORLD — TIPO DE CLIENTE E TABELA DE PREÇO
@@ -91,11 +106,46 @@ export function getOfficialPriceTableLabel(tierOrClientType?: string): string {
   }
 }
 
+// Cache em memória alimentado pelo Supabase (fonte oficial, sem gravar em localStorage)
+const supabaseCatalogCache: {
+  items: GroupProductItem[] | null;
+  categories: ProductCategory[] | null;
+  groups: ProductGroup[] | null;
+  lastFetchedAt: number;
+  inFlight: Promise<{
+    items: GroupProductItem[];
+    categories: ProductCategory[];
+    groups: ProductGroup[];
+  }> | null;
+} = {
+  items: null,
+  categories: null,
+  groups: null,
+  lastFetchedAt: 0,
+  inFlight: null,
+};
+
+function normalizePayloadArray<T>(raw: unknown): T[] | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw as T[];
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as T[]) : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
- * Returns all active products directly from the official PRODUTOS database (localStorage).
- * Always reflects live changes made by the user in the PRODUTOS tab!
+ * Returns all active products from in-memory Supabase cache (with safe fallback).
  */
 export function getOfficialProducts(): GroupProductItem[] {
+  if (Array.isArray(supabaseCatalogCache.items) && supabaseCatalogCache.items.length > 0) {
+    return supabaseCatalogCache.items.filter((p) => p.active !== false);
+  }
   if (typeof window === 'undefined') return INITIAL_PRODUCT_ITEMS;
   try {
     const raw = localStorage.getItem('fenix_product_items_data');
@@ -106,15 +156,18 @@ export function getOfficialProducts(): GroupProductItem[] {
       }
     }
   } catch (err) {
-    console.error('Erro ao ler produtos do localStorage:', err);
+    console.error('Erro ao ler produtos em memória local:', err);
   }
   return INITIAL_PRODUCT_ITEMS;
 }
 
 /**
- * Returns all official categories from PRODUTOS database
+ * Returns all official categories from Supabase cache (with safe fallback)
  */
 export function getOfficialCategories(): ProductCategory[] {
+  if (Array.isArray(supabaseCatalogCache.categories) && supabaseCatalogCache.categories.length > 0) {
+    return supabaseCatalogCache.categories;
+  }
   if (typeof window === 'undefined') return INITIAL_PRODUCT_CATEGORIES;
   try {
     const raw = localStorage.getItem('fenix_product_categories_data');
@@ -125,9 +178,31 @@ export function getOfficialCategories(): ProductCategory[] {
       }
     }
   } catch (err) {
-    console.error('Erro ao ler categorias do localStorage:', err);
+    console.error('Erro ao ler categorias:', err);
   }
   return INITIAL_PRODUCT_CATEGORIES;
+}
+
+/**
+ * Returns all official product groups/brands from Supabase cache (with safe fallback)
+ */
+export function getOfficialGroups(): ProductGroup[] {
+  if (Array.isArray(supabaseCatalogCache.groups) && supabaseCatalogCache.groups.length > 0) {
+    return supabaseCatalogCache.groups;
+  }
+  if (typeof window === 'undefined') return INITIAL_PRODUCT_GROUPS;
+  try {
+    const raw = localStorage.getItem('fenix_product_groups_data');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch (err) {
+    console.error('Erro ao ler grupos de produtos:', err);
+  }
+  return INITIAL_PRODUCT_GROUPS;
 }
 
 /**
@@ -206,46 +281,406 @@ export function getProductTierPrice(
   return baseClienteFinal;
 }
 
+function mapItemsToCatalogProducts(
+  officialList: GroupProductItem[],
+  categories: ProductCategory[],
+  groups: ProductGroup[]
+): CatalogProduct[] {
+  const catMap = new Map(categories.map((c) => [c.id, c.name]));
+  const groupMap = new Map(groups.map((g) => [g.id, g.name]));
+
+  return officialList
+    .filter((item) => item.active !== false)
+    .map((item) => {
+      const resolvedCat = catMap.get(item.categoryId);
+      const categoryName = resolvedCat || item.categoryName || 'Geral';
+      const resolvedGroup = groupMap.get(item.groupId);
+      const groupName = resolvedGroup || item.groupName || '';
+
+      const pCF = safeParsePrice(item.priceClienteFinal);
+      const pBase = safeParsePrice(item.price);
+      const priceCF = pCF > 0 ? pCF : (pBase > 0 ? pBase : 0);
+
+      const pRev = safeParsePrice(item.priceRevenda);
+      const priceRev = pRev > 0 ? pRev : Math.round(priceCF * 0.82 * 100) / 100;
+
+      const pConst = safeParsePrice(item.priceConstrutora);
+      const priceConst = pConst > 0 ? pConst : Math.round(priceCF * 0.90 * 100) / 100;
+
+      const pDist = safeParsePrice(item.priceDistribuidor);
+      const priceDist = pDist > 0 ? pDist : Math.round(priceRev * 0.95 * 100) / 100;
+
+      return {
+        id: item.id,
+        name: item.name,
+        category: categoryName,
+        categoryId: item.categoryId,
+        groupId: item.groupId,
+        groupName,
+        details: item.details,
+        description: item.description,
+        unit: item.unit || 'unidades',
+        price: priceCF,
+        priceClienteFinal: priceCF,
+        priceRevenda: priceRev,
+        priceConstrutora: priceConst,
+        priceDistribuidor: priceDist,
+      };
+    });
+}
+
 /**
  * Returns dynamic product catalog array mapped for select inputs and search
  */
 export function getDynamicProductCatalog(): CatalogProduct[] {
-  const officialList = getOfficialProducts();
-  const categories = getOfficialCategories();
-  const catMap = new Map(categories.map((c) => [c.id, c.name]));
-
-  return officialList.map((item) => {
-    const categoryName = item.categoryName || catMap.get(item.categoryId) || 'Geral';
-    const pCF = safeParsePrice(item.priceClienteFinal);
-    const pBase = safeParsePrice(item.price);
-    const priceCF = pCF > 0 ? pCF : (pBase > 0 ? pBase : 0);
-
-    const pRev = safeParsePrice(item.priceRevenda);
-    const priceRev = pRev > 0 ? pRev : Math.round(priceCF * 0.82 * 100) / 100;
-
-    const pConst = safeParsePrice(item.priceConstrutora);
-    const priceConst = pConst > 0 ? pConst : Math.round(priceCF * 0.90 * 100) / 100;
-
-    const pDist = safeParsePrice(item.priceDistribuidor);
-    const priceDist = pDist > 0 ? pDist : Math.round(priceRev * 0.95 * 100) / 100;
-
-    return {
-      id: item.id,
-      name: item.name,
-      category: categoryName,
-      categoryId: item.categoryId,
-      unit: item.unit || 'unidades',
-      price: priceCF,
-      priceClienteFinal: priceCF,
-      priceRevenda: priceRev,
-      priceConstrutora: priceConst,
-      priceDistribuidor: priceDist,
-    };
-  });
+  return mapItemsToCatalogProducts(
+    getOfficialProducts(),
+    getOfficialCategories(),
+    getOfficialGroups()
+  );
 }
 
 // Legacy static export compatibility
 export const CRM_PRODUCT_CATALOG: CatalogProduct[] = getDynamicProductCatalog();
+
+/**
+ * Normaliza texto para busca (minúsculas, sem acentos, espaços colapsados).
+ */
+export function normalizeSearchText(text?: string | null): string {
+  if (!text) return '';
+  return String(text)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const INSUMO_NAME_OR_CAT_REGEX =
+  /\b(cola|colas|primer|primers|massa|massas|autonivelante|autonivelantes|endurecedor|contrapiso|cordao de solda|suporte|perfil de arremate|calafetar|bisnaga|selante|adesivo|desempenadeira|espatula|bico|rolete|insumo|insumos)\b/;
+
+/**
+ * Classifica o produto em seu bucket oficial pela categoria real (e proteção anti-insumo).
+ */
+export function classifyProductCategory(prod: {
+  name?: string;
+  category?: string;
+  categoryName?: string;
+}): ProductSearchCategoryBucket {
+  const cat = normalizeSearchText(prod.category || prod.categoryName);
+  const name = normalizeSearchText(prod.name);
+
+  if (
+    /\b(cola|primer|massa|autonivelante|endurecedor|insumo|adesivo|selante|calafetar|acessorio|ferramenta)\b/.test(
+      cat
+    )
+  ) {
+    return 'insumo';
+  }
+
+  if (/\b(manta|hospitalar)\b/.test(cat)) {
+    return 'manta';
+  }
+
+  if (INSUMO_NAME_OR_CAT_REGEX.test(name)) {
+    return 'insumo';
+  }
+
+  if (cat.includes('rodape')) {
+    return 'rodape';
+  }
+
+  if (cat.includes('ripado')) {
+    return 'ripado';
+  }
+
+  if (
+    (cat.includes('piso') && cat.includes('vinil')) ||
+    cat === 'piso' ||
+    cat === 'pisos' ||
+    (cat.includes('piso') && !cat.includes('manta') && !cat.includes('contra'))
+  ) {
+    return 'piso';
+  }
+
+  // Fallback caso categoria venha vazia/Geral
+  if (!cat || cat === 'geral') {
+    if (name.includes('rodape')) return 'rodape';
+    if (name.includes('ripado')) return 'ripado';
+    if ((name.startsWith('piso ') || (name.includes('piso') && name.includes('vinil'))) && !name.includes('manta')) {
+      return 'piso';
+    }
+  }
+
+  return 'outro';
+}
+
+const EXPLICIT_INSUMO_TOKENS = new Set([
+  'cola',
+  'colas',
+  'primer',
+  'primers',
+  'massa',
+  'massas',
+  'autonivelante',
+  'autonivelantes',
+  'endurecedor',
+  'contrapiso',
+  'insumo',
+  'insumos',
+  'manta',
+  'cordao',
+  'suporte',
+  'perfil',
+  'calafetar',
+  'adesivo',
+  'bisnaga',
+]);
+
+/**
+ * Identifica se o termo de busca solicita uma categoria específica (PISO, RODAPÉ, RIPADO).
+ */
+export function detectSearchCategoryIntent(
+  rawQuery: string
+): 'piso' | 'rodape' | 'ripado' | null {
+  const q = normalizeSearchText(rawQuery);
+  if (!q) return null;
+  const tokens = q.split(/\s+/).filter(Boolean);
+
+  // Se o usuário pediu explicitamente um insumo/manta (ex: "cola piso", "primer contrapiso"), não restringe ao bucket principal
+  if (tokens.some((t) => EXPLICIT_INSUMO_TOKENS.has(t))) {
+    return null;
+  }
+
+  if (tokens.some((t) => t === 'rodape' || t === 'rodapes' || (t.length >= 5 && t.startsWith('rodap')))) {
+    return 'rodape';
+  }
+
+  if (tokens.some((t) => t === 'ripado' || t === 'ripados' || (t.length >= 5 && t.startsWith('ripad')))) {
+    return 'ripado';
+  }
+
+  if (
+    tokens.some(
+      (t) =>
+        t === 'piso' ||
+        t === 'pisos' ||
+        t === 'vinilico' ||
+        t === 'vinilicos' ||
+        (t.length >= 5 && t.startsWith('vinil'))
+    )
+  ) {
+    return 'piso';
+  }
+
+  return null;
+}
+
+/**
+ * Filtra lista de produtos respeitando categoria real + nome + marca (groupName) + modelo (details/description).
+ */
+export function filterCatalogProducts<
+  T extends {
+    name: string;
+    category?: string;
+    categoryId?: string;
+    groupName?: string;
+    details?: string;
+    description?: string;
+    defaultSubtitle?: string;
+  }
+>(
+  catalog: T[],
+  rawQuery: string,
+  options?: {
+    categoryIdOrName?: string;
+    limit?: number;
+  }
+): T[] {
+  const normalizedCatFilter = normalizeSearchText(options?.categoryIdOrName);
+  const hasCatFilter = Boolean(options?.categoryIdOrName && normalizedCatFilter !== 'all');
+
+  let base = catalog;
+  if (hasCatFilter && options?.categoryIdOrName) {
+    const target = options.categoryIdOrName;
+    base = base.filter(
+      (p) =>
+        p.categoryId === target ||
+        normalizeSearchText(p.category) === normalizedCatFilter
+    );
+  }
+
+  const q = normalizeSearchText(rawQuery);
+  if (!q) {
+    return options?.limit ? base.slice(0, options.limit) : base;
+  }
+
+  const intent = detectSearchCategoryIntent(rawQuery);
+  const tokens = q.split(/\s+/).filter(Boolean);
+
+  const scored: { item: T; score: number }[] = [];
+
+  for (const prod of base) {
+    const bucket = classifyProductCategory(prod);
+    if (intent && bucket !== intent) {
+      continue;
+    }
+
+    const brand =
+      prod.groupName && normalizeSearchText(prod.groupName) !== 'sem grupo'
+        ? prod.groupName
+        : '';
+
+    const normName = normalizeSearchText(prod.name);
+    const normBrand = normalizeSearchText(brand);
+    const normModel = normalizeSearchText(
+      [prod.details || '', prod.description || '', prod.defaultSubtitle || ''].join(' ')
+    );
+    const normCat = normalizeSearchText(prod.category);
+
+    const searchable = [normName, normBrand, normModel, normCat].filter(Boolean).join(' ');
+
+    // Evita falso positivo de substring ("piso" dentro de "contrapiso") em buscas gerais
+    const allTokensMatch = tokens.every((tok) => {
+      if (tok === 'piso' || tok === 'pisos') {
+        return /\bpisos?\b/.test(searchable) || bucket === 'piso';
+      }
+      return searchable.includes(tok);
+    });
+
+    if (!allTokensMatch) continue;
+
+    let score = 1;
+    if (normName.startsWith(q)) score += 60;
+    else if (normName.includes(q)) score += 35;
+    if (normBrand && normBrand.includes(q)) score += 25;
+    if (normModel && normModel.includes(q)) score += 20;
+    if (normCat.includes(q)) score += 10;
+
+    scored.push({ item: prod, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  const finalResults = scored.map((s) => s.item);
+  return options?.limit ? finalResults.slice(0, options.limit) : finalResults;
+}
+
+/**
+ * Consulta catálogo oficial atualizado diretamente no Supabase (sem gravar em localStorage).
+ */
+export async function fetchCatalogFromSupabase(forceRefresh = false): Promise<{
+  catalog: CatalogProduct[];
+  categories: ProductCategory[];
+  groups: ProductGroup[];
+}> {
+  const cacheAge = Date.now() - supabaseCatalogCache.lastFetchedAt;
+  if (
+    !forceRefresh &&
+    supabaseCatalogCache.items &&
+    supabaseCatalogCache.categories &&
+    cacheAge < 15000
+  ) {
+    return {
+      catalog: mapItemsToCatalogProducts(
+        supabaseCatalogCache.items,
+        supabaseCatalogCache.categories,
+        supabaseCatalogCache.groups || []
+      ),
+      categories: supabaseCatalogCache.categories,
+      groups: supabaseCatalogCache.groups || [],
+    };
+  }
+
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      catalog: getDynamicProductCatalog(),
+      categories: getOfficialCategories(),
+      groups: getOfficialGroups(),
+    };
+  }
+
+  if (supabaseCatalogCache.inFlight && !forceRefresh) {
+    const resolved = await supabaseCatalogCache.inFlight;
+    return {
+      catalog: mapItemsToCatalogProducts(resolved.items, resolved.categories, resolved.groups),
+      categories: resolved.categories,
+      groups: resolved.groups,
+    };
+  }
+
+  const runFetch = async () => {
+    try {
+      const { data, error } = await client
+        .from('fenix_kv_store')
+        .select('key, data')
+        .in('key', [
+          'fenix_product_items_data',
+          'fenix_product_categories_data',
+          'fenix_product_groups_data',
+        ]);
+
+      if (!error && Array.isArray(data)) {
+        const itemsRow = data.find((r) => r.key === 'fenix_product_items_data');
+        const catsRow = data.find((r) => r.key === 'fenix_product_categories_data');
+        const groupsRow = data.find((r) => r.key === 'fenix_product_groups_data');
+
+        const itemsArr = normalizePayloadArray<GroupProductItem>(itemsRow?.data);
+        const catsArr = normalizePayloadArray<ProductCategory>(catsRow?.data);
+        const groupsArr = normalizePayloadArray<ProductGroup>(groupsRow?.data);
+
+        if (itemsArr && itemsArr.length > 0) {
+          supabaseCatalogCache.items = itemsArr;
+        }
+        if (catsArr && catsArr.length > 0) {
+          supabaseCatalogCache.categories = catsArr;
+        }
+        if (groupsArr) {
+          supabaseCatalogCache.groups = groupsArr;
+        }
+        supabaseCatalogCache.lastFetchedAt = Date.now();
+      }
+    } catch (err) {
+      console.error('Erro ao consultar catálogo de produtos no Supabase:', err);
+    } finally {
+      supabaseCatalogCache.inFlight = null;
+    }
+
+    return {
+      items: getOfficialProducts(),
+      categories: getOfficialCategories(),
+      groups: getOfficialGroups(),
+    };
+  };
+
+  supabaseCatalogCache.inFlight = runFetch();
+  const resolved = await supabaseCatalogCache.inFlight;
+
+  return {
+    catalog: mapItemsToCatalogProducts(resolved.items, resolved.categories, resolved.groups),
+    categories: resolved.categories,
+    groups: resolved.groups,
+  };
+}
+
+/**
+ * Executa a busca de produtos diretamente na camada de consulta ao Supabase,
+ * já retornando resultados filtrados por categoria real, nome, marca e modelo.
+ */
+export async function searchProductsInSupabase(
+  query: string,
+  options?: {
+    categoryIdOrName?: string;
+    limit?: number;
+    forceRefresh?: boolean;
+  }
+): Promise<CatalogProduct[]> {
+  const { catalog } = await fetchCatalogFromSupabase(options?.forceRefresh ?? false);
+  return filterCatalogProducts(catalog, query, {
+    categoryIdOrName: options?.categoryIdOrName,
+    limit: options?.limit,
+  });
+}
 
 /**
  * Finds price, category and default unit for a product from the official PRODUTOS database.

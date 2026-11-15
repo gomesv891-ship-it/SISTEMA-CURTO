@@ -311,6 +311,7 @@ interface AnotacaoFolhaDocumentProps {
   date?: string; // YYYY-MM-DD
   sheetConfig?: AnotacaoSheetConfig;
   onTitleChange?: (newTitle: string) => void;
+  onDateChange?: (newDate: string) => void;
   onTitleFocus?: () => void;
   onBodyMouseDown?: () => void;
   children?: React.ReactNode;
@@ -325,6 +326,7 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
   date = '',
   sheetConfig = DEFAULT_SHEET_CONFIG,
   onTitleChange,
+  onDateChange,
   onTitleFocus,
   onBodyMouseDown,
   children,
@@ -450,8 +452,8 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
       id={containerId}
       style={{
         width: isPrint ? '794px' : '100%',
-        maxWidth: isPrint ? '794px' : '820px',
-        minHeight: isBlank ? '1122px' : isPrint ? '1122px' : '980px',
+        maxWidth: isPrint ? '794px' : '100%',
+        minHeight: isBlank ? '1122px' : isPrint ? '1122px' : '1040px',
         margin: '0 auto',
         backgroundColor: '#FFFFFF',
         color: '#0F172A',
@@ -782,43 +784,94 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
             </div>
           </div>
 
-          <div
-            style={{
-              width: '208px',
-              flexShrink: 0,
-              height: '38px',
-              borderRadius: '10px',
-              border: '1.6px solid #0B3F7D',
-              backgroundColor: '#F4F8FE',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '7px',
-              padding: '0 14px',
-              boxSizing: 'border-box',
-            }}
-          >
-            <Calendar size={16} strokeWidth={2.2} color="#072F62" style={{ flexShrink: 0 }} />
-            <span
+          {mode === 'interactive' ? (
+            <div
               style={{
-                fontSize: '14px',
-                fontWeight: 800,
-                color: '#072F62',
+                width: onDateChange ? '220px' : '208px',
                 flexShrink: 0,
+                height: '38px',
+                borderRadius: '10px',
+                border: '1.6px solid #0B3F7D',
+                backgroundColor: '#F4F8FE',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '7px',
+                padding: '0 12px',
+                boxSizing: 'border-box',
               }}
             >
-              Data:
-            </span>
-            <span
+              <Calendar size={16} strokeWidth={2.2} color="#072F62" style={{ flexShrink: 0 }} />
+              <span
+                style={{
+                  fontSize: '14px',
+                  fontWeight: 800,
+                  color: '#072F62',
+                  flexShrink: 0,
+                }}
+              >
+                Data:
+              </span>
+              {onDateChange ? (
+                <input
+                  type="date"
+                  value={date || ''}
+                  onFocus={onTitleFocus}
+                  onChange={(e) => onDateChange(e.target.value)}
+                  aria-label="Data da anotação"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    border: 'none',
+                    outline: 'none',
+                    backgroundColor: 'transparent',
+                    fontSize: '13.5px',
+                    fontWeight: 700,
+                    color: '#072F62',
+                    fontFamily: 'inherit',
+                    cursor: 'pointer',
+                  }}
+                />
+              ) : (
+                <span
+                  style={{
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    color: '#072F62',
+                    letterSpacing: '0.02em',
+                  }}
+                >
+                  {formattedDate}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div
               style={{
-                fontSize: '14px',
-                fontWeight: 700,
-                color: '#072F62',
-                letterSpacing: '0.02em',
+                width: '158px',
+                flexShrink: 0,
+                height: '38px',
+                borderRadius: '10px',
+                border: '1.6px solid #0B3F7D',
+                backgroundColor: '#F4F8FE',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '0 14px',
+                boxSizing: 'border-box',
               }}
             >
-              {formattedDate}
-            </span>
-          </div>
+              <span
+                style={{
+                  fontSize: '14px',
+                  fontWeight: 700,
+                  color: '#072F62',
+                  letterSpacing: '0.02em',
+                }}
+              >
+                {formattedDate}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* QUADRO CENTRAL COM PAUTAS SINCRONIZADAS AO DOM DO TEXTO E CHECKLISTS */}

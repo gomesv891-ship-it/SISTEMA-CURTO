@@ -568,9 +568,9 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
 
     source.forEach((o) => {
       const st = o.status;
-      if (st === 'Em aberto') emAberto++;
-      else if (st === 'Aguardando retorno') aguardando++;
-      else if (st === 'Fechados' || st === 'Fechado') fechados++;
+      if (st === 'Em aberto' || st === 'Orçamento Enviado') emAberto++;
+      else if (st === 'Aguardando retorno' || st === 'Aguardando Retorno' || st === 'Negociando') aguardando++;
+      else if (st === 'Fechados' || st === 'Fechado' || st === 'Vendido') fechados++;
       else if (st === 'Perdidos' || st === 'Perdido') perdidos++;
     });
 
@@ -690,7 +690,7 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
       isChildRow: true,
       parentId: duplicatingOrcamento.id,
       savedAt: new Date().toISOString(),
-      status: 'Em aberto',
+      status: 'Orçamento Enviado',
     };
 
     const targetIdx = orcamentos.findIndex((o) => o.id === duplicatingOrcamento.id);
@@ -818,8 +818,16 @@ export const OrcamentosListScreen: React.FC<OrcamentosListScreenProps> = ({
       if (followUpRaw) {
         const followUpList = JSON.parse(followUpRaw);
         if (Array.isArray(followUpList)) {
-          const isVendidoStatus = newStatus === 'Fechado' || newStatus === 'Fechados' || (newStatus as any) === 'Vendido';
-          const targetStatus = isVendidoStatus ? 'Vendido' : newStatus === 'Perdido' || newStatus === 'Perdidos' ? 'Perdido' : 'Orçamento Enviado';
+          const isVendidoStatus = newStatus === 'Fechado' || newStatus === 'Fechados' || newStatus === 'Vendido';
+          const targetStatus = isVendidoStatus
+            ? 'Vendido'
+            : newStatus === 'Perdido' || newStatus === 'Perdidos'
+            ? 'Perdido'
+            : newStatus === 'Negociando'
+            ? 'Negociando'
+            : newStatus === 'Aguardando Retorno' || newStatus === 'Aguardando retorno'
+            ? 'Aguardando Retorno'
+            : 'Orçamento Enviado';
           
           let fupChanged = false;
           const updatedFollowUp = followUpList.map((f: any) => {

@@ -74,28 +74,21 @@ const EditableTextBlock: React.FC<EditableTextBlockProps> = ({
     const el = elRef.current;
     if (!el) return;
 
+    const nextHtml = block.html || '';
     const noteChanged = lastNoteIdRef.current !== noteId;
-    const isFocused = document.activeElement === el;
 
-    if (noteChanged || (!isFocused && block.html !== lastHtmlRef.current)) {
-      el.innerHTML = block.html || '';
-      lastHtmlRef.current = block.html;
+    if (noteChanged) {
+      el.innerHTML = nextHtml;
+      lastHtmlRef.current = nextHtml;
       lastNoteIdRef.current = noteId;
-    } else if (!isFocused && el.innerHTML !== (block.html || '')) {
-      el.innerHTML = block.html || '';
-      lastHtmlRef.current = block.html;
+      return;
+    }
+
+    if (el.innerHTML !== nextHtml) {
+      el.innerHTML = nextHtml;
+      lastHtmlRef.current = nextHtml;
     }
   }, [noteId, block.html]);
-
-  useEffect(() => {
-    const el = elRef.current;
-    if (!el) return;
-    if (document.activeElement !== el) return;
-    if (block.html !== lastHtmlRef.current) {
-      el.innerHTML = block.html || '';
-      lastHtmlRef.current = block.html;
-    }
-  }, [block.html]);
 
   if (readOnly) {
     return (
@@ -310,6 +303,36 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       }
     }, []);
 
+    const emitActiveFormats = useCallback(() => {
+      if (!onActiveFormatsChange || typeof document === 'undefined') return;
+      try {
+        onActiveFormatsChange({
+          bold: document.queryCommandState('bold'),
+          italic: document.queryCommandState('italic'),
+          underline: document.queryCommandState('underline'),
+          unorderedList: document.queryCommandState('insertUnorderedList'),
+          orderedList: document.queryCommandState('insertOrderedList'),
+        });
+      } catch {}
+    }, [onActiveFormatsChange]);
+
+    useEffect(() => {
+      const handleDocSelectionChange = () => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        const containerNode = sel.getRangeAt(0).commonAncestorContainer;
+        const insideEditor = (
+          Object.values(textElsRef.current) as (HTMLDivElement | null)[]
+        ).some((el) => el && (el === containerNode || el.contains(containerNode)));
+        if (insideEditor) {
+          saveSelection();
+          emitActiveFormats();
+        }
+      };
+      document.addEventListener('selectionchange', handleDocSelectionChange);
+      return () => document.removeEventListener('selectionchange', handleDocSelectionChange);
+    }, [saveSelection, emitActiveFormats]);
+
     const restoreSelectionOrFocus = useCallback((): HTMLDivElement | null => {
       const targetId =
         activeBlockIdRef.current ||
@@ -318,15 +341,21 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       const targetEl = targetId ? textElsRef.current[targetId] : null;
       if (!targetEl) return null;
 
-      targetEl.focus();
+      if (document.activeElement !== targetEl) {
+        targetEl.focus({ preventScroll: true });
+      }
+
       const sel = window.getSelection();
-      if (sel && savedRangeRef.current) {
+      if (
+        sel &&
+        savedRangeRef.current &&
+        savedRangeRef.current.startContainer.isConnected &&
+        targetEl.contains(savedRangeRef.current.commonAncestorContainer)
+      ) {
         try {
-          if (targetEl.contains(savedRangeRef.current.commonAncestorContainer)) {
-            sel.removeAllRanges();
-            sel.addRange(savedRangeRef.current);
-            return targetEl;
-          }
+          sel.removeAllRanges();
+          sel.addRange(savedRangeRef.current);
+          return targetEl;
         } catch {}
       }
 
@@ -341,22 +370,13 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       return targetEl;
     }, [safeBlocks]);
 
-    const emitActiveFormats = useCallback(() => {
-      if (!onActiveFormatsChange || typeof document === 'undefined') return;
-      try {
-        onActiveFormatsChange({
-          bold: document.queryCommandState('bold'),
-          italic: document.queryCommandState('italic'),
-          underline: document.queryCommandState('underline'),
-          unorderedList: document.queryCommandState('insertUnorderedList'),
-          orderedList: document.queryCommandState('insertOrderedList'),
-        });
-      } catch {}
-    }, [onActiveFormatsChange]);
-
     const syncBlockDomHtml = useCallback(
       (targetEl: HTMLDivElement, blockId: string) => {
         const html = targetEl.innerHTML;
+        const current = safeBlocks.find((b) => b.id === blockId && b.kind === 'text');
+        if (current && current.kind === 'text' && current.html === html) {
+          return;
+        }
         const nextBlocks = safeBlocks.map((b) =>
           b.id === blockId && b.kind === 'text' ? { ...b, html } : b
         );
@@ -445,20 +465,110 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           const sel = window.getSelection();
           if (!sel || sel.rangeCount === 0) return;
 
+          const range = sel.getRangeAt(0);
+
           if (color === null) {
-            try {
-              document.execCommand('styleWithCSS', false, 'true');
-              document.execCommand('hiliteColor', false, 'transparent');
-            } catch {}
+            if (range.collapsed) {
+              // Se estiver dentro de um <mark> ou <span style="background-color">, sai dele ou remove se vazio
+              let node: Node | null = range.startContainer;
+              let highlightEl: HTMLElement | null = null;
+              while (node && node !== el) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                  const htmlEl = node as HTMLElement;
+                  if (htmlEl.tagName === 'MARK' || htmlEl.style?.backgroundColor) {
+                    highlightEl = htmlEl;
+                    break;
+                  }
+                }
+                node = node.parentNode;
+              }
+              if (highlightEl) {
+                const afterRange = document.createRange();
+                afterRange.setStartAfter(highlightEl);
+                afterRange.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(afterRange);
+                if (!highlightEl.textContent?.replace(/\u200B/g, '').trim()) {
+                  highlightEl.remove();
+                }
+              }
+            } else {
+              try {
+                document.execCommand('styleWithCSS', false, 'true');
+                document.execCommand('hiliteColor', false, 'transparent');
+              } catch {}
+              // Limpa também tags <mark> e backgrounds residuais que interceptam a seleção
+              const nodes = Array.from(el.querySelectorAll('mark, span')) as HTMLElement[];
+              for (const htmlNode of nodes) {
+                try {
+                  if (!range.intersectsNode(htmlNode)) continue;
+                } catch {
+                  continue;
+                }
+                if (htmlNode.tagName === 'MARK') {
+                  const parent = htmlNode.parentNode;
+                  if (parent) {
+                    while (htmlNode.firstChild) {
+                      parent.insertBefore(htmlNode.firstChild, htmlNode);
+                    }
+                    parent.removeChild(htmlNode);
+                  }
+                } else if (htmlNode.style?.backgroundColor) {
+                  htmlNode.style.backgroundColor = '';
+                  htmlNode.style.padding = '';
+                  htmlNode.style.borderRadius = '';
+                  if (!htmlNode.getAttribute('style')?.trim() && htmlNode.attributes.length <= 1) {
+                    const parent = htmlNode.parentNode;
+                    if (parent) {
+                      while (htmlNode.firstChild) {
+                        parent.insertBefore(htmlNode.firstChild, htmlNode);
+                      }
+                      parent.removeChild(htmlNode);
+                    }
+                  }
+                }
+              }
+            }
+          } else if (range.collapsed) {
+            const mark = document.createElement('mark');
+            mark.style.backgroundColor = color;
+            mark.style.borderRadius = '3px';
+            mark.style.padding = '0 2px';
+            const zwsp = document.createTextNode('\u200B');
+            mark.appendChild(zwsp);
+            range.insertNode(mark);
+            const innerRange = document.createRange();
+            innerRange.setStart(zwsp, 1);
+            innerRange.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(innerRange);
           } else {
+            const beforeHtml = el.innerHTML;
+            let applied = false;
             try {
               document.execCommand('styleWithCSS', false, 'true');
-              const ok = document.execCommand('hiliteColor', false, color);
-              if (!ok) {
-                document.execCommand('backColor', false, color);
+              applied = document.execCommand('hiliteColor', false, color);
+              if (!applied) {
+                applied = document.execCommand('backColor', false, color);
               }
             } catch {
-              document.execCommand('backColor', false, color);
+              applied = false;
+            }
+            if (!applied || el.innerHTML === beforeHtml) {
+              try {
+                const activeRange = sel.getRangeAt(0);
+                const frag = activeRange.extractContents();
+                const mark = document.createElement('mark');
+                mark.style.backgroundColor = color;
+                mark.style.borderRadius = '3px';
+                mark.style.padding = '0 2px';
+                mark.appendChild(frag);
+                activeRange.insertNode(mark);
+                const newRange = document.createRange();
+                newRange.selectNodeContents(mark);
+                sel.removeAllRanges();
+                sel.addRange(newRange);
+              } catch {}
             }
           }
 

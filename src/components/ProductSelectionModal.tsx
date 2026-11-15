@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Search,
   X,
@@ -11,12 +11,16 @@ import {
   Info,
 } from 'lucide-react';
 import {
+  fetchCatalogFromSupabase,
+  filterCatalogProducts,
   getDynamicProductCatalog,
   getOfficialCategories,
   getProductTierPrice,
   getOfficialPriceTableLabel,
+  searchProductsInSupabase,
   CatalogProduct,
 } from '../data/productCatalog';
+import { ProductCategory } from '../data/initialProductsSeed';
 import { PriceTableTier } from '../types';
 import {
   isRodapeProduct,
@@ -97,25 +101,53 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
     pisoModalLastRealSqmRef.current = null;
   };
 
-  const products = useMemo(() => getDynamicProductCatalog(), [isOpen]);
-  const categories = useMemo(() => getOfficialCategories(), [isOpen]);
+  const [products, setProducts] = useState<CatalogProduct[]>(() => getDynamicProductCatalog());
+  const [categories, setCategories] = useState<ProductCategory[]>(() => getOfficialCategories());
+  const [supabaseSearchResults, setSupabaseSearchResults] = useState<CatalogProduct[] | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    fetchCatalogFromSupabase(true)
+      .then((res) => {
+        if (!active) return;
+        setProducts(res.catalog);
+        setCategories(res.categories);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    const timer = setTimeout(() => {
+      searchProductsInSupabase(searchTerm, {
+        categoryIdOrName: selectedCategory,
+      })
+        .then((res) => {
+          if (active) setSupabaseSearchResults(res);
+        })
+        .catch(() => {});
+    }, 120);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [isOpen, searchTerm, selectedCategory]);
 
   const filteredProducts = useMemo(() => {
-    return products.filter((prod) => {
-      // Name filter
-      const matchesName =
-        !searchTerm.trim() ||
-        prod.name.toLowerCase().includes(searchTerm.toLowerCase().trim());
-
-      // Category filter
-      const matchesCategory =
-        selectedCategory === 'all' ||
-        prod.categoryId === selectedCategory ||
-        prod.category.toLowerCase() === selectedCategory.toLowerCase();
-
-      return matchesName && matchesCategory;
+    if (supabaseSearchResults !== null) {
+      return filterCatalogProducts(supabaseSearchResults, searchTerm, {
+        categoryIdOrName: selectedCategory,
+      });
+    }
+    return filterCatalogProducts(products, searchTerm, {
+      categoryIdOrName: selectedCategory,
     });
-  }, [products, searchTerm, selectedCategory]);
+  }, [supabaseSearchResults, products, searchTerm, selectedCategory]);
 
   if (!isOpen) return null;
 
@@ -166,15 +198,10 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
       const effMl = Math.round(explicitBars * barLen * 100) / 100;
       rodapeModalRequestedMlRef.current = effMl;
       rodapeModalLastBarrasRef.current = explicitBars;
-      const detailText = formatRodapeDetailText({
-        requestedMl: effMl,
-        barCount: explicitBars,
-        barLengthMeters: barLen,
-        existingDetail: subtituloInput,
-      });
-      setSubtituloInput(detailText);
+      const cleanManualDetail = stripRodapeAutoDetail(subtituloInput) || '';
+      setSubtituloInput(cleanManualDetail);
       if (updateQtyField) setQuantityInput(String(explicitBars));
-      return { barras: explicitBars, metros: effMl, barLen, detailText };
+      return { barras: explicitBars, metros: effMl, barLen, detailText: cleanManualDetail };
     }
 
     const parsedNum = parsePtBrNumeric(rawVal);
@@ -194,17 +221,12 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
     rodapeModalRequestedMlRef.current = requestedMl;
     rodapeModalLastBarrasRef.current = conv.barras;
 
-    const detailText = formatRodapeDetailText({
-      requestedMl,
-      barCount: conv.barras,
-      barLengthMeters: barLen,
-      existingDetail: subtituloInput,
-    });
-    setSubtituloInput(detailText);
+    const cleanManualDetail = stripRodapeAutoDetail(subtituloInput) || '';
+    setSubtituloInput(cleanManualDetail);
     if (updateQtyField) {
       setQuantityInput(String(conv.barras));
     }
-    return { ...conv, detailText };
+    return { ...conv, detailText: cleanManualDetail };
   };
 
   const handleChooseProduct = (prod: CatalogProduct) => {
@@ -363,7 +385,7 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                   type="text"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Digite o que está buscando..."
+                  placeholder="Buscar por nome, marca, modelo ou categoria..."
                   className="w-full bg-transparent text-xs sm:text-sm text-slate-900 placeholder:text-slate-400 outline-none"
                   autoFocus
                 />
@@ -588,18 +610,6 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                                 }
                                 rodapeModalRequestedMlRef.current = parsedNum;
                                 rodapeModalLastBarrasRef.current = null;
-                                const barLen = extractBarLengthFromProductName(prod.name, 2.4);
-                                const conv = convertMetrosToBarras(parsedNum, prod.name, barLen);
-                                if (conv && conv.barras > 0) {
-                                  setSubtituloInput(
-                                    formatRodapeDetailText({
-                                      requestedMl: parsedNum,
-                                      barCount: conv.barras,
-                                      barLengthMeters: barLen,
-                                      existingDetail: subtituloInput,
-                                    })
-                                  );
-                                }
                                 rodapeModalDebounceRef.current = setTimeout(() => {
                                   applyRodapeModalConversion(prod, val, true);
                                   rodapeModalDebounceRef.current = null;

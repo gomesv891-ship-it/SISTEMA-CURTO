@@ -3,10 +3,6 @@ import {
   Search,
   X,
   RotateCcw,
-  Calendar,
-  CalendarDays,
-  ChevronLeft,
-  ChevronRight,
   Eye,
   Pencil,
   Trash2,
@@ -22,10 +18,14 @@ import {
   AlertTriangle,
   FileText,
   ExternalLink,
+  ArrowUpDown,
+  Hash,
+  Sparkles,
 } from 'lucide-react';
 import {
   ClientRecord,
   FollowUpItem,
+  OfficialFollowUpStatus,
   OrcamentoStatus,
   SavedOrcamento,
 } from '../../types';
@@ -34,6 +34,9 @@ import {
   deduplicateFollowUpList,
   extractOrcamentoCreationDateParts,
   findMatchingFollowUpIndex,
+  generateNextPedidoNumber,
+  getDisplayOrcamentoNumber,
+  mapOrcamentoStatusToFollowUp,
   normalizeOrcamentoRefId,
   resolveClientPhone,
   resolveOrcamentoResponsible,
@@ -42,13 +45,57 @@ import { isRecordOfResponsible, getSellerIdForUser } from '../../utils/userDataF
 import { getUserIdByName } from '../../utils/auth';
 import { ResponsibleFilterTabs } from '../ResponsibleFilterTabs';
 
-export type TrackingListStatus = 'Pendente' | 'Vendido' | 'Não vendido';
-export type TrackingStatusFilter = 'Todos' | 'Vendidos' | 'Pendentes' | 'Não vendidos';
-export type TrackingPeriodMode = 'dia' | 'mes' | 'todos';
+export type TrackingListStatus = OfficialFollowUpStatus;
+export type TrackingStatusFilter = 'Todos' | OfficialFollowUpStatus;
+export type TrackingPeriodMode =
+  | 'todos'
+  | 'hoje'
+  | '7dias'
+  | '30dias'
+  | 'mes_atual'
+  | 'dia'
+  | 'mes'
+  | 'personalizado';
+export type TrackingValueRangeFilter =
+  | 'todos'
+  | 'ate_2k'
+  | '2k_5k'
+  | '5k_15k'
+  | '15k_30k'
+  | 'acima_30k';
+export type TrackingSqmRangeFilter =
+  | 'todos'
+  | 'ate_20'
+  | '20_50'
+  | '50_100'
+  | 'acima_100'
+  | 'sem_metragem';
+export type TrackingSortOrder =
+  | 'recentes'
+  | 'antigos'
+  | 'maior_valor'
+  | 'menor_valor'
+  | 'maior_metragem'
+  | 'menor_metragem'
+  | 'alfabetica';
+
+export const OFFICIAL_TRACKING_STATUSES: { value: OfficialFollowUpStatus; label: string }[] = [
+  { value: 'Orçamento Enviado', label: 'ORÇAMENTO ENVIADO' },
+  { value: 'Aguardando Retorno', label: 'AGUARDANDO RETORNO' },
+  { value: 'Negociando', label: 'NEGOCIANDO' },
+  { value: 'Vendido', label: 'VENDIDO' },
+  { value: 'Perdido', label: 'PERDIDO' },
+];
+
+export function getOfficialStatusLabel(status: OfficialFollowUpStatus): string {
+  const found = OFFICIAL_TRACKING_STATUSES.find((s) => s.value === status);
+  return found ? found.label : String(status).toUpperCase();
+}
 
 export interface TrackingOrcamentoRow {
   rowKey: string;
   orcamentoId: string;
+  numeroOrcamento: string;
   followUpId?: string;
   pedido?: string;
   clientId?: string;
@@ -58,7 +105,7 @@ export interface TrackingOrcamentoRow {
   nomeOrcamento: string;
   sqm: number;
   valor: number;
-  status: TrackingListStatus;
+  status: OfficialFollowUpStatus;
   observacao: string;
   responsavel: string;
   responsavelId?: string | null;
@@ -79,43 +126,24 @@ export interface TrackingOrcamentoRow {
 export function deriveTrackingStatus(
   followUp?: FollowUpItem,
   orc?: Partial<SavedOrcamento>
-): TrackingListStatus {
-  if (
-    followUp?.trackingStatus === 'Pendente' ||
-    followUp?.trackingStatus === 'Vendido' ||
-    followUp?.trackingStatus === 'Não vendido'
-  ) {
-    return followUp.trackingStatus;
+): OfficialFollowUpStatus {
+  const orcMapped = orc?.status ? mapOrcamentoStatusToFollowUp(orc.status) : null;
+  if (orcMapped === 'Vendido') return 'Vendido';
+
+  if (followUp?.status) {
+    const fupMapped = mapOrcamentoStatusToFollowUp(followUp.status);
+    if (fupMapped === 'Orçamento Enviado' && followUp.trackingStatus) {
+      if (followUp.trackingStatus === 'Vendido') return 'Vendido';
+      if (followUp.trackingStatus === 'Não vendido') return 'Perdido';
+    }
+    return fupMapped;
   }
 
-  const raw = String(followUp?.status || orc?.status || '')
-    .trim()
-    .toLowerCase();
+  if (followUp?.trackingStatus === 'Vendido') return 'Vendido';
+  if (followUp?.trackingStatus === 'Não vendido') return 'Perdido';
 
-  if (
-    raw === 'vendido' ||
-    raw === 'fechado' ||
-    raw === 'fechados' ||
-    raw === 'aprovado' ||
-    raw === 'venda' ||
-    raw === 'concluido' ||
-    raw === 'concluído'
-  ) {
-    return 'Vendido';
-  }
-
-  if (
-    raw === 'perdido' ||
-    raw === 'perdidos' ||
-    raw === 'recusado' ||
-    raw === 'cancelado' ||
-    raw === 'não vendido' ||
-    raw === 'nao vendido'
-  ) {
-    return 'Não vendido';
-  }
-
-  return 'Pendente';
+  if (orcMapped) return orcMapped;
+  return 'Orçamento Enviado';
 }
 
 export function formatPhoneDisplay(phone?: string): string {
@@ -161,6 +189,21 @@ export function formatCurrencyBRL(val: number): string {
   })}`;
 }
 
+function getLocalISODate(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function normalizeSearchText(str?: string): string {
+  return (str || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
 export function buildTrackingRows(params: {
   followUpItems: FollowUpItem[];
   allOrcamentos: SavedOrcamento[];
@@ -182,7 +225,12 @@ export function buildTrackingRows(params: {
     const existingTs = new Date(existing.updatedAt || existing.savedAt || 0).getTime() || 0;
     const incomingTs = new Date(o.updatedAt || o.savedAt || 0).getTime() || 0;
     if (incomingTs >= existingTs) {
-      orcMap.set(key, { ...existing, ...o });
+      orcMap.set(key, {
+        ...existing,
+        ...o,
+        pedido: o.pedido || existing.pedido,
+        followUpId: o.followUpId || existing.followUpId,
+      });
     }
   });
 
@@ -253,9 +301,12 @@ export function buildTrackingRows(params: {
       getUserIdByName(responsavel) ||
       getSellerIdForUser(responsavel);
 
+    const numeroOrcamento = getDisplayOrcamentoNumber(orc, orcId);
+
     rows.push({
       rowKey: `orc_${normalizeOrcamentoRefId(orcId) || orcId}`,
       orcamentoId: orcId,
+      numeroOrcamento,
       followUpId: fup?.id,
       pedido: (orc as any).pedido || (orc as any).orderNum || fup?.pedido || '',
       clientId: orc.clientId || fup?.clientId,
@@ -320,8 +371,11 @@ export function buildTrackingRows(params: {
       );
     }
 
+    const orcId = fup.orcamentoId || fup.id.replace(/^fup_/, '') || `orc_${fup.id}`;
+    const fallbackStatus = deriveTrackingStatus(fup);
+
     const fallbackOrc: SavedOrcamento = {
-      id: fup.orcamentoId || fup.id.replace(/^fup_/, '') || `orc_${fup.id}`,
+      id: orcId,
       clientId: fup.clientId || 'cli_geral',
       clientName,
       clientType: fup.clientType || 'Cliente Final',
@@ -346,13 +400,18 @@ export function buildTrackingRows(params: {
       freteEndereco: '',
       descontoValor: Number(fup.desconto) || 0,
       totalFinal: Number(fup.valor) || 0,
-      status: (fup.status as OrcamentoStatus) || 'Em aberto',
+      status: fallbackStatus as OrcamentoStatus,
+      pedido: fup.pedido || '',
+      followUpId: fup.id,
       savedAt: fup.createdAt || new Date().toISOString(),
     };
 
+    const numeroOrcamento = getDisplayOrcamentoNumber(fallbackOrc, orcId);
+
     rows.push({
       rowKey: `fup_${fup.id}`,
-      orcamentoId: fup.orcamentoId || fup.id,
+      orcamentoId: orcId,
+      numeroOrcamento,
       followUpId: fup.id,
       pedido: fup.pedido || '',
       clientId: fup.clientId,
@@ -362,7 +421,7 @@ export function buildTrackingRows(params: {
       nomeOrcamento: fup.nomeOrcamento || fup.produto || 'Orçamento',
       sqm,
       valor: Number(fup.valor) || 0,
-      status: deriveTrackingStatus(fup),
+      status: fallbackStatus,
       observacao: fup.observacao || '',
       responsavel: fup.responsavel || fup.vendedor || fallbackUserName || 'Consultora Fênix',
       responsavelId: fup.responsavelId,
@@ -401,14 +460,18 @@ const getClientTypeIconInfo = (type?: string) => {
   }
 };
 
-const getTrackingStatusSelectClass = (status: TrackingListStatus): string => {
+const getTrackingStatusSelectClass = (status: OfficialFollowUpStatus): string => {
   switch (status) {
     case 'Vendido':
       return 'bg-emerald-50 text-emerald-700 border-emerald-200 focus:border-emerald-500';
-    case 'Não vendido':
+    case 'Perdido':
       return 'bg-rose-50 text-rose-700 border-rose-200 focus:border-rose-500';
+    case 'Negociando':
+      return 'bg-purple-50 text-purple-700 border-purple-200 focus:border-purple-500';
+    case 'Aguardando Retorno':
+      return 'bg-amber-50 text-amber-800 border-amber-200 focus:border-amber-500';
     default:
-      return 'bg-amber-50 text-amber-800 border-amber-200 focus:border-[#0052cc]';
+      return 'bg-blue-50 text-[#0052cc] border-blue-200 focus:border-[#0052cc]';
   }
 };
 
@@ -419,7 +482,7 @@ interface ListaAcompanhamentoOrcamentosProps {
   currentUserName: string;
   isDirector: boolean;
   onViewOrcamento: (row: TrackingOrcamentoRow) => void;
-  onUpdateTrackingStatus: (row: TrackingOrcamentoRow, newStatus: TrackingListStatus) => Promise<void> | void;
+  onUpdateTrackingStatus: (row: TrackingOrcamentoRow, newStatus: OfficialFollowUpStatus) => Promise<void> | void;
   onSaveTrackingEdit: (
     row: TrackingOrcamentoRow,
     edited: {
@@ -428,7 +491,8 @@ interface ListaAcompanhamentoOrcamentosProps {
       nomeOrcamento: string;
       sqm: number;
       valor: number;
-      status: TrackingListStatus;
+      status: OfficialFollowUpStatus;
+      pedido?: string;
       observacao: string;
       restoreOriginal?: boolean;
     }
@@ -447,14 +511,20 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
   onSaveTrackingEdit,
   onRemoveFromTrackingList,
 }) => {
-  const todayStr = useMemo(() => new Date().toISOString().slice(0, 10), []);
-  const currentMonthStr = useMemo(() => new Date().toISOString().slice(0, 7), []);
+  const todayStr = useMemo(() => getLocalISODate(new Date()), []);
+  const currentMonthStr = useMemo(() => todayStr.slice(0, 7), [todayStr]);
 
+  // Filtros combinados
   const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState<TrackingStatusFilter>('Todos');
   const [periodMode, setPeriodMode] = useState<TrackingPeriodMode>('todos');
   const [selectedDate, setSelectedDate] = useState<string>(todayStr);
   const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
-  const [statusFilter, setStatusFilter] = useState<TrackingStatusFilter>('Todos');
+  const [customStartDate, setCustomStartDate] = useState<string>('');
+  const [customEndDate, setCustomEndDate] = useState<string>('');
+  const [valueRangeFilter, setValueRangeFilter] = useState<TrackingValueRangeFilter>('todos');
+  const [sqmRangeFilter, setSqmRangeFilter] = useState<TrackingSqmRangeFilter>('todos');
+  const [sortOrder, setSortOrder] = useState<TrackingSortOrder>('recentes');
   const [responsibleTab, setResponsibleTab] = useState<string>('Todos');
 
   // Modais de Edição e Exclusão da Lista de Acompanhamento
@@ -465,7 +535,8 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
     nomeOrcamento: string;
     sqm: string;
     valor: string;
-    status: TrackingListStatus;
+    status: OfficialFollowUpStatus;
+    pedido: string;
     observacao: string;
   }>({
     cliente: '',
@@ -473,15 +544,17 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
     nomeOrcamento: '',
     sqm: '',
     valor: '',
-    status: 'Pendente',
+    status: 'Orçamento Enviado',
+    pedido: '',
     observacao: '',
   });
+  const [editPedidoError, setEditPedidoError] = useState('');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
 
   const [removingRow, setRemovingRow] = useState<TrackingOrcamentoRow | null>(null);
   const [isRemoving, setIsRemoving] = useState(false);
 
-  // 1. Constrói todas as linhas 1:1 (orçamento -> registro)
+  // 1. Constrói todas as linhas 1:1 (orçamento -> registro) com dados reais do Supabase
   const allRows = useMemo(
     () =>
       buildTrackingRows({
@@ -493,73 +566,188 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
     [followUpItems, allOrcamentos, clients, currentUserName]
   );
 
-  // 2. Filtro por data de criação do orçamento
-  const periodFilteredRows = useMemo(() => {
-    if (periodMode === 'todos') return allRows;
-    if (periodMode === 'dia') {
-      return allRows.filter((r) => r.creationDateStr === selectedDate);
-    }
-    return allRows.filter((r) => r.creationMonthStr === selectedMonth);
-  }, [allRows, periodMode, selectedDate, selectedMonth]);
-
   // Contagem por responsável (para diretoria)
   const responsibleCounts = useMemo(() => {
     if (!isDirector) return undefined;
     return {
-      todos: periodFilteredRows.length,
-      eder: periodFilteredRows.filter((r) => isRecordOfResponsible(r, 'Éder')).length,
-      vanessa: periodFilteredRows.filter((r) => isRecordOfResponsible(r, 'Vanessa')).length,
-      jhessica: periodFilteredRows.filter((r) => isRecordOfResponsible(r, 'Jhessica')).length,
-      demais: periodFilteredRows.filter((r) => isRecordOfResponsible(r, 'demais')).length,
+      todos: allRows.length,
+      eder: allRows.filter((r) => isRecordOfResponsible(r, 'Éder')).length,
+      vanessa: allRows.filter((r) => isRecordOfResponsible(r, 'Vanessa')).length,
+      jhessica: allRows.filter((r) => isRecordOfResponsible(r, 'Jhessica')).length,
+      demais: allRows.filter((r) => isRecordOfResponsible(r, 'demais')).length,
     };
-  }, [periodFilteredRows, isDirector]);
+  }, [allRows, isDirector]);
 
-  // 3. Escopo de usuário / responsável
-  const scopedRows = useMemo(() => {
+  // 2. Escopo de usuário / responsável
+  const userScopedRows = useMemo(() => {
     if (isDirector) {
-      if (responsibleTab === 'Todos') return periodFilteredRows;
-      return periodFilteredRows.filter((r) => isRecordOfResponsible(r, responsibleTab));
+      if (responsibleTab === 'Todos') return allRows;
+      return allRows.filter((r) => isRecordOfResponsible(r, responsibleTab));
     }
-    return periodFilteredRows.filter((r) => isRecordOfResponsible(r, currentUserName || ''));
-  }, [periodFilteredRows, isDirector, responsibleTab, currentUserName]);
+    return allRows.filter((r) => isRecordOfResponsible(r, currentUserName || ''));
+  }, [allRows, isDirector, responsibleTab, currentUserName]);
 
-  // Contadores dos filtros de status
-  const statusCounts = useMemo(() => {
-    return {
-      Todos: scopedRows.length,
-      Vendidos: scopedRows.filter((r) => r.status === 'Vendido').length,
-      Pendentes: scopedRows.filter((r) => r.status === 'Pendente').length,
-      'Não vendidos': scopedRows.filter((r) => r.status === 'Não vendido').length,
-    };
-  }, [scopedRows]);
+  // Datas auxiliares para filtros de período relativo
+  const sevenDaysAgoStr = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 6);
+    return getLocalISODate(d);
+  }, []);
 
-  // 4. Filtro de status + pesquisa textual (nome, telefone ou número/título do orçamento)
-  const visibleRows = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase();
+  const thirtyDaysAgoStr = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 29);
+    return getLocalISODate(d);
+  }, []);
+
+  // Contadores de status sobre a base do usuário (combinando pesquisa, período, faixa de valor e metragem)
+  const preStatusRows = useMemo(() => {
+    const q = normalizeSearchText(searchTerm);
+    const qCleanHash = q.replace(/^#+/, '');
     const qDigits = q.replace(/\D/g, '');
 
-    // Quando há pesquisa ativa sem filtros restritivos, busca dentro de scopedRows
-    return scopedRows.filter((row) => {
-      if (statusFilter === 'Vendidos' && row.status !== 'Vendido') return false;
-      if (statusFilter === 'Pendentes' && row.status !== 'Pendente') return false;
-      if (statusFilter === 'Não vendidos' && row.status !== 'Não vendido') return false;
+    return userScopedRows.filter((row) => {
+      // Período de criação
+      if (periodMode === 'hoje') {
+        if (row.creationDateStr !== todayStr) return false;
+      } else if (periodMode === '7dias') {
+        if (!row.creationDateStr || row.creationDateStr < sevenDaysAgoStr) return false;
+      } else if (periodMode === '30dias') {
+        if (!row.creationDateStr || row.creationDateStr < thirtyDaysAgoStr) return false;
+      } else if (periodMode === 'mes_atual') {
+        if (row.creationMonthStr !== currentMonthStr) return false;
+      } else if (periodMode === 'dia') {
+        if (row.creationDateStr !== selectedDate) return false;
+      } else if (periodMode === 'mes') {
+        if (row.creationMonthStr !== selectedMonth) return false;
+      } else if (periodMode === 'personalizado') {
+        if (customStartDate && (!row.creationDateStr || row.creationDateStr < customStartDate)) return false;
+        if (customEndDate && (!row.creationDateStr || row.creationDateStr > customEndDate)) return false;
+      }
 
+      // Faixa de valor
+      if (valueRangeFilter === 'ate_2k' && row.valor > 2000) return false;
+      if (valueRangeFilter === '2k_5k' && (row.valor <= 2000 || row.valor > 5000)) return false;
+      if (valueRangeFilter === '5k_15k' && (row.valor <= 5000 || row.valor > 15000)) return false;
+      if (valueRangeFilter === '15k_30k' && (row.valor <= 15000 || row.valor > 30000)) return false;
+      if (valueRangeFilter === 'acima_30k' && row.valor <= 30000) return false;
+
+      // Faixa de metragem
+      if (sqmRangeFilter === 'ate_20' && (row.sqm <= 0 || row.sqm > 20)) return false;
+      if (sqmRangeFilter === '20_50' && (row.sqm <= 20 || row.sqm > 50)) return false;
+      if (sqmRangeFilter === '50_100' && (row.sqm <= 50 || row.sqm > 100)) return false;
+      if (sqmRangeFilter === 'acima_100' && row.sqm <= 100) return false;
+      if (sqmRangeFilter === 'sem_metragem' && row.sqm > 0) return false;
+
+      // Busca por cliente, telefone ou número do orçamento
       if (!q) return true;
 
-      const inClient = row.cliente.toLowerCase().includes(q);
-      const inBudgetName = row.nomeOrcamento.toLowerCase().includes(q);
-      const inPedido = (row.pedido || '').toLowerCase().includes(q);
-      const inOrcId = row.orcamentoId.toLowerCase().includes(q);
-      const inPhone = row.telefone.toLowerCase().includes(q);
+      const inClient = normalizeSearchText(row.cliente).includes(q);
+      const inBudgetName = normalizeSearchText(row.nomeOrcamento).includes(q);
+      const inPedido = normalizeSearchText(row.pedido).replace(/^#+/, '').includes(qCleanHash);
+      const inNumeroOrc = normalizeSearchText(row.numeroOrcamento).includes(qCleanHash);
+      const inOrcId = normalizeSearchText(row.orcamentoId).includes(qCleanHash);
+      const inPhone = normalizeSearchText(row.telefone).includes(q);
       const phoneDigits = row.telefone.replace(/\D/g, '');
       const inPhoneDigits = qDigits.length >= 3 && phoneDigits.includes(qDigits);
 
-      return inClient || inBudgetName || inPedido || inOrcId || inPhone || inPhoneDigits;
+      return (
+        inClient ||
+        inBudgetName ||
+        inPedido ||
+        inNumeroOrc ||
+        inOrcId ||
+        inPhone ||
+        inPhoneDigits
+      );
     });
-  }, [scopedRows, statusFilter, searchTerm]);
+  }, [
+    userScopedRows,
+    periodMode,
+    todayStr,
+    sevenDaysAgoStr,
+    thirtyDaysAgoStr,
+    currentMonthStr,
+    selectedDate,
+    selectedMonth,
+    customStartDate,
+    customEndDate,
+    valueRangeFilter,
+    sqmRangeFilter,
+    searchTerm,
+  ]);
+
+  const statusCounts = useMemo(() => {
+    const counts: Record<TrackingStatusFilter, number> = {
+      Todos: preStatusRows.length,
+      'Orçamento Enviado': 0,
+      'Aguardando Retorno': 0,
+      Negociando: 0,
+      Vendido: 0,
+      Perdido: 0,
+    };
+    preStatusRows.forEach((r) => {
+      if (counts[r.status] !== undefined) {
+        counts[r.status] += 1;
+      }
+    });
+    return counts;
+  }, [preStatusRows]);
+
+  // 3. Aplica filtro de Status + Ordenação combinados
+  const visibleRows = useMemo(() => {
+    const filtered =
+      statusFilter === 'Todos'
+        ? preStatusRows
+        : preStatusRows.filter((row) => row.status === statusFilter);
+
+    return [...filtered].sort((a, b) => {
+      switch (sortOrder) {
+        case 'antigos':
+          return a.creationTimestamp - b.creationTimestamp;
+        case 'maior_valor':
+          return b.valor - a.valor || b.creationTimestamp - a.creationTimestamp;
+        case 'menor_valor':
+          return a.valor - b.valor || b.creationTimestamp - a.creationTimestamp;
+        case 'maior_metragem':
+          return b.sqm - a.sqm || b.creationTimestamp - a.creationTimestamp;
+        case 'menor_metragem':
+          return a.sqm - b.sqm || b.creationTimestamp - a.creationTimestamp;
+        case 'alfabetica':
+          return a.cliente.localeCompare(b.cliente, 'pt-BR', { sensitivity: 'base' });
+        case 'recentes':
+        default:
+          return b.creationTimestamp - a.creationTimestamp;
+      }
+    });
+  }, [preStatusRows, statusFilter, sortOrder]);
+
+  const hasActiveFilters =
+    searchTerm.trim() !== '' ||
+    statusFilter !== 'Todos' ||
+    periodMode !== 'todos' ||
+    valueRangeFilter !== 'todos' ||
+    sqmRangeFilter !== 'todos' ||
+    sortOrder !== 'recentes' ||
+    (isDirector && responsibleTab !== 'Todos');
+
+  const handleClearFilters = () => {
+    setSearchTerm('');
+    setStatusFilter('Todos');
+    setPeriodMode('todos');
+    setSelectedDate(todayStr);
+    setSelectedMonth(currentMonthStr);
+    setCustomStartDate('');
+    setCustomEndDate('');
+    setValueRangeFilter('todos');
+    setSqmRangeFilter('todos');
+    setSortOrder('recentes');
+    if (isDirector) setResponsibleTab('Todos');
+  };
 
   const handleOpenEditModal = (row: TrackingOrcamentoRow) => {
     setEditingRow(row);
+    setEditPedidoError('');
     setEditForm({
       cliente: row.cliente,
       telefone: row.telefone,
@@ -567,6 +755,7 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
       sqm: row.sqm > 0 ? String(row.sqm).replace('.', ',') : '',
       valor: row.valor > 0 ? row.valor.toFixed(2).replace('.', ',') : '0,00',
       status: row.status,
+      pedido: row.pedido ? String(row.pedido).replace(/^#+/, '') : '',
       observacao: row.observacao,
     });
   };
@@ -574,6 +763,12 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
   const handleConfirmEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingRow) return;
+
+    const cleanPedido = editForm.pedido.trim().replace(/^#+/, '');
+    if (editForm.status === 'Vendido' && !cleanPedido) {
+      setEditPedidoError('Informe ou gere o número do pedido para concluir como VENDIDO.');
+      return;
+    }
 
     const parsePtNumber = (txt: string): number => {
       const cleaned = txt.trim().replace(/[^\d.,]/g, '');
@@ -596,6 +791,7 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
         sqm: parsePtNumber(editForm.sqm),
         valor: parsePtNumber(editForm.valor),
         status: editForm.status,
+        pedido: cleanPedido || undefined,
         observacao: editForm.observacao.trim(),
       });
       setEditingRow(null);
@@ -617,6 +813,7 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
         sqm: origSqm,
         valor: Number(origOrc.totalFinal) || 0,
         status: editingRow.status,
+        pedido: editingRow.pedido,
         observacao: origOrc.observacoes || '',
         restoreOriginal: true,
       });
@@ -649,25 +846,25 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
         />
       )}
 
-      {/* Barra de Filtros: Pesquisa, Período (Data de Criação) e Status */}
-      <div className="bg-white rounded-[24px] border border-slate-200/90 shadow-[0_4px_24px_-4px_rgba(0,0,0,0.04)] p-4 sm:p-5 space-y-4">
-        {/* Linha 1: Pesquisa + Filtro de Data de Criação */}
-        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3.5">
-          {/* Pesquisa */}
-          <div className="relative w-full xl:max-w-md flex-1">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+      {/* Barra Compacta de Filtros e Ordenação acima da tabela */}
+      <div className="bg-white rounded-[22px] border border-slate-200/90 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.04)] p-3.5 sm:p-4 space-y-2.5">
+        {/* Grade compacta de filtros combináveis */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-2 items-center">
+          {/* 1. Busca por cliente, telefone ou número do orçamento */}
+          <div className="relative lg:col-span-4">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               type="text"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Pesquisar por cliente, WhatsApp ou nº/nome do orçamento..."
-              className="w-full h-10 pl-10 pr-9 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs sm:text-sm text-slate-800 placeholder:text-slate-400 outline-none transition-all"
+              placeholder="Buscar cliente, telefone ou nº orçamento..."
+              className="w-full h-9 pl-8.5 pr-8 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs text-slate-800 placeholder:text-slate-400 outline-none transition-all"
             />
             {searchTerm && (
               <button
                 type="button"
                 onClick={() => setSearchTerm('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
                 title="Limpar busca"
               >
                 <X className="w-3.5 h-3.5" />
@@ -675,180 +872,104 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
             )}
           </div>
 
-          {/* Filtro de Data (criação do orçamento) */}
-          <div className="flex flex-wrap items-center gap-2.5">
-            <div className="flex items-center gap-1 p-1 bg-slate-100/90 rounded-xl border border-slate-200/80">
-              <button
-                type="button"
-                onClick={() => setPeriodMode('dia')}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  periodMode === 'dia'
-                    ? 'bg-white text-[#0052cc] shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
+          {/* 2. Status (somente os 5 oficiais + Todos) */}
+          <div className="lg:col-span-2">
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as TrackingStatusFilter)}
+              aria-label="Filtrar por Status"
+              className="w-full h-9 px-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+            >
+              <option value="Todos">Status: Todos ({statusCounts.Todos})</option>
+              {OFFICIAL_TRACKING_STATUSES.map((st) => (
+                <option key={st.value} value={st.value}>
+                  {st.label} ({statusCounts[st.value]})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* 3. Período de criação */}
+          <div className="lg:col-span-2">
+            <select
+              value={periodMode}
+              onChange={(e) => setPeriodMode(e.target.value as TrackingPeriodMode)}
+              aria-label="Filtrar por Período de Criação"
+              className="w-full h-9 px-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+            >
+              <option value="todos">Período: Todos</option>
+              <option value="hoje">Hoje</option>
+              <option value="7dias">Últimos 7 dias</option>
+              <option value="30dias">Últimos 30 dias</option>
+              <option value="mes_atual">Este mês</option>
+              <option value="dia">Dia específico...</option>
+              <option value="mes">Mês específico...</option>
+              <option value="personalizado">Intervalo de datas...</option>
+            </select>
+          </div>
+
+          {/* 4. Faixa de valor */}
+          <div className="lg:col-span-1">
+            <select
+              value={valueRangeFilter}
+              onChange={(e) => setValueRangeFilter(e.target.value as TrackingValueRangeFilter)}
+              aria-label="Filtrar por Faixa de Valor"
+              title="Faixa de valor"
+              className="w-full h-9 px-2 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+            >
+              <option value="todos">Valor: Todos</option>
+              <option value="ate_2k">Até R$ 2 mil</option>
+              <option value="2k_5k">R$ 2 mil – 5 mil</option>
+              <option value="5k_15k">R$ 5 mil – 15 mil</option>
+              <option value="15k_30k">R$ 15 mil – 30 mil</option>
+              <option value="acima_30k">Acima R$ 30 mil</option>
+            </select>
+          </div>
+
+          {/* 5. Metragem */}
+          <div className="lg:col-span-1">
+            <select
+              value={sqmRangeFilter}
+              onChange={(e) => setSqmRangeFilter(e.target.value as TrackingSqmRangeFilter)}
+              aria-label="Filtrar por Metragem"
+              title="Metragem"
+              className="w-full h-9 px-2 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+            >
+              <option value="todos">m²: Todos</option>
+              <option value="ate_20">Até 20 m²</option>
+              <option value="20_50">20 a 50 m²</option>
+              <option value="50_100">50 a 100 m²</option>
+              <option value="acima_100">+ de 100 m²</option>
+              <option value="sem_metragem">Sem m²</option>
+            </select>
+          </div>
+
+          {/* 6. Ordenação */}
+          <div className="lg:col-span-2 flex items-center gap-1.5">
+            <div className="relative flex-1">
+              <ArrowUpDown className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <select
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value as TrackingSortOrder)}
+                aria-label="Ordenar lista"
+                className="w-full h-9 pl-7.5 pr-2 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
               >
-                <Calendar className="w-3.5 h-3.5" />
-                <span>Por Dia</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setPeriodMode('mes')}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  periodMode === 'mes'
-                    ? 'bg-white text-[#0052cc] shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <CalendarDays className="w-3.5 h-3.5" />
-                <span>Por Mês</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setPeriodMode('todos')}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  periodMode === 'todos'
-                    ? 'bg-white text-[#0052cc] shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <span>Todos os Períodos</span>
-              </button>
+                <option value="recentes">Mais recentes</option>
+                <option value="antigos">Mais antigos</option>
+                <option value="maior_valor">Maior valor</option>
+                <option value="menor_valor">Menor valor</option>
+                <option value="maior_metragem">Maior metragem</option>
+                <option value="menor_metragem">Menor metragem</option>
+                <option value="alfabetica">Ordem alfabética</option>
+              </select>
             </div>
 
-            {periodMode === 'dia' && (
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const d = new Date(selectedDate + 'T12:00:00');
-                    d.setDate(d.getDate() - 1);
-                    setSelectedDate(d.toISOString().slice(0, 10));
-                  }}
-                  className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
-                  title="Dia anterior"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <input
-                  type="date"
-                  value={selectedDate}
-                  onChange={(e) => setSelectedDate(e.target.value)}
-                  className="h-9 px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    const d = new Date(selectedDate + 'T12:00:00');
-                    d.setDate(d.getDate() + 1);
-                    setSelectedDate(d.toISOString().slice(0, 10));
-                  }}
-                  className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
-                  title="Próximo dia"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedDate(todayStr)}
-                  className="px-2.5 py-1.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold cursor-pointer"
-                >
-                  Hoje
-                </button>
-              </div>
-            )}
-
-            {periodMode === 'mes' && (
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const [y, m] = selectedMonth.split('-').map(Number);
-                    const prevM = m === 1 ? 12 : m - 1;
-                    const prevY = m === 1 ? y - 1 : y;
-                    setSelectedMonth(`${prevY}-${String(prevM).padStart(2, '0')}`);
-                  }}
-                  className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
-                  title="Mês anterior"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <input
-                  type="month"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(e.target.value)}
-                  className="h-9 px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    const [y, m] = selectedMonth.split('-').map(Number);
-                    const nextM = m === 12 ? 1 : m + 1;
-                    const nextY = m === 12 ? y + 1 : y;
-                    setSelectedMonth(`${nextY}-${String(nextM).padStart(2, '0')}`);
-                  }}
-                  className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
-                  title="Próximo mês"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedMonth(currentMonthStr)}
-                  className="px-2.5 py-1.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold cursor-pointer"
-                >
-                  Mês Atual
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Linha 2: Filtro de Status + Contador */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-slate-100">
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0 no-scrollbar select-none">
-            {(['Todos', 'Pendentes', 'Vendidos', 'Não vendidos'] as TrackingStatusFilter[]).map(
-              (tab) => {
-                const isActive = statusFilter === tab;
-                const count = statusCounts[tab];
-                return (
-                  <button
-                    key={tab}
-                    type="button"
-                    onClick={() => setStatusFilter(tab)}
-                    className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-semibold whitespace-nowrap transition-all cursor-pointer ${
-                      isActive
-                        ? 'bg-[#0052cc] text-white shadow-sm shadow-blue-600/20'
-                        : 'bg-white border border-slate-200/90 text-slate-700 hover:bg-slate-50 hover:text-slate-900 shadow-2xs'
-                    }`}
-                  >
-                    <span>{tab}</span>
-                    <span
-                      className={`inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-[11px] font-bold ${
-                        isActive ? 'bg-[#003d99] text-white' : 'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      {count}
-                    </span>
-                  </button>
-                );
-              }
-            )}
-          </div>
-
-          <div className="flex items-center gap-3 text-xs text-slate-500 justify-between sm:justify-end">
-            <span>
-              Exibindo <strong className="text-slate-900 font-bold">{visibleRows.length}</strong>{' '}
-              {visibleRows.length === 1 ? 'orçamento' : 'orçamentos'}
-            </span>
-            {(searchTerm || statusFilter !== 'Todos' || periodMode !== 'todos') && (
+            {hasActiveFilters && (
               <button
                 type="button"
-                onClick={() => {
-                  setSearchTerm('');
-                  setStatusFilter('Todos');
-                  setPeriodMode('todos');
-                }}
-                className="inline-flex items-center gap-1 font-semibold text-[#0052cc] hover:underline cursor-pointer"
+                onClick={handleClearFilters}
+                title="Limpar filtros"
+                className="h-9 px-2.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer flex-shrink-0 transition-colors"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 <span>Limpar filtros</span>
@@ -856,9 +977,112 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
             )}
           </div>
         </div>
+
+        {/* Inputs condicionais de Período (Dia / Mês / Intervalo Personalizado) */}
+        {(periodMode === 'dia' || periodMode === 'mes' || periodMode === 'personalizado') && (
+          <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100 text-xs">
+            {periodMode === 'dia' && (
+              <div className="flex items-center gap-2">
+                <span className="text-slate-500 font-semibold">Data de criação:</span>
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(e) => setSelectedDate(e.target.value)}
+                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
+                />
+                <button
+                  type="button"
+                  onClick={() => setSelectedDate(todayStr)}
+                  className="px-2 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-[#0052cc] font-bold cursor-pointer"
+                >
+                  Hoje
+                </button>
+              </div>
+            )}
+
+            {periodMode === 'mes' && (
+              <div className="flex items-center gap-2">
+                <span className="text-slate-500 font-semibold">Mês de criação:</span>
+                <input
+                  type="month"
+                  value={selectedMonth}
+                  onChange={(e) => setSelectedMonth(e.target.value)}
+                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
+                />
+                <button
+                  type="button"
+                  onClick={() => setSelectedMonth(currentMonthStr)}
+                  className="px-2 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-[#0052cc] font-bold cursor-pointer"
+                >
+                  Mês atual
+                </button>
+              </div>
+            )}
+
+            {periodMode === 'personalizado' && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-slate-500 font-semibold">De:</span>
+                <input
+                  type="date"
+                  value={customStartDate}
+                  onChange={(e) => setCustomStartDate(e.target.value)}
+                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
+                />
+                <span className="text-slate-500 font-semibold">Até:</span>
+                <input
+                  type="date"
+                  value={customEndDate}
+                  onChange={(e) => setCustomEndDate(e.target.value)}
+                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Linha de resumo compacto por status oficial + total exibido */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-[11px]">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setStatusFilter('Todos')}
+              className={`px-2 py-1 rounded-lg font-bold transition-colors cursor-pointer ${
+                statusFilter === 'Todos'
+                  ? 'bg-[#0B2D59] text-white'
+                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200/80'
+              }`}
+            >
+              TODOS ({statusCounts.Todos})
+            </button>
+            {OFFICIAL_TRACKING_STATUSES.map((st) => {
+              const active = statusFilter === st.value;
+              return (
+                <button
+                  key={st.value}
+                  type="button"
+                  onClick={() => setStatusFilter(active ? 'Todos' : st.value)}
+                  className={`px-2 py-1 rounded-lg font-bold border transition-colors cursor-pointer ${
+                    active
+                      ? 'bg-[#0052cc] text-white border-[#0052cc] shadow-2xs'
+                      : `${getTrackingStatusSelectClass(st.value)} opacity-90 hover:opacity-100`
+                  }`}
+                >
+                  {st.label} ({statusCounts[st.value]})
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <span>
+              Exibindo <strong className="text-slate-900 font-bold">{visibleRows.length}</strong>{' '}
+              {visibleRows.length === 1 ? 'orçamento' : 'orçamentos'}
+            </span>
+          </div>
+        </div>
       </div>
 
-      {/* Tabela Corporativa Contínua (Padrão Clientes) */}
+      {/* Tabela Corporativa Contínua */}
       <div className="bg-white rounded-[24px] sm:rounded-[28px] border border-slate-200/90 shadow-[0_4px_24px_-4px_rgba(0,0,0,0.04)] overflow-hidden">
         {visibleRows.length === 0 ? (
           <div className="py-14 px-6 text-center">
@@ -869,20 +1093,16 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
               Nenhum orçamento encontrado na Lista de Acompanhamento
             </h3>
             <p className="text-xs sm:text-sm text-slate-500 mt-1 mb-4 max-w-md mx-auto">
-              Todo orçamento gerado no CRM entra automaticamente aqui. Ajuste os filtros de pesquisa, status ou data para visualizar os registros.
+              Todo orçamento gerado no CRM entra automaticamente aqui com status ORÇAMENTO ENVIADO. Ajuste ou limpe os filtros para visualizar os registros.
             </p>
-            {(searchTerm || statusFilter !== 'Todos' || periodMode !== 'todos') && (
+            {hasActiveFilters && (
               <button
                 type="button"
-                onClick={() => {
-                  setSearchTerm('');
-                  setStatusFilter('Todos');
-                  setPeriodMode('todos');
-                }}
+                onClick={handleClearFilters}
                 className="inline-flex items-center gap-2 h-9 px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs transition-colors cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5 text-[#0052cc]" />
-                <span>Mostrar todos os orçamentos</span>
+                <span>Limpar filtros</span>
               </button>
             )}
           </div>
@@ -911,8 +1131,8 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                       onClick={() => onViewOrcamento(row)}
                       className="hover:bg-slate-50/80 transition-colors cursor-pointer group"
                     >
-                      {/* 1. Cliente */}
-                      <td className="py-3.5 px-4 sm:px-6 min-w-[200px]">
+                      {/* 1. Cliente & Número do Orçamento / Pedido */}
+                      <td className="py-3.5 px-4 sm:px-6 min-w-[220px]">
                         <div className="flex items-center gap-3">
                           <div
                             className={`w-8 h-8 rounded-xl border flex items-center justify-center flex-shrink-0 ${bgClass}`}
@@ -924,11 +1144,16 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                             <div className="font-bold text-[#091122] group-hover:text-[#0052cc] transition-colors truncate">
                               {row.cliente}
                             </div>
-                            <div className="text-[11px] text-slate-400 truncate mt-0.5 flex items-center gap-1.5">
-                              <span className="truncate">{row.nomeOrcamento}</span>
+                            <div className="text-[11px] text-slate-400 truncate mt-0.5 flex items-center gap-1.5 flex-wrap">
+                              {row.numeroOrcamento && (
+                                <span className="font-semibold text-slate-600 flex-shrink-0">
+                                  Orç. #{row.numeroOrcamento}
+                                </span>
+                              )}
+                              <span className="truncate">• {row.nomeOrcamento}</span>
                               {row.pedido && (
-                                <span className="font-semibold text-slate-500 flex-shrink-0">
-                                  • #{row.pedido}
+                                <span className="font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded flex-shrink-0">
+                                  Pedido #{String(row.pedido).replace(/^#+/, '')}
                                 </span>
                               )}
                               <span className="flex-shrink-0">• {row.creationDisplayDate}</span>
@@ -972,7 +1197,7 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                         {formatCurrencyBRL(row.valor)}
                       </td>
 
-                      {/* 5. Status (Pendente | Vendido | Não vendido) */}
+                      {/* 5. Status (exclusivamente os 5 status oficiais) */}
                       <td
                         className="py-3.5 px-3 sm:px-4 whitespace-nowrap"
                         onClick={(e) => e.stopPropagation()}
@@ -980,16 +1205,18 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                         <select
                           value={row.status}
                           onChange={(e) =>
-                            onUpdateTrackingStatus(row, e.target.value as TrackingListStatus)
+                            onUpdateTrackingStatus(row, e.target.value as OfficialFollowUpStatus)
                           }
                           aria-label={`Status de ${row.cliente}`}
-                          className={`h-8 px-2.5 pr-6 rounded-lg border text-xs font-bold outline-none cursor-pointer transition-colors ${getTrackingStatusSelectClass(
+                          className={`h-8 px-2.5 pr-6 rounded-lg border text-[11px] font-bold uppercase tracking-wide outline-none cursor-pointer transition-colors ${getTrackingStatusSelectClass(
                             row.status
                           )}`}
                         >
-                          <option value="Pendente">Pendente</option>
-                          <option value="Vendido">Vendido</option>
-                          <option value="Não vendido">Não vendido</option>
+                          {OFFICIAL_TRACKING_STATUSES.map((st) => (
+                            <option key={st.value} value={st.value}>
+                              {st.label}
+                            </option>
+                          ))}
                         </select>
                       </td>
 
@@ -1050,7 +1277,7 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
               <div>
                 <h3 className="text-sm font-bold">Editar Acompanhamento</h3>
                 <p className="text-[11px] text-blue-100 mt-0.5">
-                  Alterações aqui não modificam nem apagam o orçamento original.
+                  Status e pedido são sincronizados automaticamente com o CRM e Metas.
                 </p>
               </div>
               <button
@@ -1097,17 +1324,58 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                   </label>
                   <select
                     value={editForm.status}
-                    onChange={(e) =>
-                      setEditForm((f) => ({ ...f, status: e.target.value as TrackingListStatus }))
-                    }
-                    className="w-full h-9.5 px-3 bg-slate-50 border border-slate-200 focus:bg-white focus:border-[#0052cc] rounded-xl text-xs sm:text-sm font-bold text-slate-800 outline-none cursor-pointer"
+                    onChange={(e) => {
+                      const nextStatus = e.target.value as OfficialFollowUpStatus;
+                      setEditPedidoError('');
+                      setEditForm((f) => ({ ...f, status: nextStatus }));
+                    }}
+                    className="w-full h-9.5 px-3 bg-slate-50 border border-slate-200 focus:bg-white focus:border-[#0052cc] rounded-xl text-xs font-bold uppercase text-slate-800 outline-none cursor-pointer"
                   >
-                    <option value="Pendente">Pendente</option>
-                    <option value="Vendido">Vendido</option>
-                    <option value="Não vendido">Não vendido</option>
+                    {OFFICIAL_TRACKING_STATUSES.map((st) => (
+                      <option key={st.value} value={st.value}>
+                        {st.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
+
+              {editForm.status === 'Vendido' && (
+                <div className="p-3.5 bg-emerald-50/70 border border-emerald-200 rounded-xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-emerald-900">
+                      Número do Pedido <span className="text-rose-500">*</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditPedidoError('');
+                        setEditForm((f) => ({ ...f, pedido: generateNextPedidoNumber() }));
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white hover:bg-emerald-100 text-emerald-700 border border-emerald-300 text-[11px] font-bold cursor-pointer"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      <span>Gerar nº</span>
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <Hash className="w-4 h-4 text-emerald-600 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={editForm.pedido}
+                      onChange={(e) => {
+                        setEditPedidoError('');
+                        setEditForm((f) => ({ ...f, pedido: e.target.value.replace(/^#+/, '') }));
+                      }}
+                      placeholder="Ex: 1052"
+                      className="w-full h-9.5 pl-9 pr-3 bg-white border border-emerald-300 focus:border-emerald-600 rounded-xl text-xs sm:text-sm font-bold text-slate-900 outline-none"
+                    />
+                  </div>
+                  {editPedidoError && (
+                    <p className="text-[11px] font-bold text-rose-600">{editPedidoError}</p>
+                  )}
+                </div>
+              )}
 
               <div>
                 <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-600 mb-1">

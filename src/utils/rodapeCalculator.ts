@@ -218,6 +218,22 @@ export function formatRodapeDetailText(params: {
 }
 
 /**
+ * Remove o bloco automático complementar de rodapé (metragem solicitada, barras, metragem efetiva)
+ * para exibição limpa na tabela de Itens do Orçamento, preservando eventual observação manual.
+ */
+export function stripRodapeAutoDetail(subtitle?: string): string | undefined {
+  if (!subtitle) return undefined;
+  const autoBlockRegex =
+    /(?:Solicitado:\s*[0-9.,]+\s*ml?\s*[•\-—]\s*)?\d+\s*barras?\s+de\s+[0-9.,]+\s*m\s*(?:\([^)]*\))?/gi;
+  const cleaned = subtitle
+    .replace(autoBlockRegex, '')
+    .replace(/\s*[•\-—]+\s*$/g, '')
+    .replace(/^\s*[•\-—]+\s*/g, '')
+    .trim();
+  return cleaned || undefined;
+}
+
+/**
  * Tenta extrair metros lineares e comprimento de barra de um subtítulo previamente gerado
  */
 export function parseRodapeDetails(

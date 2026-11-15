@@ -9,8 +9,6 @@ import {
   AlertCircle,
   CheckCircle2,
   Search,
-  Filter,
-  Phone,
   PhoneCall,
   FileText,
   Users,
@@ -27,17 +25,14 @@ import {
   Trash2,
   CalendarCheck,
   Building2,
-  ExternalLink,
   MessageCircle,
-  HelpCircle,
 } from 'lucide-react';
 import { ClientRecord, TaskItem, TaskPriority, TaskStatus, TaskType } from '../types';
 import { addClientActivity } from '../utils/activities';
 import { isTaskVisibleToUser, getSellerIdForUser } from '../utils/userDataFilter';
 import { sendUserNotification, markNotificationsAsReadByCondition } from '../utils/notifications';
-import { getUserIdByName } from '../utils/auth';
+import { getUserIdByName, getStoredAccounts, isUserRevoked } from '../utils/auth';
 import { saveItemToSupabase, deleteItemFromSupabase, getSupabaseClient } from '../utils/supabaseClient';
-import { ShieldCheck, User } from 'lucide-react';
 import { UserAvatar } from './UserAvatar';
 
 interface TarefaScreenProps {
@@ -48,8 +43,6 @@ interface TarefaScreenProps {
   initialOpenCreateTask?: boolean;
 }
 
-const INITIAL_TASKS: TaskItem[] = [];
-
 // Data dinâmica atual no formato YYYY-MM-DD
 const getDynamicTodayDate = () => {
   const d = new Date();
@@ -59,14 +52,61 @@ const getDynamicTodayDate = () => {
   return `${year}-${month}-${day}`;
 };
 
-const TASK_TYPE_OPTIONS: { type: TaskType; label: string; icon: React.ElementType; color: string }[] = [
-  { type: 'ligacao', label: 'Ligação / Contato', icon: Phone, color: 'text-sky-600 bg-sky-50 border-sky-200' },
-  { type: 'proposta', label: 'Proposta / Orçamento', icon: FileText, color: 'text-indigo-600 bg-indigo-50 border-indigo-200' },
-  { type: 'reuniao', label: 'Reunião / Visita', icon: Users, color: 'text-amber-600 bg-amber-50 border-amber-200' },
-  { type: 'entrega', label: 'Entrega / Logística', icon: Truck, color: 'text-purple-600 bg-purple-50 border-purple-200' },
-  { type: 'medicao', label: 'Medição Técnica', icon: Ruler, color: 'text-emerald-600 bg-emerald-50 border-emerald-200' },
-  { type: 'outro', label: 'Outro', icon: CheckSquare, color: 'text-slate-600 bg-slate-50 border-slate-200' },
-];
+const normalizeTaskPriority = (priority?: string | null): TaskPriority => {
+  const lower = (priority || '').trim().toLowerCase();
+  if (lower === 'alta') return 'Alta';
+  if (lower === 'baixa') return 'Baixa';
+  return 'Normal';
+};
+
+const PRIORITY_META: Record<
+  TaskPriority,
+  {
+    label: string;
+    subtitle: string;
+    shortTag: string;
+    examples: string;
+    dotClass: string;
+    badgeClass: string;
+    cardSelectedClass: string;
+    helperBoxClass: string;
+    filterSelectedClass: string;
+  }
+> = {
+  Baixa: {
+    label: 'Baixa',
+    subtitle: 'Pode esperar',
+    shortTag: 'Pode esperar',
+    examples: 'Atualizar cadastro, organizar documentos e enviar materiais sem urgência.',
+    dotClass: 'bg-emerald-500',
+    badgeClass: 'bg-emerald-50 text-emerald-700 border-emerald-200/90',
+    cardSelectedClass: 'bg-emerald-50 border-emerald-400 text-emerald-900 ring-2 ring-emerald-500/15',
+    helperBoxClass: 'bg-emerald-50/70 border-emerald-200/80 text-emerald-800',
+    filterSelectedClass: 'bg-emerald-50 border-emerald-300 text-emerald-800 shadow-2xs',
+  },
+  Normal: {
+    label: 'Normal',
+    subtitle: 'Prazo habitual',
+    shortTag: 'Prazo habitual',
+    examples: 'Retornar orçamento, confirmar informações e fazer contato com cliente.',
+    dotClass: 'bg-[#0057ff]',
+    badgeClass: 'bg-blue-50 text-[#0057ff] border-blue-200/90',
+    cardSelectedClass: 'bg-blue-50 border-[#0057ff] text-[#071a52] ring-2 ring-blue-500/15',
+    helperBoxClass: 'bg-blue-50/70 border-blue-200/80 text-[#071a52]',
+    filterSelectedClass: 'bg-blue-50 border-blue-300 text-[#0057ff] shadow-2xs',
+  },
+  Alta: {
+    label: 'Alta',
+    subtitle: 'Precisa de atenção rápida',
+    shortTag: 'Atenção rápida',
+    examples: 'Cliente aguardando fechamento, problema de instalação ou orçamento com prazo próximo.',
+    dotClass: 'bg-rose-500',
+    badgeClass: 'bg-rose-50 text-rose-700 border-rose-200/90',
+    cardSelectedClass: 'bg-rose-50 border-rose-400 text-rose-900 ring-2 ring-rose-500/15',
+    helperBoxClass: 'bg-rose-50/70 border-rose-200/80 text-rose-800',
+    filterSelectedClass: 'bg-rose-50 border-rose-300 text-rose-800 shadow-2xs',
+  },
+};
 
 export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   client,
@@ -95,14 +135,26 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   const [registeredClients, setRegisteredClients] = useState<ClientRecord[]>([]);
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem('fenix_clients_db');
-      if (stored) {
-        setRegisteredClients(JSON.parse(stored));
+    const loadClients = () => {
+      try {
+        const stored = localStorage.getItem('fenix_clients_db');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (Array.isArray(parsed)) {
+            setRegisteredClients(parsed);
+          }
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
+    };
+    loadClients();
+    window.addEventListener('fenix_clients_updated', loadClients);
+    window.addEventListener('storage', loadClients);
+    return () => {
+      window.removeEventListener('fenix_clients_updated', loadClients);
+      window.removeEventListener('storage', loadClients);
+    };
   }, []);
 
   const isLoadedRef = useRef(false);
@@ -167,11 +219,9 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   // Active Filter: 'Todas' | 'Pendentes' | 'Hoje' | 'Atrasadas' | 'Concluídas'
   const [activeFilter, setActiveFilter] = useState<'Todas' | 'Pendentes' | 'Hoje' | 'Atrasadas' | 'Concluídas'>('Todas');
   const [searchTerm, setSearchTerm] = useState('');
-  
-  // Advanced Filter Dropdown
-  const [isFilterDropdownOpen, setIsFilterDropdownOpen] = useState(false);
+
+  // Priority Filter in Agenda
   const [priorityFilter, setPriorityFilter] = useState<'Todas' | TaskPriority>('Todas');
-  const [typeFilter, setTypeFilter] = useState<'Todos' | TaskType>('Todos');
 
   // Checkbox selection
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
@@ -180,30 +230,69 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 8;
 
-  // Drawer / Modal State
+  // Modal State
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const isDrawerOpenRef = useRef(false);
   isDrawerOpenRef.current = isDrawerOpen;
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const clientDropdownRef = useRef<HTMLDivElement | null>(null);
 
   // Form State
   const [formTitle, setFormTitle] = useState('');
-  const [formType, setFormType] = useState<TaskType>('ligacao');
   const [formClientId, setFormClientId] = useState('');
   const [formClientName, setFormClientName] = useState('');
   const [formClientCompany, setFormClientCompany] = useState('');
   const [formClientPhone, setFormClientPhone] = useState('');
   const [formDueDate, setFormDueDate] = useState<string>(getDynamicTodayDate);
-  const [formDueTime, setFormDueTime] = useState('14:00');
+  const [formDueTime, setFormDueTime] = useState('15:00');
   const [formPriority, setFormPriority] = useState<TaskPriority>('Normal');
   const [formObservation, setFormObservation] = useState('');
-  const [formDescription, setFormDescription] = useState('');
   const [clientSearchQuery, setClientSearchQuery] = useState('');
   const [isClientSelectOpen, setIsClientSelectOpen] = useState(false);
   const [formResponsavel, setFormResponsavel] = useState<string>(currentUserName || 'Vanessa Gomes');
   const [formErrors, setFormErrors] = useState<{ [key: string]: string }>({});
 
   const isDirector = (currentUserName || '').toLowerCase().includes('eder');
+
+  const responsibleOptions = useMemo(() => {
+    const base = [
+      { value: 'Vanessa Gomes', label: 'Vanessa Gomes (Vendedora)' },
+      { value: 'Jhessica Camargo', label: 'Jhessica Camargo (Vendedora)' },
+      { value: 'Geral', label: 'Geral (Equipe)' },
+    ];
+    const seen = new Set(base.map((o) => o.value.toLowerCase()));
+    try {
+      const accounts = getStoredAccounts();
+      Object.values(accounts).forEach((acc) => {
+        if (!acc?.name || !acc.active || isUserRevoked(acc.name)) return;
+        const lower = acc.name.trim().toLowerCase();
+        if (!seen.has(lower)) {
+          seen.add(lower);
+          base.push({
+            value: acc.name,
+            label: acc.cargo ? `${acc.name} (${acc.cargo})` : acc.name,
+          });
+        }
+      });
+    } catch {
+      // ignore
+    }
+    if (formResponsavel && !seen.has(formResponsavel.trim().toLowerCase())) {
+      base.push({ value: formResponsavel, label: formResponsavel });
+    }
+    return base;
+  }, [formResponsavel]);
+
+  useEffect(() => {
+    if (!isClientSelectOpen) return;
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (clientDropdownRef.current && !clientDropdownRef.current.contains(e.target as Node)) {
+        setIsClientSelectOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [isClientSelectOpen]);
 
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -381,29 +470,27 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     return Array.from(map.values());
   }, [registeredClients]);
 
-  // Open Drawer for creating new task
+  // Open Modal for creating new task
   const handleOpenNewTask = () => {
     setEditingTaskId(null);
     setFormTitle('');
-    setFormType('ligacao');
     if (client) {
       setFormClientId(client.id);
       setFormClientName(client.name);
       setFormClientCompany(client.clientType || 'Cliente');
       setFormClientPhone(client.whatsapp || '');
     } else {
-      const defaultCli = allAvailableClients[0];
-      setFormClientId(defaultCli ? defaultCli.id : '');
-      setFormClientName(defaultCli ? defaultCli.name : '');
-      setFormClientCompany(defaultCli ? defaultCli.segment : '');
-      setFormClientPhone(defaultCli ? defaultCli.phone : '');
+      setFormClientId('');
+      setFormClientName('');
+      setFormClientCompany('');
+      setFormClientPhone('');
     }
+    setClientSearchQuery('');
     setFormDueDate(getDynamicTodayDate());
     setFormDueTime('15:00');
     setFormPriority('Normal');
     setFormResponsavel(currentUserName || 'Vanessa Gomes');
     setFormObservation('');
-    setFormDescription('');
     setFormErrors({});
     setIsClientSelectOpen(false);
     setIsDrawerOpen(true);
@@ -415,21 +502,27 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     }
   }, [initialOpenCreateTask]);
 
-  // Open Drawer for editing existing task
+  // Open Modal for editing existing task
   const handleEditTask = (task: TaskItem) => {
     setEditingTaskId(task.id);
     setFormTitle(task.title);
-    setFormType(task.type);
-    setFormClientId(task.clientId);
-    setFormClientName(task.clientName);
+    setFormClientId(task.clientId || '');
+    setFormClientName(task.clientName || '');
     setFormClientCompany(task.clientCompanyOrSegment || '');
     setFormClientPhone(task.clientPhone || '');
+    setClientSearchQuery('');
     setFormDueDate(task.dueDate === 'Hoje' ? getDynamicTodayDate() : task.dueDate);
-    setFormDueTime(task.dueTime || '14:00');
-    setFormPriority(task.priority);
+    setFormDueTime(task.dueTime || '15:00');
+    setFormPriority(normalizeTaskPriority(task.priority));
     setFormResponsavel(task.responsavel || task.atribuidoA || task.criadoPor || currentUserName || 'Vanessa Gomes');
-    setFormObservation(task.observation || '');
-    setFormDescription(task.description || '');
+    setFormObservation(
+      task.observation ||
+        (task.description &&
+        task.description !== task.title &&
+        task.description !== 'Atividade agendada via SISTEMA FÊNIX WORLD'
+          ? task.description
+          : '')
+    );
     setFormErrors({});
     setIsClientSelectOpen(false);
     setActionMenuTask(null);
@@ -573,7 +666,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     }
   };
 
-  // Save Task in Drawer
+  // Save Task in Modal
   const handleSaveTask = async (e: React.FormEvent) => {
     e.preventDefault();
     const errors: { [key: string]: string } = {};
@@ -581,19 +674,26 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     if (!formTitle.trim()) {
       errors.title = 'Informe o nome da tarefa';
     }
-    // O campo "Cliente" é opcional. Se preenchido, permitir selecionar APENAS clientes já cadastrados
-    if (formClientName.trim()) {
-      const clientMatch = allAvailableClients.find(
-        (c) =>
-          c.name.toLowerCase() === formClientName.trim().toLowerCase() ||
-          (formClientId && c.id === formClientId)
-      );
-      if (!clientMatch) {
-        errors.client = 'Selecione um cliente já cadastrado no sistema';
-      }
+    // O campo "Cliente" é busca opcional. Se preenchido, deve corresponder a um cliente cadastrado
+    const matchedClient = formClientName.trim()
+      ? allAvailableClients.find(
+          (c) =>
+            c.name.toLowerCase() === formClientName.trim().toLowerCase() ||
+            (formClientId && c.id === formClientId)
+        )
+      : null;
+
+    if (formClientName.trim() && !matchedClient) {
+      errors.client = 'Selecione um cliente da lista ou deixe em branco';
+    }
+    if (!formResponsavel.trim()) {
+      errors.responsavel = 'Informe o responsável';
     }
     if (!formDueDate) {
-      errors.dueDate = 'Informe a data da tarefa';
+      errors.dueDate = 'Informe a data';
+    }
+    if (!formDueTime.trim()) {
+      errors.dueTime = 'Informe o horário';
     }
 
     if (Object.keys(errors).length > 0) {
@@ -604,7 +704,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     // Determine default status based on date and scheduled time (regra dos 10 minutos)
     let derivedStatus: TaskStatus = 'Pendente';
     const cleanDueDate = formDueDate.includes('T') ? formDueDate.split('T')[0] : formDueDate;
-    const cleanDueTime = formDueTime ? formDueTime.trim() : '12:00';
+    const cleanDueTime = formDueTime.trim();
     const scheduledDateTime = new Date(`${cleanDueDate}T${cleanDueTime.length === 5 ? cleanDueTime : `${cleanDueTime}:00`}`);
     if (!isNaN(scheduledDateTime.getTime())) {
       const diffMs = Date.now() - scheduledDateTime.getTime();
@@ -614,22 +714,13 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       }
     }
 
-    // Resolver cliente cadastrado
-    const matchedClient = formClientName.trim()
-      ? allAvailableClients.find(
-          (c) =>
-            c.name.toLowerCase() === formClientName.trim().toLowerCase() ||
-            (formClientId && c.id === formClientId)
-        )
-      : null;
-
-    const resolvedClientId = matchedClient ? matchedClient.id : (formClientId || undefined);
-    const resolvedClientName = matchedClient ? matchedClient.name : formClientName.trim();
-    const resolvedClientCompany = matchedClient ? matchedClient.segment : formClientCompany.trim();
-    const resolvedClientPhone = matchedClient ? matchedClient.phone : formClientPhone.trim();
+    const resolvedClientId = matchedClient ? matchedClient.id : '';
+    const resolvedClientName = matchedClient ? matchedClient.name : '';
+    const resolvedClientCompany = matchedClient ? matchedClient.segment : '';
+    const resolvedClientPhone = matchedClient ? matchedClient.phone : '';
+    const cleanObs = formObservation.trim();
 
     if (editingTaskId) {
-      // Updating
       const myId = getUserIdByName(currentUserName) || undefined;
       const respId = getUserIdByName(formResponsavel) || getSellerIdForUser(formResponsavel) || undefined;
 
@@ -640,17 +731,17 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         ...currentTask,
         id: editingTaskId,
         title: formTitle.trim(),
-        type: formType,
-        description: formDescription.trim() || formTitle.trim(),
-        clientId: resolvedClientId || currentTask?.clientId,
+        type: currentTask?.type || 'outro',
+        description: cleanObs || '',
+        clientId: resolvedClientId,
         clientName: resolvedClientName,
         clientCompanyOrSegment: resolvedClientCompany,
-        clientPhone: resolvedClientPhone || currentTask?.clientPhone,
+        clientPhone: resolvedClientPhone,
         dueDate: formDueDate,
-        dueTime: formDueTime || '12:00',
+        dueTime: cleanDueTime,
         priority: formPriority,
         status: currentTask?.status === 'Concluída' ? 'Concluída' : derivedStatus,
-        observation: formObservation.trim(),
+        observation: cleanObs,
         responsavel: formResponsavel,
         atribuidoA: formResponsavel,
         responsavelId: respId,
@@ -667,12 +758,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       }
 
       setTasks((prev) => {
-        const next = prev.map((t) => {
-          if (t.id === editingTaskId) {
-            return updatedTaskRecord;
-          }
-          return t;
-        });
+        const next = prev.map((t) => (t.id === editingTaskId ? updatedTaskRecord : t));
         try {
           localStorage.setItem('fenix_tarefas_db', JSON.stringify(next));
         } catch {}
@@ -683,7 +769,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         sendUserNotification({
           category: 'Tarefas',
           title: `Tarefa atualizada por ${currentUserName}`,
-          description: `${formTitle.trim()}. Vencimento: ${formDueDate} ${formDueTime || ''}. Prioridade: ${formPriority}.`,
+          description: `${formTitle.trim()}. Vencimento: ${formDueDate} ${cleanDueTime}. Prioridade: ${formPriority}.`,
           targetTab: 'Tarefas',
           recipientName: formResponsavel,
           recipientId: getUserIdByName(formResponsavel) || undefined,
@@ -697,7 +783,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         sendUserNotification({
           category: 'Tarefas',
           title: `Tarefa atualizada por ${currentUserName}`,
-          description: `${formTitle.trim()}. Vencimento: ${formDueDate} ${formDueTime || ''}. Observação: ${formObservation.trim() || 'Atualizada'}.`,
+          description: `${formTitle.trim()}. Vencimento: ${formDueDate} ${cleanDueTime}. Observação: ${cleanObs || 'Atualizada'}.`,
           targetTab: 'Tarefas',
           recipientName: originalCreator,
           recipientId: (currentTask as any)?.criadoPorId || (currentTask as any)?.creatorId || getUserIdByName(originalCreator) || undefined,
@@ -708,24 +794,23 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       }
       showToast('Tarefa atualizada com sucesso!');
     } else {
-      // Creating New Task (não cria cliente novo automaticamente)
       const myId = getUserIdByName(currentUserName) || undefined;
       const respId = getUserIdByName(formResponsavel) || getSellerIdForUser(formResponsavel) || undefined;
 
       const newTask: TaskItem = {
         id: `task_${Date.now()}`,
         title: formTitle.trim(),
-        type: formType,
-        description: formDescription.trim() || 'Atividade agendada via SISTEMA FÊNIX WORLD',
+        type: 'outro',
+        description: cleanObs || '',
         clientId: resolvedClientId,
         clientName: resolvedClientName,
         clientCompanyOrSegment: resolvedClientCompany,
         clientPhone: resolvedClientPhone,
         dueDate: formDueDate,
-        dueTime: formDueTime || '14:00',
+        dueTime: cleanDueTime,
         priority: formPriority,
         status: derivedStatus,
-        observation: formObservation.trim(),
+        observation: cleanObs,
         criadoPor: currentUserName,
         criadoPorId: myId,
         creatorId: myId,
@@ -765,7 +850,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         });
       }
 
-      // Add to client activities history
+      // Add to client activities history when a client is linked
       if (newTask.clientId) {
         addClientActivity({
           clientId: newTask.clientId,
@@ -791,7 +876,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       if (searchTerm.trim()) {
         const query = searchTerm.toLowerCase();
         const matchesTitle = task.title.toLowerCase().includes(query);
-        const matchesClient = task.clientName.toLowerCase().includes(query);
+        const matchesClient = (task.clientName || '').toLowerCase().includes(query);
         const matchesDesc = task.description?.toLowerCase().includes(query);
         const matchesObs = task.observation?.toLowerCase().includes(query);
         const matchesResp = (task.responsavel || task.atribuidoA || '').toLowerCase().includes(query);
@@ -815,13 +900,8 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         if (task.status !== 'Concluída') return false;
       }
 
-      // 3. Priority Filter (from advanced dropdown)
-      if (priorityFilter !== 'Todas' && task.priority !== priorityFilter) {
-        return false;
-      }
-
-      // 4. Type Filter (from advanced dropdown)
-      if (typeFilter !== 'Todos' && task.type !== typeFilter) {
+      // 3. Priority Filter
+      if (priorityFilter !== 'Todas' && normalizeTaskPriority(task.priority) !== priorityFilter) {
         return false;
       }
 
@@ -834,7 +914,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       const isPendB = (b.status || '').toLowerCase().includes('pendente') ? 0 : 1;
       return isPendA - isPendB;
     });
-  }, [userScopedTasks, searchTerm, activeFilter, priorityFilter, typeFilter]);
+  }, [userScopedTasks, searchTerm, activeFilter, priorityFilter]);
 
   // Pagination calculations
   const totalPages = Math.max(1, Math.ceil(filteredTasks.length / itemsPerPage));
@@ -851,7 +931,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   }, [totalPages, currentPage]);
 
   // Helper renderers
-  const renderTaskTypeIcon = (type: TaskType) => {
+  const renderTaskTypeIcon = (type?: TaskType) => {
     switch (type) {
       case 'ligacao':
         return (
@@ -885,34 +965,25 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
         );
       default:
         return (
-          <div className="w-10 h-10 rounded-xl bg-slate-50 text-slate-600 flex items-center justify-center flex-shrink-0 border border-slate-200 shadow-2xs" title="Tarefa">
+          <div className="w-10 h-10 rounded-xl bg-blue-50/70 text-[#0057ff] flex items-center justify-center flex-shrink-0 border border-blue-100 shadow-2xs" title="Tarefa">
             <CheckSquare className="w-4 h-4 stroke-[2.2]" />
           </div>
         );
     }
   };
 
-  const renderPriorityBadge = (priority: TaskPriority) => {
-    switch (priority) {
-      case 'Alta':
-        return (
-          <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200/80">
-            Alta
-          </span>
-        );
-      case 'Normal':
-        return (
-          <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold bg-sky-50 text-sky-700 border border-sky-200/80">
-            Normal
-          </span>
-        );
-      case 'Baixa':
-        return (
-          <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200/80">
-            Baixa
-          </span>
-        );
-    }
+  const renderPriorityBadge = (priority?: TaskPriority) => {
+    const normalized = normalizeTaskPriority(priority);
+    const meta = PRIORITY_META[normalized];
+    return (
+      <span
+        title={`${meta.label} — ${meta.subtitle}. Exemplos: ${meta.examples}`}
+        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold border ${meta.badgeClass}`}
+      >
+        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${meta.dotClass}`} />
+        <span>{meta.label}</span>
+      </span>
+    );
   };
 
   const renderStatusBadge = (status: TaskStatus) => {
@@ -1142,102 +1213,64 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
           })}
         </div>
 
-        {/* Input de Busca + Botão Filtros */}
-        <div className="flex items-center gap-2.5">
-          <div className="relative flex-1 sm:w-80">
+        {/* Input de Busca + Filtro de Prioridade na Agenda */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+          {/* Filtro direto por Prioridade */}
+          <div className="flex items-center gap-1 bg-white border border-slate-200/90 rounded-xl p-1 h-10 shadow-2xs overflow-x-auto">
+            <span className="text-[11px] font-bold text-slate-400 px-2 whitespace-nowrap">
+              Prioridade:
+            </span>
+            <button
+              type="button"
+              onClick={() => setPriorityFilter('Todas')}
+              className={`px-2.5 h-7.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
+                priorityFilter === 'Todas'
+                  ? 'bg-[#071a52] text-white shadow-2xs'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
+            >
+              Todas
+            </button>
+            {(['Baixa', 'Normal', 'Alta'] as const).map((prio) => {
+              const meta = PRIORITY_META[prio];
+              const isSelected = priorityFilter === prio;
+              return (
+                <button
+                  key={prio}
+                  type="button"
+                  onClick={() => setPriorityFilter(isSelected ? 'Todas' : prio)}
+                  title={`${meta.label} — ${meta.subtitle}`}
+                  className={`px-2.5 h-7.5 rounded-lg text-xs font-bold border transition-all cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap ${
+                    isSelected
+                      ? meta.filterSelectedClass
+                      : 'border-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                  }`}
+                >
+                  <span className={`w-2 h-2 rounded-full ${meta.dotClass}`} />
+                  <span>{meta.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="relative flex-1 sm:w-72">
             <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               type="text"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               placeholder="Buscar tarefa ou cliente..."
-              className="w-full h-10 pl-9.5 pr-4 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all"
+              className="w-full h-10 pl-9.5 pr-8 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all"
             />
             {searchTerm && (
               <button
                 type="button"
                 onClick={() => setSearchTerm('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                title="Limpar busca"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
-            )}
-          </div>
-
-          {/* Botão Secundário: Filtros com Dropdown */}
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setIsFilterDropdownOpen(!isFilterDropdownOpen)}
-              className={`h-10 px-3.5 rounded-xl border text-xs sm:text-sm font-bold flex items-center gap-2 transition-all cursor-pointer shadow-2xs ${
-                priorityFilter !== 'Todas' || typeFilter !== 'Todos'
-                  ? 'bg-blue-50 text-[#0057ff] border-blue-200'
-                  : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
-              }`}
-            >
-              <Filter className="w-4 h-4 stroke-[2]" />
-              <span>Filtros</span>
-              {(priorityFilter !== 'Todas' || typeFilter !== 'Todos') && (
-                <span className="w-2 h-2 rounded-full bg-[#0057ff]" />
-              )}
-            </button>
-
-            {/* Dropdown de Filtro Avançado */}
-            {isFilterDropdownOpen && (
-              <div className="absolute right-0 top-12 z-30 w-72 bg-white rounded-2xl border border-slate-200 shadow-xl p-4 space-y-4 animate-in fade-in duration-150">
-                <div className="flex items-center justify-between pb-2 border-b border-slate-100">
-                  <span className="text-xs font-bold text-slate-800">Filtros Avançados</span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPriorityFilter('Todas');
-                      setTypeFilter('Todos');
-                    }}
-                    className="text-[11px] text-[#0057ff] hover:underline font-semibold"
-                  >
-                    Limpar
-                  </button>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-600">Prioridade</label>
-                  <select
-                    value={priorityFilter}
-                    onChange={(e) => setPriorityFilter(e.target.value as any)}
-                    className="w-full h-9 px-3 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-700 outline-none focus:border-[#0057ff]"
-                  >
-                    <option value="Todas">Todas as prioridades</option>
-                    <option value="Alta">Alta</option>
-                    <option value="Normal">Normal</option>
-                    <option value="Baixa">Baixa</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-600">Tipo de Atividade</label>
-                  <select
-                    value={typeFilter}
-                    onChange={(e) => setTypeFilter(e.target.value as any)}
-                    className="w-full h-9 px-3 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-700 outline-none focus:border-[#0057ff]"
-                  >
-                    <option value="Todos">Todos os tipos</option>
-                    <option value="ligacao">Ligação / Contato</option>
-                    <option value="proposta">Proposta / Orçamento</option>
-                    <option value="reuniao">Reunião / Visita</option>
-                    <option value="medicao">Medição Técnica</option>
-                    <option value="entrega">Entrega / Logística</option>
-                    <option value="outro">Outro</option>
-                  </select>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setIsFilterDropdownOpen(false)}
-                  className="w-full h-9 rounded-xl bg-[#0057ff] text-white text-xs font-bold hover:bg-blue-600 transition-colors"
-                >
-                  Aplicar Filtros
-                </button>
-              </div>
             )}
           </div>
         </div>
@@ -1365,7 +1398,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                         />
                       </td>
 
-                      {/* Tarefa: Ícone do tipo em círculo suave + Título em negrito + Descrição/Detalhe abaixo */}
+                      {/* Tarefa: Ícone + Título em negrito + Observação/Detalhe abaixo */}
                       <td className="py-3.5 px-4">
                         <div className="flex items-start gap-3">
                           {renderTaskTypeIcon(task.type)}
@@ -1377,9 +1410,12 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                             >
                               {task.title}
                             </span>
-                            {task.description && (
+                            {(task.observation ||
+                              (task.description &&
+                                task.description !== task.title &&
+                                task.description !== 'Atividade agendada via SISTEMA FÊNIX WORLD')) && (
                               <p className="text-[11px] sm:text-xs text-slate-500 line-clamp-1 mt-0.5">
-                                {task.description}
+                                {task.observation || task.description}
                               </p>
                             )}
                           </div>
@@ -1388,14 +1424,22 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
 
                       {/* Cliente: Nome do contato/cliente em negrito + Empresa/Segmento logo abaixo */}
                       <td className="py-3.5 px-4 whitespace-nowrap">
-                        <div>
-                          <span className="block font-bold text-[#071a52] text-xs sm:text-sm">
-                            {task.clientName}
+                        {task.clientName ? (
+                          <div>
+                            <span className="block font-bold text-[#071a52] text-xs sm:text-sm">
+                              {task.clientName}
+                            </span>
+                            {task.clientCompanyOrSegment && (
+                              <span className="text-[11px] text-slate-400 font-medium">
+                                {task.clientCompanyOrSegment}
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-slate-400 italic font-medium">
+                            Sem cliente vinculado
                           </span>
-                          <span className="text-[11px] text-slate-400 font-medium">
-                            {task.clientCompanyOrSegment || 'Cliente Geral'}
-                          </span>
-                        </div>
+                        )}
                       </td>
 
                       {/* Responsável (Avatar Oficial + Nome) */}
@@ -1573,12 +1617,11 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
       </div>
 
       {/* ========================================================================= */}
-      {/* 5. MODAL / DRAWER LATERAL "NOVA TAREFA" (ESTADO CONDICIONAL)               */}
-      {/* ATENÇÃO: NÃO FICA VISÍVEL POR PADRÃO. SÓ ABRE QUANDO CLICA EM NOVA TAREFA  */}
+      {/* 5. JANELA MODAL COMPACTA "NOVA TAREFA / EDITAR TAREFA"                    */}
       {/* ========================================================================= */}
       {isDrawerOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex justify-end animate-in fade-in duration-200"
+          className="fixed inset-0 z-50 bg-[#071a52]/45 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-150"
           onClick={(e) => {
             if (e.target === e.currentTarget) {
               setIsDrawerOpen(false);
@@ -1586,49 +1629,52 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
           }}
         >
           <div
-            className="w-full max-w-[420px] bg-white h-full shadow-2xl flex flex-col justify-between overflow-hidden animate-in slide-in-from-right duration-250 ease-out"
+            className="w-full max-w-[600px] bg-white rounded-2xl shadow-2xl border border-slate-200/90 flex flex-col max-h-[94vh] overflow-hidden animate-in zoom-in-95 duration-150"
             role="dialog"
             aria-modal="true"
+            aria-labelledby="modal-nova-tarefa-titulo"
           >
-            {/* Drawer Header */}
-            <div className="px-4.5 py-3.5 bg-slate-50 border-b border-slate-100 flex items-center justify-between flex-shrink-0">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-lg bg-blue-50 text-[#0057ff] flex items-center justify-center flex-shrink-0">
+            {/* Modal Header (Padrão Azul-Marinho Fênix World) */}
+            <div className="px-5 py-3.5 bg-[#071a52] text-white flex items-center justify-between flex-shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-white/10 text-white border border-white/15 flex items-center justify-center flex-shrink-0">
                   <CheckSquare className="w-4.5 h-4.5 stroke-[2.2]" />
                 </div>
                 <div>
-                  <h2 className="text-sm sm:text-base font-extrabold text-[#071a52]">
+                  <h2 id="modal-nova-tarefa-titulo" className="text-sm sm:text-base font-extrabold tracking-tight text-white">
                     {editingTaskId ? 'Editar Tarefa' : 'Nova Tarefa'}
                   </h2>
-                  <p className="text-[11px] text-slate-500">
+                  <p className="text-[11px] text-blue-100/85">
                     {editingTaskId
-                      ? 'Atualize os dados e o compromisso da atividade'
-                      : 'Preencha os detalhes para agendar o compromisso'}
+                      ? 'Atualize os dados e a prioridade da tarefa'
+                      : 'Preencha os campos abaixo para agendar a tarefa'}
                   </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => setIsDrawerOpen(false)}
-                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
-                title="Fechar (X)"
+                className="p-1.5 text-blue-100 hover:text-white rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
+                title="Fechar"
               >
                 <X className="w-4.5 h-4.5" />
               </button>
             </div>
 
-            {/* Drawer Form Body */}
-            <form id="task-form" onSubmit={handleSaveTask} className="flex-1 overflow-y-auto p-4 sm:p-4.5 space-y-3.5">
-              {/* Nome da Tarefa * */}
+            {/* Modal Form Body (7 campos na ordem oficial, layout compacto sem rolagem desnecessária) */}
+            <form id="task-form" onSubmit={handleSaveTask} className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+              {/* 1. Nome da tarefa (principal e obrigatório) */}
               <div className="space-y-1">
-                <label className="text-xs font-bold text-slate-700 flex items-center justify-between">
-                  <span>Nome da Tarefa *</span>
+                <label className="text-xs font-bold text-[#071a52] flex items-center justify-between">
+                  <span>
+                    Nome da tarefa <span className="text-rose-500">*</span>
+                  </span>
                   {formErrors.title && (
-                    <span className="text-red-500 text-[11px] font-normal">{formErrors.title}</span>
+                    <span className="text-rose-600 text-[11px] font-semibold">{formErrors.title}</span>
                   )}
                 </label>
                 <div className="relative">
-                  <CheckSquare className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <CheckSquare className="w-4 h-4 text-[#0057ff] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     type="text"
                     value={formTitle}
@@ -1636,45 +1682,25 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                       setFormTitle(e.target.value);
                       if (formErrors.title) setFormErrors((prev) => ({ ...prev, title: '' }));
                     }}
-                    placeholder="Ex.: Retornar orçamento"
-                    className="w-full h-9 pl-9 pr-3 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all"
+                    placeholder="Ex.: Retornar orçamento ou confirmar instalação"
+                    className={`w-full h-9.5 pl-9 pr-3 rounded-xl border bg-white text-xs sm:text-sm font-semibold text-slate-800 placeholder-slate-400 outline-none transition-all ${
+                      formErrors.title
+                        ? 'border-rose-400 focus:border-rose-500 focus:ring-2 focus:ring-rose-500/15'
+                        : 'border-slate-200 focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10'
+                    }`}
                     autoFocus
                   />
                 </div>
               </div>
 
-              {/* Tipo de Tarefa (Chips selecionáveis) */}
-              <div className="space-y-1">
-                <label className="text-xs font-bold text-slate-700">Tipo de Atividade</label>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {TASK_TYPE_OPTIONS.map((opt) => {
-                    const Icon = opt.icon;
-                    const isSelected = formType === opt.type;
-                    return (
-                      <button
-                        key={opt.type}
-                        type="button"
-                        onClick={() => setFormType(opt.type)}
-                        className={`p-2 rounded-lg border text-xs font-bold flex flex-col items-center text-center gap-1 transition-all cursor-pointer ${
-                          isSelected
-                            ? 'bg-blue-50/80 border-[#0057ff] text-[#0057ff] shadow-xs'
-                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                        }`}
-                      >
-                        <Icon className="w-3.5 h-3.5" />
-                        <span className="text-[10px] leading-tight line-clamp-1">{opt.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Cliente (opcional - somente clientes cadastrados) */}
-              <div className="space-y-1 relative">
-                <label className="text-xs font-bold text-slate-700 flex items-center justify-between">
-                  <span>Cliente <span className="text-slate-400 font-normal">(opcional)</span></span>
+              {/* 2. Cliente (busca opcional) */}
+              <div ref={clientDropdownRef} className="space-y-1 relative">
+                <label className="text-xs font-bold text-[#071a52] flex items-center justify-between">
+                  <span>
+                    Cliente <span className="text-slate-400 font-normal">(busca opcional)</span>
+                  </span>
                   {formErrors.client && (
-                    <span className="text-red-500 text-[11px] font-normal">{formErrors.client}</span>
+                    <span className="text-rose-600 text-[11px] font-semibold">{formErrors.client}</span>
                   )}
                 </label>
 
@@ -1685,40 +1711,61 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                     value={formClientName}
                     onFocus={() => setIsClientSelectOpen(true)}
                     onChange={(e) => {
-                      setFormClientName(e.target.value);
-                      setClientSearchQuery(e.target.value);
+                      const val = e.target.value;
+                      setFormClientName(val);
+                      setClientSearchQuery(val);
+                      setFormClientId('');
+                      setFormClientCompany('');
+                      setFormClientPhone('');
                       setIsClientSelectOpen(true);
                       if (formErrors.client) setFormErrors((prev) => ({ ...prev, client: '' }));
                     }}
-                    placeholder="Selecione um cliente cadastrado..."
-                    className="w-full h-9 pl-9 pr-8 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all"
+                    placeholder="Buscar cliente cadastrado (opcional)..."
+                    className={`w-full h-9.5 pl-9 pr-8 rounded-xl border bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none transition-all ${
+                      formErrors.client
+                        ? 'border-rose-400 focus:border-rose-500 focus:ring-2 focus:ring-rose-500/15'
+                        : 'border-slate-200 focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10'
+                    }`}
                   />
                   {formClientName && (
                     <button
                       type="button"
                       onClick={() => {
                         setFormClientName('');
+                        setClientSearchQuery('');
                         setFormClientId('');
                         setFormClientCompany('');
                         setFormClientPhone('');
+                        if (formErrors.client) setFormErrors((prev) => ({ ...prev, client: '' }));
                       }}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                      title="Limpar cliente"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
                   )}
                 </div>
 
-                {/* Cliente Select Dropdown com busca */}
+                {/* Dropdown de busca de clientes */}
                 {isClientSelectOpen && (
-                  <div className="absolute left-0 right-0 top-15 z-30 bg-white rounded-xl border border-slate-200 shadow-xl max-h-44 overflow-y-auto py-1">
-                    {allAvailableClients
-                      .filter((c) =>
-                        clientSearchQuery
-                          ? c.name.toLowerCase().includes(clientSearchQuery.toLowerCase())
+                  <div className="absolute left-0 right-0 top-[62px] z-30 bg-white rounded-xl border border-slate-200 shadow-xl max-h-40 overflow-y-auto py-1">
+                    {(() => {
+                      const query = (clientSearchQuery || formClientName || '').trim().toLowerCase();
+                      const filtered = allAvailableClients.filter((c) =>
+                        query
+                          ? c.name.toLowerCase().includes(query) ||
+                            c.segment.toLowerCase().includes(query) ||
+                            c.phone.toLowerCase().includes(query)
                           : true
-                      )
-                      .map((c) => (
+                      );
+                      if (filtered.length === 0) {
+                        return (
+                          <p className="p-3 text-xs text-slate-400 text-center">
+                            Nenhum cliente encontrado. Deixe em branco se não houver cliente vinculado.
+                          </p>
+                        );
+                      }
+                      return filtered.map((c) => (
                         <div
                           key={c.id}
                           onClick={() => {
@@ -1726,138 +1773,168 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                             setFormClientName(c.name);
                             setFormClientCompany(c.segment);
                             setFormClientPhone(c.phone);
-                            setIsClientSelectOpen(false);
                             setClientSearchQuery('');
+                            setIsClientSelectOpen(false);
+                            if (formErrors.client) setFormErrors((prev) => ({ ...prev, client: '' }));
                           }}
-                          className="px-3 py-1.5 hover:bg-blue-50 cursor-pointer flex items-center justify-between gap-2"
+                          className="px-3 py-1.5 hover:bg-blue-50 cursor-pointer flex items-center justify-between gap-2 transition-colors"
                         >
-                          <div>
-                            <span className="text-xs font-bold text-slate-800 block">{c.name}</span>
+                          <div className="min-w-0">
+                            <span className="text-xs font-bold text-[#071a52] block truncate">{c.name}</span>
                             <span className="text-[10px] text-slate-400 font-medium">{c.segment}</span>
                           </div>
                           {c.phone && (
-                            <span className="text-[10px] font-mono text-slate-400">{c.phone}</span>
+                            <span className="text-[10px] font-mono text-slate-400 flex-shrink-0">{c.phone}</span>
                           )}
                         </div>
-                      ))}
-                    {allAvailableClients.length === 0 && (
-                      <p className="p-3 text-xs text-slate-400 text-center">Nenhum cliente cadastrado.</p>
-                    )}
+                      ));
+                    })()}
                   </div>
                 )}
               </div>
 
-              {/* Data * e Horário (grid) */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                <div className="space-y-1">
-                  <label className="text-xs font-bold text-slate-700 flex items-center justify-between">
-                    <span>Data *</span>
+              {/* 3. Responsável * | 4. Data * | 5. Horário * */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+                {/* 3. Responsável (obrigatório) */}
+                <div className="sm:col-span-5 space-y-1">
+                  <label className="text-xs font-bold text-[#071a52] flex items-center justify-between">
+                    <span>
+                      Responsável <span className="text-rose-500">*</span>
+                    </span>
+                    {formErrors.responsavel && (
+                      <span className="text-rose-600 text-[10px] font-semibold">{formErrors.responsavel}</span>
+                    )}
+                  </label>
+                  <div className="relative flex items-center">
+                    <div className="absolute left-2.5 pointer-events-none flex items-center">
+                      <UserAvatar userName={formResponsavel} size="xs" />
+                    </div>
+                    <select
+                      value={formResponsavel}
+                      onChange={(e) => {
+                        setFormResponsavel(e.target.value);
+                        if (formErrors.responsavel) setFormErrors((prev) => ({ ...prev, responsavel: '' }));
+                      }}
+                      className={`w-full h-9.5 pl-9 pr-2.5 rounded-xl border bg-white text-xs font-semibold text-slate-800 outline-none transition-all cursor-pointer ${
+                        formErrors.responsavel
+                          ? 'border-rose-400 focus:border-rose-500'
+                          : 'border-slate-200 focus:border-[#0057ff]'
+                      }`}
+                    >
+                      {responsibleOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* 4. Data (obrigatória) */}
+                <div className="sm:col-span-4 space-y-1">
+                  <label className="text-xs font-bold text-[#071a52] flex items-center justify-between">
+                    <span>
+                      Data <span className="text-rose-500">*</span>
+                    </span>
                     {formErrors.dueDate && (
-                      <span className="text-red-500 text-[11px] font-normal">{formErrors.dueDate}</span>
+                      <span className="text-rose-600 text-[10px] font-semibold">{formErrors.dueDate}</span>
                     )}
                   </label>
                   <div className="relative">
-                    <Calendar className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <Calendar className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                     <input
                       type="date"
                       value={formDueDate}
-                      onChange={(e) => setFormDueDate(e.target.value)}
-                      className="w-full h-9 pl-9 pr-2.5 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 outline-none focus:border-[#0057ff] transition-all"
+                      onChange={(e) => {
+                        setFormDueDate(e.target.value);
+                        if (formErrors.dueDate) setFormErrors((prev) => ({ ...prev, dueDate: '' }));
+                      }}
+                      className={`w-full h-9.5 pl-8.5 pr-2 rounded-xl border bg-white text-xs font-semibold text-slate-800 outline-none transition-all ${
+                        formErrors.dueDate
+                          ? 'border-rose-400 focus:border-rose-500'
+                          : 'border-slate-200 focus:border-[#0057ff]'
+                      }`}
                     />
                   </div>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-xs font-bold text-slate-700">Horário</label>
+                {/* 5. Horário (obrigatório) */}
+                <div className="sm:col-span-3 space-y-1">
+                  <label className="text-xs font-bold text-[#071a52] flex items-center justify-between">
+                    <span>
+                      Horário <span className="text-rose-500">*</span>
+                    </span>
+                    {formErrors.dueTime && (
+                      <span className="text-rose-600 text-[10px] font-semibold">{formErrors.dueTime}</span>
+                    )}
+                  </label>
                   <div className="relative">
-                    <Clock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <Clock className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                     <input
                       type="time"
                       value={formDueTime}
-                      onChange={(e) => setFormDueTime(e.target.value)}
-                      className="w-full h-9 pl-9 pr-2.5 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 outline-none focus:border-[#0057ff] transition-all"
+                      onChange={(e) => {
+                        setFormDueTime(e.target.value);
+                        if (formErrors.dueTime) setFormErrors((prev) => ({ ...prev, dueTime: '' }));
+                      }}
+                      className={`w-full h-9.5 pl-8.5 pr-2 rounded-xl border bg-white text-xs font-semibold text-slate-800 outline-none transition-all ${
+                        formErrors.dueTime
+                          ? 'border-rose-400 focus:border-rose-500'
+                          : 'border-slate-200 focus:border-[#0057ff]'
+                      }`}
                     />
                   </div>
                 </div>
               </div>
 
-              {/* Prioridade * (Radio buttons em estilo pílulas: Baixa, Normal, Alta) */}
-              <div className="space-y-1">
-                <label className="text-xs font-bold text-slate-700">Prioridade *</label>
-                <div className="grid grid-cols-3 gap-1.5">
+              {/* 6. Prioridade (Baixa, Normal, Alta com identificação visual e orientação) */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-[#071a52] block">
+                  Prioridade <span className="text-rose-500">*</span>
+                </label>
+                <div className="grid grid-cols-3 gap-2">
                   {(['Baixa', 'Normal', 'Alta'] as const).map((p) => {
+                    const meta = PRIORITY_META[p];
                     const isSelected = formPriority === p;
                     return (
                       <button
                         key={p}
                         type="button"
                         onClick={() => setFormPriority(p)}
-                        className={`h-8.5 rounded-lg border text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                        className={`px-3 py-2 rounded-xl border text-left transition-all cursor-pointer flex flex-col gap-0.5 ${
                           isSelected
-                            ? p === 'Alta'
-                              ? 'bg-rose-50 border-rose-300 text-rose-700 shadow-xs ring-2 ring-rose-500/10'
-                              : p === 'Normal'
-                              ? 'bg-blue-50 border-blue-300 text-[#0057ff] shadow-xs ring-2 ring-blue-500/10'
-                              : 'bg-emerald-50 border-emerald-300 text-emerald-700 shadow-xs ring-2 ring-emerald-500/10'
-                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                            ? meta.cardSelectedClass
+                            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
                         }`}
                       >
-                        <span
-                          className={`w-2 h-2 rounded-full ${
-                            p === 'Alta' ? 'bg-rose-500' : p === 'Normal' ? 'bg-[#0057ff]' : 'bg-emerald-500'
-                          }`}
-                        />
-                        <span>{p}</span>
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-extrabold">
+                            <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${meta.dotClass}`} />
+                            <span>{meta.label}</span>
+                          </span>
+                          {isSelected && <Check className="w-3.5 h-3.5 flex-shrink-0 stroke-[2.8]" />}
+                        </div>
+                        <span className="text-[10px] font-medium opacity-85 leading-tight">
+                          {meta.shortTag}
+                        </span>
                       </button>
                     );
                   })}
                 </div>
+                <div className={`px-3 py-1.5 rounded-lg border text-[11px] leading-snug ${PRIORITY_META[formPriority].helperBoxClass}`}>
+                  <span className="font-bold">
+                    {PRIORITY_META[formPriority].label.toUpperCase()} — {PRIORITY_META[formPriority].subtitle}:
+                  </span>{' '}
+                  <span>{PRIORITY_META[formPriority].examples}</span>
+                </div>
               </div>
 
-              {/* Responsável / Atribuição */}
-              <div className="space-y-1 p-3 rounded-lg bg-slate-50/90 border border-slate-200/80">
-                <label className="text-xs font-bold text-slate-700 flex items-center justify-between">
-                  <span className="flex items-center gap-1.5">
-                    <UserAvatar userName={formResponsavel} size="xs" />
-                    <span>Responsável pela Tarefa</span>
-                  </span>
-                  <span className="text-[10px] text-blue-600 font-bold bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200/60">
-                    Atribuição
-                  </span>
-                </label>
-                <select
-                  value={formResponsavel}
-                  onChange={(e) => setFormResponsavel(e.target.value)}
-                  className="w-full h-9 px-2.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-800 outline-none focus:border-[#0057ff] transition-all cursor-pointer"
-                >
-                  <option value="Vanessa Gomes">Vanessa Gomes (Vendedora)</option>
-                  <option value="Jhessica Camargo">Jhessica Camargo (Vendedora)</option>
-                  <option value="Geral">Geral (Equipe)</option>
-                  {formResponsavel && !['Vanessa Gomes', 'Jhessica Camargo', 'Geral'].includes(formResponsavel) && (
-                    <option value={formResponsavel}>{formResponsavel} (Histórico)</option>
-                  )}
-                </select>
-                <p className="text-[10px] text-slate-500 leading-tight pt-0.5">
-                  <span className="font-semibold text-blue-600">Regra:</span> O criador e o responsável visualizam o mesmo registro em tempo real.
-                </p>
-              </div>
-
-              {/* Detalhe / Resumo da atividade */}
-              <div className="space-y-1">
-                <label className="text-xs font-bold text-slate-700">Detalhes da Atividade</label>
-                <input
-                  type="text"
-                  value={formDescription}
-                  onChange={(e) => setFormDescription(e.target.value)}
-                  placeholder="Ex.: Enviar catálogo digital e alinhar metragem"
-                  className="w-full h-9 px-3 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] transition-all"
-                />
-              </div>
-
-              {/* Observação (Textarea com contador de caracteres 0/500) */}
+              {/* 7. Observações (campo opcional) */}
               <div className="space-y-1">
                 <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-700">Observação</label>
+                  <label className="text-xs font-bold text-[#071a52]">
+                    Observações <span className="text-slate-400 font-normal">(opcional)</span>
+                  </label>
                   <span className="text-[10px] font-mono text-slate-400">
                     {formObservation.length}/500
                   </span>
@@ -1867,20 +1944,27 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
                   maxLength={500}
                   onChange={(e) => setFormObservation(e.target.value)}
                   rows={2}
-                  placeholder="Digite uma observação..."
-                  className="w-full p-2.5 rounded-lg border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all resize-none"
+                  placeholder="Informações adicionais, contexto ou lembretes..."
+                  className="w-full p-2.5 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-800 placeholder-slate-400 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 transition-all resize-none"
                 />
               </div>
             </form>
 
-            {/* Drawer Footer com Botão de Rodapé */}
-            <div className="p-4 bg-slate-50 border-t border-slate-100 flex-shrink-0">
+            {/* Modal Footer: Cancelar e Salvar Tarefa */}
+            <div className="px-5 py-3 bg-slate-50 border-t border-slate-200/80 flex items-center justify-end gap-2.5 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsDrawerOpen(false)}
+                className="px-4 h-9.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-bold text-xs sm:text-sm transition-colors cursor-pointer"
+              >
+                Cancelar
+              </button>
               <button
                 type="submit"
                 form="task-form"
-                className="w-full h-10 rounded-lg bg-[#0057ff] hover:bg-blue-700 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md shadow-blue-600/20 transition-all cursor-pointer"
+                className="px-5 h-9.5 rounded-xl bg-[#0057ff] hover:bg-blue-700 text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm shadow-blue-600/20 transition-all cursor-pointer"
               >
-                <Save className="w-4 h-4 stroke-[2.5]" />
+                <Save className="w-4 h-4 stroke-[2.3]" />
                 <span>Salvar Tarefa</span>
               </button>
             </div>

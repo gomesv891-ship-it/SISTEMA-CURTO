@@ -24,6 +24,8 @@ export interface GroupProductItem {
   priceDistribuidor?: number;
   price?: number;
   active?: boolean;
+  description?: string;
+  details?: string;
 }
 
 export {

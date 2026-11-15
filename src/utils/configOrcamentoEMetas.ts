@@ -279,7 +279,7 @@ export function formatOrcamentoMessage(
       style: 'currency',
       currency: 'BRL',
     });
-    const labelDesc = data.descontoTexto || 'DESCONTO ESPECIAL APLICADO:';
+    const labelDesc = data.descontoTexto || 'DESCONTO PARA PAGAMENTO VIA PIX';
     descontoText = `\n🏷️ ${labelDesc} - ${descValorFmt}`;
   }
 

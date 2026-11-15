@@ -68,11 +68,14 @@ import {
   deduplicateFollowUpList,
   findMatchingFollowUpIndex,
   resolveOrcamentoResponsible,
+  mapOrcamentoStatusToFollowUp,
+  normalizeOrcamentoRefId,
+  generateNextPedidoNumber,
 } from '../utils/orcamentoFollowUpSync';
 import {
   ListaAcompanhamentoOrcamentos,
-  TrackingListStatus,
   TrackingOrcamentoRow,
+  getOfficialStatusLabel,
 } from './followup/ListaAcompanhamentoOrcamentos';
 
 const readLocalOrcamentosSnapshot = (): SavedOrcamento[] => {
@@ -726,7 +729,35 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
         localStorage.setItem(CLIENTS_STORAGE_KEY, JSON.stringify(remoteClients));
       }
 
-      // Merge de coleções preservando registros locais mais novos
+      // Merge de coleções preservando sempre a versão mais recente (por updatedAt/savedAt)
+      const mergeOrcCollections = (primary: any[], secondary: any[]) => {
+        const orcMap = new Map<string, any>();
+        const ingest = (list: any[]) => {
+          list.forEach((o) => {
+            if (!o || !o.id) return;
+            const key = normalizeOrcamentoRefId(o.id) || String(o.id).trim();
+            const existing = orcMap.get(key);
+            if (!existing) {
+              orcMap.set(key, o);
+              return;
+            }
+            const existingTs = new Date(existing.updatedAt || existing.savedAt || 0).getTime() || 0;
+            const incomingTs = new Date(o.updatedAt || o.savedAt || 0).getTime() || 0;
+            if (incomingTs >= existingTs) {
+              orcMap.set(key, {
+                ...existing,
+                ...o,
+                pedido: o.pedido || existing.pedido,
+                followUpId: o.followUpId || existing.followUpId,
+              });
+            }
+          });
+        };
+        ingest(secondary);
+        ingest(primary);
+        return Array.from(orcMap.values());
+      };
+
       const mergedFup =
         remoteFup.length > 0
           ? localFup.length > 0
@@ -734,12 +765,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             : remoteFup
           : localFup;
 
-      const mergedOrcs =
-        remoteOrcs.length > 0
-          ? localOrcs.length > 0
-            ? safeMergeLists(remoteOrcs, localOrcs, 'id')
-            : remoteOrcs
-          : localOrcs;
+      const mergedOrcs = mergeOrcCollections(remoteOrcs, localOrcs);
 
       // Mapa de orçamentos vendidos ou fechados para sincronizar status real
       const soldOrcMap = new Map<string, any>();
@@ -750,7 +776,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
         }
       });
 
-      // Constrói lista inicial de follow-up com status normalizado, 1:1 com orçamentos
+      // Constrói lista inicial de follow-up com status normalizado para os 5 status oficiais
       let currentItems: FollowUpItem[] = deduplicateFollowUpList(
         mergedFup
           .filter((it: FollowUpItem) => !(it.cliente || '').toLowerCase().includes('roberto silveira'))
@@ -760,8 +786,18 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
               soldOrcMap.get(it.id.replace('fup_', '')) ||
               soldOrcMap.get(it.id);
 
-            const isItemSold = isSoldStatus(it.status) || Boolean(matchingSoldOrc);
-            const finalStatus = isItemSold ? 'Vendido' : normalizeStatus(it.status);
+            const isItemSold =
+              isSoldStatus(it.status) ||
+              it.trackingStatus === 'Vendido' ||
+              Boolean(matchingSoldOrc);
+
+            const normalizedFromStatus = normalizeStatus(it.status);
+            const finalStatus: FollowUpStatus = isItemSold
+              ? 'Vendido'
+              : normalizedFromStatus === 'Orçamento Enviado' && it.trackingStatus === 'Não vendido'
+              ? 'Perdido'
+              : normalizedFromStatus;
+
             const resolvedVal =
               parseMonetaryValue(it.valor) ||
               parseMonetaryValue(matchingSoldOrc?.totalFinal) ||
@@ -771,6 +807,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             return {
               ...it,
               status: finalStatus,
+              pedido: it.pedido || matchingSoldOrc?.pedido || '',
               valor: resolvedVal,
             };
           })
@@ -814,9 +851,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             ? 'Vendido'
             : isLost
             ? 'Perdido'
-            : shouldBeInCobranca
-            ? 'Aguardando Retorno'
-            : 'Orçamento Enviado';
+            : mapOrcamentoStatusToFollowUp(orc.status);
 
           const newItem: FollowUpItem = {
             id: `fup_${orc.id}`,
@@ -881,11 +916,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           const fupUpdatedTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
           const orcIsNewer = orcUpdatedTs > fupUpdatedTs + 1000;
 
+          const orcMapped = mapOrcamentoStatusToFollowUp(orc.status);
           const targetStatus: FollowUpStatus = isSold
             ? 'Vendido'
             : isLost
             ? 'Perdido'
-            : existing.status;
+            : orcIsNewer
+            ? orcMapped
+            : normalizeStatus(existing.status);
           const nextValor =
             orcIsNewer || !parseMonetaryValue(existing.valor)
               ? orcValue || parseMonetaryValue(existing.valor)
@@ -993,6 +1031,30 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           const orcId = singleItemToSave.orcamentoId;
           const bareOrcId = orcId.replace(/^orc_/, '');
           const isSold = isSoldStatus(singleItemToSave.status);
+          const syncedStatus = (isSold ? 'Vendido' : singleItemToSave.status) as OrcamentoStatus;
+          const nowIso = new Date().toISOString();
+
+          // Atualiza estado em memória para refletir imediatamente na Lista de Acompanhamento
+          setAllOrcamentos((prev) =>
+            prev.map((o) => {
+              if (
+                o &&
+                (o.id === orcId ||
+                  o.id === bareOrcId ||
+                  String(o.id).replace(/^orc_/, '') === bareOrcId)
+              ) {
+                return {
+                  ...o,
+                  status: syncedStatus,
+                  ...(isSold && singleItemToSave.pedido ? { pedido: singleItemToSave.pedido } : {}),
+                  followUpId: singleItemToSave.id,
+                  updatedAt: nowIso,
+                };
+              }
+              return o;
+            })
+          );
+
           const syncOrcKey = (key: string) => {
             const rawOrcs = localStorage.getItem(key);
             if (!rawOrcs) return;
@@ -1004,10 +1066,10 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                 if (o && (o.id === orcId || o.id === bareOrcId || String(o.id).replace(/^orc_/, '') === bareOrcId)) {
                   matchedOrc = {
                     ...o,
-                    status: isSold ? 'Vendido' : singleItemToSave.status,
+                    status: syncedStatus,
                     ...(isSold && singleItemToSave.pedido ? { pedido: singleItemToSave.pedido } : {}),
                     followUpId: singleItemToSave.id,
-                    updatedAt: new Date().toISOString(),
+                    updatedAt: nowIso,
                   };
                   return matchedOrc;
                 }
@@ -1060,14 +1122,16 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   };
 
   const buildBaseFollowUpFromRow = (row: TrackingOrcamentoRow): FollowUpItem => {
-    if (row.sourceFollowUp) return row.sourceFollowUp;
+    if (row.sourceFollowUp) {
+      return {
+        ...row.sourceFollowUp,
+        status: row.status,
+        pedido: row.sourceFollowUp.pedido || row.pedido || '',
+        orcamentoId: row.sourceFollowUp.orcamentoId || row.orcamentoId,
+      };
+    }
     const nowIso = new Date().toISOString();
-    const mappedStatus: FollowUpStatus =
-      row.status === 'Vendido'
-        ? 'Vendido'
-        : row.status === 'Não vendido'
-        ? 'Perdido'
-        : 'Orçamento Enviado';
+    const mappedStatus: FollowUpStatus = mapOrcamentoStatusToFollowUp(row.status);
     const sellerId =
       row.responsavelId || getUserIdByName(row.responsavel) || getSellerIdForUser(row.responsavel);
     return {
@@ -1095,7 +1159,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
       responsavelId: sellerId,
       createdAt: row.sourceOrcamento.savedAt || nowIso,
       updatedAt: nowIso,
-      lembretesAtivos: mappedStatus === 'Orçamento Enviado',
+      lembretesAtivos: mappedStatus !== 'Vendido' && mappedStatus !== 'Perdido',
       produtos: row.sourceOrcamento.items,
       historico: [],
     };
@@ -1103,19 +1167,69 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
 
   const handleTrackingStatusUpdate = async (
     row: TrackingOrcamentoRow,
-    newStatus: TrackingListStatus
+    newStatus: OfficialFollowUpStatus
   ) => {
     const base = buildBaseFollowUpFromRow(row);
-    const nowIso = new Date().toISOString();
+
+    // Ao marcar como VENDIDO, segue exatamente o fluxo oficial: gera/registra pedido, vincula ao orçamento e contabiliza em Metas sem duplicar
+    if (newStatus === 'Vendido') {
+      setTransitioningBudget(base);
+      setSelectedNewStatus('Vendido');
+      setStatusComment('');
+      setStatusError('');
+      setNumeroPedidoInput(
+        (base.pedido || row.pedido || '').replace(/^#+/, '')
+      );
+      setPedidoError('');
+      return;
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const dia = String(now.getDate()).padStart(2, '0');
+    const mes = String(now.getMonth() + 1).padStart(2, '0');
+    const ano = now.getFullYear();
+    const hora = String(now.getHours()).padStart(2, '0');
+    const min = String(now.getMinutes()).padStart(2, '0');
+
+    const wasPreviouslySold = isSoldStatus(base.status);
+    const isFinished = newStatus === 'Perdido';
+
+    const newHistoryEntry: FollowUpHistoryEntry = {
+      id: `h_list_${Date.now()}`,
+      data: `${dia}/${mes}/${ano}`,
+      hora: `${hora}:${min}`,
+      statusAnterior: base.status,
+      novoStatus: newStatus,
+      observacao: `Status alterado para ${getOfficialStatusLabel(newStatus)} na Lista de Acompanhamento.`,
+      usuario: currentUserName,
+      timestamp: now.getTime(),
+    };
+
     const updatedItem: FollowUpItem = {
       ...base,
-      trackingStatus: newStatus,
-      trackingUpdatedAt: nowIso,
+      status: newStatus,
+      trackingStatus: undefined,
+      lembretesAtivos: isFinished ? false : base.lembretesAtivos ?? true,
+      dataUltimoContato: isFinished ? base.dataUltimoContato : nowIso,
+      dataCicloAtual: isFinished ? base.dataCicloAtual : nowIso,
       dataAtualizacao: nowIso,
       updatedAt: nowIso,
+      trackingUpdatedAt: nowIso,
+      historico: [newHistoryEntry, ...(base.historico || [])],
     };
-    await persistTrackingOnlyItem(updatedItem);
-    showToast(`✓ Status atualizado para "${newStatus}" na Lista de Acompanhamento.`);
+
+    const idx = findMatchingFollowUpIndex(items, updatedItem.orcamentoId || updatedItem.id);
+    const nextList =
+      idx >= 0
+        ? items.map((it, i) => (i === idx ? updatedItem : it))
+        : [updatedItem, ...items];
+
+    persistItems(nextList, updatedItem);
+    syncFollowUpStatusWithMetasAndVendas(updatedItem, newStatus, currentUserName, {
+      wasPreviouslySold,
+    });
+    showToast(`✓ Status atualizado para "${getOfficialStatusLabel(newStatus)}" em todo o CRM.`);
   };
 
   const handleSaveTrackingEdit = async (
@@ -1126,13 +1240,47 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
       nomeOrcamento: string;
       sqm: number;
       valor: number;
-      status: TrackingListStatus;
+      status: OfficialFollowUpStatus;
+      pedido?: string;
       observacao: string;
       restoreOriginal?: boolean;
     }
   ) => {
     const base = buildBaseFollowUpFromRow(row);
-    const nowIso = new Date().toISOString();
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const wasPreviouslySold = isSoldStatus(base.status);
+    const cleanPedido = (edited.pedido || base.pedido || '').trim().replace(/^#+/, '') ||
+      (edited.status === 'Vendido' ? generateNextPedidoNumber() : '');
+
+    const statusChanged = base.status !== edited.status || (edited.status === 'Vendido' && cleanPedido !== (base.pedido || ''));
+    const dia = String(now.getDate()).padStart(2, '0');
+    const mes = String(now.getMonth() + 1).padStart(2, '0');
+    const ano = now.getFullYear();
+    const hora = String(now.getHours()).padStart(2, '0');
+    const min = String(now.getMinutes()).padStart(2, '0');
+
+    const nextHistory = statusChanged
+      ? [
+          {
+            id: `h_edit_${Date.now()}`,
+            data: `${dia}/${mes}/${ano}`,
+            hora: `${hora}:${min}`,
+            statusAnterior: base.status,
+            novoStatus: edited.status,
+            observacao:
+              edited.status === 'Vendido'
+                ? `Venda confirmada na Lista de Acompanhamento. Pedido #${cleanPedido}`
+                : `Status atualizado para ${getOfficialStatusLabel(edited.status)}.`,
+            usuario: currentUserName,
+            timestamp: now.getTime(),
+          },
+          ...(base.historico || []),
+        ]
+      : base.historico || [];
+
+    const isFinished = edited.status === 'Vendido' || edited.status === 'Perdido';
+
     const updatedItem: FollowUpItem = {
       ...base,
       cliente: edited.cliente,
@@ -1141,10 +1289,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
       customSqm: edited.restoreOriginal ? undefined : edited.sqm,
       valor: edited.valor,
       observacao: edited.observacao,
-      trackingStatus: edited.status,
+      status: edited.status,
+      pedido: edited.status === 'Vendido' ? cleanPedido : base.pedido,
+      trackingStatus: undefined,
+      lembretesAtivos: isFinished ? false : base.lembretesAtivos ?? true,
       trackingUpdatedAt: nowIso,
       dataAtualizacao: nowIso,
       updatedAt: nowIso,
+      historico: nextHistory,
       trackingOverrides: edited.restoreOriginal
         ? undefined
         : {
@@ -1156,11 +1308,25 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             observacao: true,
           },
     };
-    await persistTrackingOnlyItem(updatedItem);
+
+    const idx = findMatchingFollowUpIndex(items, updatedItem.orcamentoId || updatedItem.id);
+    const nextList =
+      idx >= 0
+        ? items.map((it, i) => (i === idx ? updatedItem : it))
+        : [updatedItem, ...items];
+
+    persistItems(nextList, updatedItem);
+    syncFollowUpStatusWithMetasAndVendas(updatedItem, edited.status, currentUserName, {
+      pedido: cleanPedido,
+      wasPreviouslySold,
+    });
+
     showToast(
       edited.restoreOriginal
         ? '✓ Dados restaurados conforme o orçamento original.'
-        : '✓ Informações da Lista de Acompanhamento atualizadas com sucesso.'
+        : edited.status === 'Vendido'
+        ? `✓ Venda confirmada! Pedido #${cleanPedido} vinculado e contabilizado na Meta.`
+        : '✓ Informações e status atualizados em todo o CRM.'
     );
   };
 
@@ -1679,6 +1845,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     const updatedBudget: FollowUpItem = {
       ...transitioningBudget,
       status: selectedNewStatus,
+      trackingStatus: undefined,
       lembretesAtivos: isFinished ? false : (transitioningBudget.lembretesAtivos ?? true),
       pedido: selectedNewStatus === 'Vendido' ? cleanPedido : transitioningBudget.pedido,
       dataUltimoContato: isFinished ? transitioningBudget.dataUltimoContato : now.toISOString(),
@@ -1689,9 +1856,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
       historico: [newHistoryEntry, ...(transitioningBudget.historico || [])],
     };
 
-    const updatedItems = items.map((it) =>
-      it.id === transitioningBudget.id ? updatedBudget : it
+    const existingMatchIdx = findMatchingFollowUpIndex(
+      items,
+      updatedBudget.orcamentoId || updatedBudget.id
     );
+    const updatedItems =
+      existingMatchIdx >= 0
+        ? items.map((it, idx) => (idx === existingMatchIdx ? updatedBudget : it))
+        : [updatedBudget, ...items];
     persistItems(updatedItems, updatedBudget);
 
     // Sincroniza automaticamente a venda na Meta da consultora responsável vinculada ao orçamento
@@ -2116,7 +2288,10 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => setOrcamentosSubView('lista_acompanhamento')}
+                onClick={() => {
+                  setOrcamentosSubView('lista_acompanhamento');
+                  syncWithSupabaseAndStorage();
+                }}
                 className={`inline-flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-extrabold uppercase tracking-wide transition-all cursor-pointer ${
                   orcamentosSubView === 'lista_acompanhamento'
                     ? 'bg-[#0B2D59] text-white shadow-2xs'
@@ -3241,12 +3416,25 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                   </div>
                 </div>
 
-                {/* 3. Confirmação Simplificada de Venda (VENDIDO): solicita somente o Número do Pedido */}
+                {/* 3. Confirmação Simplificada de Venda (VENDIDO): solicita ou gera o Número do Pedido */}
                 {selectedNewStatus === 'Vendido' && (
                   <div className="p-4.5 bg-gradient-to-br from-emerald-50/80 via-emerald-50/30 to-white border border-emerald-200/90 rounded-2xl shadow-xs animate-in fade-in duration-200">
-                    <label className="block text-xs font-bold text-emerald-950 mb-1.5">
-                      Número do Pedido <span className="text-rose-500">*</span>
-                    </label>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <label className="block text-xs font-bold text-emerald-950">
+                        Número do Pedido <span className="text-rose-500">*</span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNumeroPedidoInput(generateNextPedidoNumber());
+                          if (pedidoError) setPedidoError('');
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-100 text-emerald-700 border border-emerald-300 text-[11px] font-bold transition-colors cursor-pointer shadow-2xs"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        <span>Gerar nº automático</span>
+                      </button>
+                    </div>
                     <div className="relative">
                       <Hash className="w-4 h-4 text-emerald-600 absolute left-3.5 top-1/2 -translate-y-1/2" />
                       <input

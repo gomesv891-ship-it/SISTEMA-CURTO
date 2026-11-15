@@ -1,4 +1,9 @@
-import { getDynamicProductCatalog, CatalogProduct, getProductTierPrice } from '../data/productCatalog';
+import {
+  fetchCatalogFromSupabase,
+  getDynamicProductCatalog,
+  CatalogProduct,
+  getProductTierPrice,
+} from '../data/productCatalog';
 import { getSupabaseClient, recordSelfSave, withTimeout } from './supabaseClient';
 import { isUserRevoked } from './auth';
 
@@ -30,8 +35,17 @@ export interface PromoSubcategory {
   order: number;
 }
 
+export interface PromoLotGroup {
+  id: string;
+  name: string;
+  order: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface PromoFloorLot {
   id: string;
+  lotGroupId?: string;
   crmProductId?: string;
   description: string;
   pattern?: string;
@@ -44,6 +58,58 @@ export interface PromoFloorLot {
   createdAt: string;
   updatedAt: string;
 }
+
+export const DEFAULT_ADMIN_LOT_GROUPS: {
+  id: string;
+  name: string;
+  order: number;
+  products: { seedId: string; name: string; defaultSqmPerBox: number }[];
+}[] = [
+  {
+    id: 'grp_vinilforte_flexfloor',
+    name: 'VINILFORTE / FLEXFLOOR',
+    order: 0,
+    products: [
+      { seedId: 'lot_seed_lobato', name: 'Lobato', defaultSqmPerBox: 2.5 },
+      { seedId: 'lot_seed_malta', name: 'Malta', defaultSqmPerBox: 2.5 },
+      { seedId: 'lot_seed_carvalho_rustic', name: 'Carvalho Rustic', defaultSqmPerBox: 2.5 },
+    ],
+  },
+  {
+    id: 'grp_ospefloor',
+    name: 'OSPEFLOOR',
+    order: 1,
+    products: [
+      { seedId: 'lot_seed_pisera', name: 'Pisera', defaultSqmPerBox: 2.5 },
+      { seedId: 'lot_seed_trenado', name: 'Trenado', defaultSqmPerBox: 2.5 },
+    ],
+  },
+  {
+    id: 'grp_vinilforte_placa',
+    name: 'VINILFORTE PLACA',
+    order: 2,
+    products: [
+      { seedId: 'lot_seed_turmalina', name: 'Turmalina', defaultSqmPerBox: 2.5 },
+      { seedId: 'lot_seed_pinheiros', name: 'Pinheiros', defaultSqmPerBox: 2.5 },
+    ],
+  },
+  {
+    id: 'grp_vinilforte_linha_b',
+    name: 'VINILFORTE LINHA B',
+    order: 3,
+    products: [
+      { seedId: 'lot_seed_jacaranda', name: 'Jacarandá', defaultSqmPerBox: 2.5 },
+    ],
+  },
+  {
+    id: 'grp_vexa_clicado',
+    name: 'VEXA CLICADO',
+    order: 4,
+    products: [
+      { seedId: 'lot_seed_jatoba', name: 'Jatobá', defaultSqmPerBox: 2.5 },
+    ],
+  },
+];
 
 export interface PromoLotSale {
   id: string;
@@ -118,6 +184,7 @@ export interface PromoCampaign {
   conditionsByModality: Record<PromoModality, string>;
   tierQuantitiesByModality: Record<PromoModality, PromoTierQuantities>;
   subcategories: PromoSubcategory[];
+  lotGroups?: PromoLotGroup[];
   lots: PromoFloorLot[];
   lotSales: PromoLotSale[];
   offersByModality: Record<PromoModality, PromoOfferItem[]>;
@@ -370,6 +437,19 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
         }))
     : [];
 
+  const lotGroups: PromoLotGroup[] | undefined = Array.isArray(raw.lotGroups)
+    ? raw.lotGroups
+        .filter((g: any) => g && g.id && typeof g.name === 'string' && g.name.trim())
+        .map((g: any, idx: number) => ({
+          id: String(g.id),
+          name: String(g.name).trim(),
+          order: Number(g.order ?? idx),
+          createdAt: g.createdAt ? String(g.createdAt) : undefined,
+          updatedAt: g.updatedAt ? String(g.updatedAt) : undefined,
+        }))
+        .sort((a: PromoLotGroup, b: PromoLotGroup) => a.order - b.order)
+    : undefined;
+
   const lots: PromoFloorLot[] = Array.isArray(raw.lots)
     ? raw.lots
         .filter((l: any) => l && l.id)
@@ -384,6 +464,7 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
           const soldBoxes = Math.min(initialBoxes, Math.max(0, rawSold));
           return {
             id: String(l.id),
+            lotGroupId: l.lotGroupId ? String(l.lotGroupId) : undefined,
             crmProductId: l.crmProductId ? String(l.crmProductId) : undefined,
             description: String(l.description || 'Piso Vinílico'),
             pattern: l.pattern ? String(l.pattern) : '',
@@ -545,6 +626,7 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
     conditionsByModality,
     tierQuantitiesByModality,
     subcategories,
+    ...(lotGroups !== undefined ? { lotGroups } : {}),
     lots,
     lotSales,
     offersByModality,
@@ -799,6 +881,20 @@ export async function duplicateCampaignInSupabase(
     return { ...s, id: newId };
   });
 
+  const groupMap = new Map<string, string>();
+  const newLotGroups: PromoLotGroup[] | undefined = Array.isArray(source.lotGroups)
+    ? source.lotGroups.map((g, idx) => {
+        const newId = `grp_${suffix}_${idx}`;
+        groupMap.set(g.id, newId);
+        return {
+          ...g,
+          id: newId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+      })
+    : undefined;
+
   const lotMap = new Map<string, string>();
   const newLots: PromoFloorLot[] = source.lots.map((l, idx) => {
     const newId = `lot_${suffix}_${idx}`;
@@ -806,6 +902,7 @@ export async function duplicateCampaignInSupabase(
     return {
       ...l,
       id: newId,
+      lotGroupId: l.lotGroupId ? groupMap.get(l.lotGroupId) || l.lotGroupId : undefined,
       subcategoryId: l.subcategoryId ? subMap.get(l.subcategoryId) || l.subcategoryId : undefined,
       soldBoxes: 0, // Nova campanha inicia com estoque limpo para o lote
       createdAt: nowIso,
@@ -828,6 +925,7 @@ export async function duplicateCampaignInSupabase(
     name: `${source.name} (Cópia)`,
     status: 'inativa',
     subcategories: newSubs,
+    ...(newLotGroups !== undefined ? { lotGroups: newLotGroups } : {}),
     lots: newLots,
     lotSales: [],
     conditionsByModality: { ...source.conditionsByModality },
@@ -1236,6 +1334,7 @@ export async function updateLotStockInSupabase(params: {
   sqmPerBox: number;
   initialBoxes: number;
   soldBoxes: number;
+  lotGroupId?: string;
   updatedBy: string;
 }): Promise<{
   success: boolean;
@@ -1258,7 +1357,7 @@ export async function updateLotStockInSupabase(params: {
   const description = params.description.trim();
 
   if (!description) {
-    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe a descrição do lote.' };
+    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe a descrição do produto.' };
   }
   if (sqmPerBox <= 0) {
     return { success: false, campaigns: readCachedPromocoes(), error: 'Informe m² / Caixa maior que zero.' };
@@ -1294,7 +1393,7 @@ export async function updateLotStockInSupabase(params: {
 
     const targetLot = targetCampaign.lots.find((l) => l.id === params.lotId);
     if (!targetLot) {
-      return { success: false, campaigns: remoteCampaigns, error: 'Lote não encontrado.' };
+      return { success: false, campaigns: remoteCampaigns, error: 'Produto não encontrado no lote.' };
     }
 
     const nowIso = new Date().toISOString();
@@ -1306,6 +1405,7 @@ export async function updateLotStockInSupabase(params: {
             sqmPerBox,
             initialBoxes,
             soldBoxes,
+            ...(params.lotGroupId !== undefined ? { lotGroupId: params.lotGroupId || undefined } : {}),
             updatedAt: nowIso,
           }
         : l
@@ -1371,37 +1471,751 @@ export async function updateLotStockInSupabase(params: {
 }
 
 /**
- * Carrega os produtos já cadastrados no CRM (sem modificar o cadastro geral de produtos).
+ * Cadastra um novo lote diretamente no Controle Administrativo da campanha no Supabase.
  */
-export async function loadCrmProductsForPromocoes(): Promise<CatalogProduct[]> {
+export async function createLotInSupabase(params: {
+  campaignId: string;
+  description: string;
+  sqmPerBox: number;
+  initialBoxes: number;
+  soldBoxes?: number;
+  lotGroupId?: string;
+  createdBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  error?: string;
+}> {
   const client = getSupabaseClient();
-  if (client) {
-    try {
-      const res = await withTimeout(
-        client
-          .from('fenix_kv_store')
-          .select('key, data')
-          .in('key', ['fenix_product_items_data', 'fenix_product_categories_data']),
-        3500,
-        { data: null } as any
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase para cadastrar o produto.',
+    };
+  }
+
+  const description = params.description.trim();
+  const sqmPerBox = Math.max(0, Number(params.sqmPerBox) || 0);
+  const initialBoxes = Math.max(0, Math.floor(Number(params.initialBoxes) || 0));
+  const soldBoxes = Math.max(0, Math.floor(Number(params.soldBoxes) || 0));
+
+  if (!description) {
+    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe o nome do produto.' };
+  }
+  if (sqmPerBox <= 0) {
+    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe m² / Caixa maior que zero.' };
+  }
+  if (soldBoxes > initialBoxes) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: `Quantidade vendida (${soldBoxes}) não pode ultrapassar a quantidade inicial (${initialBoxes}).`,
+    };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const newLot: PromoFloorLot = {
+      id: `lot_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      lotGroupId: params.lotGroupId || undefined,
+      description,
+      sqmPerBox,
+      initialBoxes,
+      soldBoxes,
+      active: true,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lots: [...targetCampaign.lots, newLot],
+      updatedAt: nowIso,
+      updatedBy: params.createdBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.createdBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao cadastrar lote no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao cadastrar lote.',
+    };
+  }
+}
+
+/**
+ * Exclui um lote da tabela administrativa preservando integralmente o histórico de vendas (lotSales).
+ */
+export async function deleteLotInSupabase(params: {
+  campaignId: string;
+  lotId: string;
+  deletedBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  error?: string;
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase para excluir o lote.',
+    };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const remainingLots = targetCampaign.lots.filter((l) => l.id !== params.lotId);
+    const nextOffers = { ...targetCampaign.offersByModality };
+    (['cliente_final', 'construtora', 'revenda'] as PromoModality[]).forEach((mod) => {
+      nextOffers[mod] = (nextOffers[mod] || []).map((o) =>
+        o.lotId === params.lotId ? { ...o, lotId: undefined } : o
       );
-      if (Array.isArray(res?.data)) {
-        for (const row of res.data) {
-          if (row?.key && row?.data) {
-            try {
-              const str = typeof row.data === 'string' ? row.data : JSON.stringify(row.data);
-              localStorage.setItem(row.key, str);
-            } catch {
-              // ignore
-            }
-          }
+    });
+
+    // Preserva targetCampaign.lotSales integralmente para manter o histórico de vendas
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lots: remainingLots,
+      lotSales: [...(targetCampaign.lotSales || [])],
+      offersByModality: nextOffers,
+      updatedAt: nowIso,
+      updatedBy: params.deletedBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.deletedBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao excluir lote no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao excluir lote.',
+    };
+  }
+}
+
+function normalizeLotText(str: string): string {
+  return (str || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+}
+
+export function buildDefaultLotGroupsForCampaign(campaign: PromoCampaign): {
+  lotGroups: PromoLotGroup[];
+  lots: PromoFloorLot[];
+} {
+  const nowIso = new Date().toISOString();
+  const lotGroups: PromoLotGroup[] = DEFAULT_ADMIN_LOT_GROUPS.map((g) => ({
+    id: g.id,
+    name: g.name,
+    order: g.order,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  }));
+
+  const existingLots = [...(campaign.lots || [])];
+  const matchedSeedNames = new Set<string>();
+
+  const mappedLots: PromoFloorLot[] = existingLots.map((lot) => {
+    if (lot.lotGroupId && lotGroups.some((g) => g.id === lot.lotGroupId)) {
+      return lot;
+    }
+    const normDesc = normalizeLotText(lot.description);
+    for (const grp of DEFAULT_ADMIN_LOT_GROUPS) {
+      for (const prod of grp.products) {
+        const normSeed = normalizeLotText(prod.name);
+        if (normDesc === normSeed || normDesc.includes(normSeed)) {
+          matchedSeedNames.add(prod.seedId);
+          return { ...lot, lotGroupId: grp.id };
         }
       }
-    } catch {
-      // ignore fallback to local catalog
+    }
+    return lot;
+  });
+
+  for (const grp of DEFAULT_ADMIN_LOT_GROUPS) {
+    for (const prod of grp.products) {
+      if (matchedSeedNames.has(prod.seedId)) continue;
+      const alreadyExists = mappedLots.some(
+        (l) =>
+          l.id === prod.seedId ||
+          normalizeLotText(l.description) === normalizeLotText(prod.name) ||
+          normalizeLotText(l.description).includes(normalizeLotText(prod.name))
+      );
+      if (!alreadyExists) {
+        mappedLots.push({
+          id: prod.seedId,
+          lotGroupId: grp.id,
+          description: prod.name,
+          sqmPerBox: prod.defaultSqmPerBox,
+          initialBoxes: 0,
+          soldBoxes: 0,
+          active: true,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+      }
     }
   }
-  return getDynamicProductCatalog();
+
+  return { lotGroups, lots: mappedLots };
+}
+
+/**
+ * Inicializa os grupos padrão no Supabase de forma idempotente caso a campanha ainda não tenha lotGroups.
+ * Nunca duplica lotes/produtos e preserva integralmente todos os registros existentes.
+ */
+export async function initializeLotGroupsInSupabase(params: {
+  campaignId: string;
+  updatedBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  error?: string;
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase.',
+    };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    // Já inicializada anteriormente (mesmo que vazia): respeita exatamente o estado salvo no Supabase
+    if (Array.isArray(targetCampaign.lotGroups)) {
+      return {
+        success: true,
+        campaigns: remoteCampaigns,
+        updatedCampaign: targetCampaign,
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    const { lotGroups, lots } = buildDefaultLotGroupsForCampaign(targetCampaign);
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lotGroups,
+      lots,
+      updatedAt: nowIso,
+      updatedBy: params.updatedBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.updatedBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao inicializar grupos no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao inicializar grupos.',
+    };
+  }
+}
+
+export async function createLotGroupInSupabase(params: {
+  campaignId: string;
+  name: string;
+  createdBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  createdGroup?: PromoLotGroup;
+  error?: string;
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase para criar o lote.',
+    };
+  }
+
+  const name = params.name.trim();
+  if (!name) {
+    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe o nome do lote.' };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    const baseOrg = Array.isArray(targetCampaign.lotGroups)
+      ? { lotGroups: targetCampaign.lotGroups, lots: targetCampaign.lots }
+      : buildDefaultLotGroupsForCampaign(targetCampaign);
+
+    if (baseOrg.lotGroups.some((g) => normalizeLotText(g.name) === normalizeLotText(name))) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: `Já existe um lote chamado "${name}".`,
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    const maxOrder = baseOrg.lotGroups.reduce((m, g) => Math.max(m, g.order), -1);
+    const createdGroup: PromoLotGroup = {
+      id: `grp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      order: maxOrder + 1,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lotGroups: [...baseOrg.lotGroups, createdGroup],
+      lots: baseOrg.lots,
+      updatedAt: nowIso,
+      updatedBy: params.createdBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.createdBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao criar lote no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+      createdGroup,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao criar lote.',
+    };
+  }
+}
+
+export async function updateLotGroupInSupabase(params: {
+  campaignId: string;
+  groupId: string;
+  name: string;
+  updatedBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  error?: string;
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase para atualizar o lote.',
+    };
+  }
+
+  const name = params.name.trim();
+  if (!name) {
+    return { success: false, campaigns: readCachedPromocoes(), error: 'Informe o nome do lote.' };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    const currentGroups = Array.isArray(targetCampaign.lotGroups) ? targetCampaign.lotGroups : [];
+    if (
+      currentGroups.some(
+        (g) => g.id !== params.groupId && normalizeLotText(g.name) === normalizeLotText(name)
+      )
+    ) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: `Já existe um lote chamado "${name}".`,
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    const updatedGroups = currentGroups.map((g) =>
+      g.id === params.groupId ? { ...g, name, updatedAt: nowIso } : g
+    );
+
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lotGroups: updatedGroups,
+      updatedAt: nowIso,
+      updatedBy: params.updatedBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.updatedBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao atualizar lote no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao atualizar lote.',
+    };
+  }
+}
+
+export async function deleteLotGroupInSupabase(params: {
+  campaignId: string;
+  groupId: string;
+  deletedBy: string;
+}): Promise<{
+  success: boolean;
+  campaigns: PromoCampaign[];
+  updatedCampaign?: PromoCampaign;
+  error?: string;
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: 'Sem conexão com o Supabase para excluir o lote.',
+    };
+  }
+
+  try {
+    const { data: remoteRow, error: fetchErr } = await client
+      .from('fenix_kv_store')
+      .select('data')
+      .eq('key', PROMOCOES_SUPABASE_KEY)
+      .maybeSingle();
+
+    if (fetchErr) {
+      return {
+        success: false,
+        campaigns: readCachedPromocoes(),
+        error: fetchErr.message || 'Erro ao consultar campanha no Supabase.',
+      };
+    }
+
+    const remoteCampaigns = remoteRow?.data ? parsePromocoesPayload(remoteRow.data) : [];
+    const targetCampaign = remoteCampaigns.find((c) => c.id === params.campaignId);
+    if (!targetCampaign) {
+      return { success: false, campaigns: remoteCampaigns, error: 'Campanha não encontrada.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const removedLotIds = new Set(
+      targetCampaign.lots.filter((l) => l.lotGroupId === params.groupId).map((l) => l.id)
+    );
+    const remainingGroups = (targetCampaign.lotGroups || []).filter((g) => g.id !== params.groupId);
+    const remainingLots = targetCampaign.lots.filter((l) => l.lotGroupId !== params.groupId);
+
+    const nextOffers = { ...targetCampaign.offersByModality };
+    (['cliente_final', 'construtora', 'revenda'] as PromoModality[]).forEach((mod) => {
+      nextOffers[mod] = (nextOffers[mod] || []).map((o) =>
+        o.lotId && removedLotIds.has(o.lotId) ? { ...o, lotId: undefined } : o
+      );
+    });
+
+    // Preserva targetCampaign.lotSales integralmente
+    const updatedCampaign: PromoCampaign = {
+      ...targetCampaign,
+      lotGroups: remainingGroups,
+      lots: remainingLots,
+      lotSales: [...(targetCampaign.lotSales || [])],
+      offersByModality: nextOffers,
+      updatedAt: nowIso,
+      updatedBy: params.deletedBy || 'Vanessa Gomes',
+      version: (targetCampaign.version || 1) + 1,
+    };
+
+    const updatedList = parsePromocoesPayload(
+      remoteCampaigns.map((c) => (c.id === updatedCampaign.id ? updatedCampaign : c))
+    );
+
+    recordSelfSave(PROMOCOES_SUPABASE_KEY, nowIso);
+
+    const { error: upsertErr } = await client.from('fenix_kv_store').upsert(
+      {
+        key: PROMOCOES_SUPABASE_KEY,
+        data: updatedList,
+        updated_at: nowIso,
+        updated_by: params.deletedBy || 'Vanessa Gomes',
+      },
+      { onConflict: 'key' }
+    );
+
+    if (upsertErr) {
+      return {
+        success: false,
+        campaigns: remoteCampaigns,
+        error: upsertErr.message || 'Erro ao excluir lote no Supabase.',
+      };
+    }
+
+    writeCachedPromocoes(updatedList);
+    return {
+      success: true,
+      campaigns: updatedList,
+      updatedCampaign,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      campaigns: readCachedPromocoes(),
+      error: err?.message || 'Erro inesperado ao excluir lote.',
+    };
+  }
+}
+
+/**
+ * Carrega os produtos já cadastrados no CRM direto do Supabase (sem modificar o cadastro geral ou usar localStorage).
+ */
+export async function loadCrmProductsForPromocoes(): Promise<CatalogProduct[]> {
+  try {
+    const { catalog } = await withTimeout(
+      fetchCatalogFromSupabase(true),
+      4000,
+      { catalog: getDynamicProductCatalog(), categories: [], groups: [] }
+    );
+    return catalog;
+  } catch {
+    return getDynamicProductCatalog();
+  }
 }
 
 export function getCrmPriceForModality(prod: CatalogProduct, modality: PromoModality): number {

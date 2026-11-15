@@ -1,6 +1,11 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { Package, Plus, Search, X, Check, Layers } from 'lucide-react';
-import { CatalogProduct, getOfficialCategories } from '../data/productCatalog';
+import {
+  CatalogProduct,
+  filterCatalogProducts,
+  getOfficialCategories,
+  searchProductsInSupabase,
+} from '../data/productCatalog';
 import {
   PromoCategory,
   PromoModality,
@@ -53,23 +58,39 @@ export const PromocaoCrmProductPickerModal: React.FC<PromocaoCrmProductPickerMod
     };
   }, [isOpen]);
 
+  const [supabaseFiltered, setSupabaseFiltered] = useState<CatalogProduct[] | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    const timer = setTimeout(() => {
+      searchProductsInSupabase(searchTerm, {
+        categoryIdOrName: selectedCrmCategory,
+      })
+        .then((res) => {
+          if (active) setSupabaseFiltered(res);
+        })
+        .catch(() => {});
+    }, 120);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [isOpen, searchTerm, selectedCrmCategory]);
+
   const categories = useMemo(() => getOfficialCategories(), [isOpen, products.length]);
   const modalityMeta = PROMO_MODALITIES.find((m) => m.id === modality) || PROMO_MODALITIES[0];
 
   const filteredProducts = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase();
-    return products.filter((p) => {
-      const matchesName =
-        !q ||
-        p.name.toLowerCase().includes(q) ||
-        (p.category || '').toLowerCase().includes(q);
-      const matchesCat =
-        selectedCrmCategory === 'all' ||
-        p.categoryId === selectedCrmCategory ||
-        (p.category || '').toLowerCase() === selectedCrmCategory.toLowerCase();
-      return matchesName && matchesCat;
+    if (supabaseFiltered !== null) {
+      return filterCatalogProducts(supabaseFiltered, searchTerm, {
+        categoryIdOrName: selectedCrmCategory,
+      });
+    }
+    return filterCatalogProducts(products, searchTerm, {
+      categoryIdOrName: selectedCrmCategory,
     });
-  }, [products, searchTerm, selectedCrmCategory]);
+  }, [supabaseFiltered, products, searchTerm, selectedCrmCategory]);
 
   if (!isOpen) return null;
 

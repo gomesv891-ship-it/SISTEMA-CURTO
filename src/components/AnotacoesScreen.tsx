@@ -167,6 +167,10 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   const [renameCategoryValue, setRenameCategoryValue] = useState('');
   const [deleteCategoryTarget, setDeleteCategoryTarget] = useState<AnotacaoCategory | null>(null);
   const [deleteNoteTarget, setDeleteNoteTarget] = useState<AnotacaoItem | null>(null);
+  const [pendingNavAction, setPendingNavAction] = useState<{
+    title: string;
+    run: () => void;
+  } | null>(null);
 
   const [isPersonalizeOpen, setIsPersonalizeOpen] = useState(false);
   const [personalizeDraft, setPersonalizeDraft] = useState<AnotacaoSheetConfig>({
@@ -195,9 +199,8 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   const [canRedo, setCanRedo] = useState(false);
   const lastHistoryPushAtRef = useRef<number>(0);
 
-  // Refs para auto-save, editor e menus
+  // Refs para editor e menus
   const editorRef = useRef<AnotacaoRichEditorHandle | null>(null);
-  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftNoteRef = useRef<AnotacaoItem | null>(null);
   const hasUnsavedRef = useRef(false);
@@ -396,13 +399,9 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     }
   }, [selectedNoteId, visibleNotesTotal, isNewDraft, hasUnsavedChanges]);
 
-  // Executa salvamento oficial no Supabase
+  // Executa salvamento manual oficial no Supabase
   const persistNoteNow = useCallback(
-    async (noteToSave: AnotacaoItem, silentToast = true): Promise<boolean> => {
-      if (autoSaveTimerRef.current) {
-        clearTimeout(autoSaveTimerRef.current);
-        autoSaveTimerRef.current = null;
-      }
+    async (noteToSave: AnotacaoItem, silentToast = false): Promise<boolean> => {
       setIsSaving(true);
       setErrorBanner(null);
 
@@ -451,29 +450,17 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     [currentUserKey, currentUserName, showToast]
   );
 
-  // Agenda auto-save suave (850ms)
-  const scheduleAutoSave = useCallback(
-    (noteSnapshot: AnotacaoItem, immediate = false) => {
-      if (autoSaveTimerRef.current) {
-        clearTimeout(autoSaveTimerRef.current);
-      }
-      if (immediate) {
-        persistNoteNow(noteSnapshot, true);
-        return;
-      }
-      autoSaveTimerRef.current = setTimeout(() => {
-        const latest = draftNoteRef.current;
-        if (latest && latest.id === noteSnapshot.id) {
-          persistNoteNow(latest, true);
-        }
-      }, 850);
-    },
-    [persistNoteNow]
-  );
-
+  // Alerta o navegador se houver alterações não salvas antes de fechar/recarregar
   useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (hasUnsavedRef.current) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
-      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, []);
@@ -511,19 +498,15 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     categoriesByUser,
   ]);
 
-  const flushPendingDraftBeforeSwitch = useCallback(async () => {
-    if (autoSaveTimerRef.current) {
-      clearTimeout(autoSaveTimerRef.current);
-      autoSaveTimerRef.current = null;
+  const runWithUnsavedGuard = (title: string, action: () => void) => {
+    if (hasUnsavedRef.current && draftNoteRef.current) {
+      setPendingNavAction({ title, run: action });
+      return;
     }
-    const pending = draftNoteRef.current;
-    if (pending && hasUnsavedRef.current) {
-      await persistNoteNow(pending, true);
-    }
-  }, [persistNoteNow]);
+    action();
+  };
 
-  const handleSelectFolder = async (folderId: string) => {
-    await flushPendingDraftBeforeSwitch();
+  const applySelectFolder = (folderId: string) => {
     setSelectedFolderId(folderId);
     setSearchTerm('');
 
@@ -535,6 +518,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     setIsNewDraft(false);
     setIsEditing(false);
     setHasUnsavedChanges(false);
+    hasUnsavedRef.current = false;
     resetHistory();
 
     if (targetNotes[0]) {
@@ -546,14 +530,17 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     }
   };
 
-  const handleSelectNote = async (note: AnotacaoItem) => {
-    if (draftNote?.id === note.id) {
-      setIsMobileSidebarOpen(false);
-      return;
-    }
-    await flushPendingDraftBeforeSwitch();
+  const handleSelectFolder = (folderId: string) => {
+    if (folderId === selectedFolderId && !isNewDraft) return;
+    runWithUnsavedGuard('Você possui alterações não salvas antes de trocar de pasta.', () =>
+      applySelectFolder(folderId)
+    );
+  };
+
+  const applySelectNote = (note: AnotacaoItem) => {
     setIsNewDraft(false);
     setHasUnsavedChanges(false);
+    hasUnsavedRef.current = false;
     setIsEditing(false);
     resetHistory();
     setSelectedNoteId(note.id);
@@ -561,9 +548,17 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     setIsMobileSidebarOpen(false);
   };
 
-  const handleStartNewNote = async () => {
-    await flushPendingDraftBeforeSwitch();
+  const handleSelectNote = (note: AnotacaoItem) => {
+    if (draftNote?.id === note.id) {
+      setIsMobileSidebarOpen(false);
+      return;
+    }
+    runWithUnsavedGuard('Você possui alterações não salvas nesta anotação.', () =>
+      applySelectNote(note)
+    );
+  };
 
+  const applyStartNewNote = () => {
     const targetCatId =
       selectedFolderId !== SHARED_SECTION_ID &&
       userCategories.some((c) => c.id === selectedFolderId)
@@ -582,6 +577,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     setIsNewDraft(true);
     setIsEditing(true);
     setHasUnsavedChanges(true);
+    hasUnsavedRef.current = true;
     setIsMobileSidebarOpen(false);
 
     setTimeout(() => {
@@ -589,13 +585,29 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     }, 60);
   };
 
+  const handleStartNewNote = () => {
+    runWithUnsavedGuard('Você possui alterações não salvas antes de criar uma nova anotação.', () =>
+      applyStartNewNote()
+    );
+  };
+
   const handleUpdateDraftTitle = (newTitle: string) => {
     if (!draftNote) return;
     pushHistorySnapshot({ title: draftNote.title, blocks: draftNote.blocks });
     const next = { ...draftNote, title: newTitle };
     setDraftNote(next);
+    draftNoteRef.current = next;
     setHasUnsavedChanges(true);
-    scheduleAutoSave(next, false);
+    hasUnsavedRef.current = true;
+  };
+
+  const handleUpdateDraftDate = (newDate: string) => {
+    if (!draftNote) return;
+    const next = { ...draftNote, date: newDate };
+    setDraftNote(next);
+    draftNoteRef.current = next;
+    setHasUnsavedChanges(true);
+    hasUnsavedRef.current = true;
   };
 
   const handleUpdateDraftBlocks = useCallback(
@@ -606,11 +618,11 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
         const updated = { ...prev, blocks: nextBlocks };
         draftNoteRef.current = updated;
         setHasUnsavedChanges(true);
-        scheduleAutoSave(updated, flushImmediate);
+        hasUnsavedRef.current = true;
         return updated;
       });
     },
-    [pushHistorySnapshot, scheduleAutoSave]
+    [pushHistorySnapshot]
   );
 
   const handleUndo = () => {
@@ -633,7 +645,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     setDraftNote(restored);
     draftNoteRef.current = restored;
     setHasUnsavedChanges(true);
-    scheduleAutoSave(restored, false);
+    hasUnsavedRef.current = true;
   };
 
   const handleRedo = () => {
@@ -656,7 +668,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     setDraftNote(restored);
     draftNoteRef.current = restored;
     setHasUnsavedChanges(true);
-    scheduleAutoSave(restored, false);
+    hasUnsavedRef.current = true;
   };
 
   const handleMoveNoteToCategory = async (note: AnotacaoItem, targetCategoryId: string) => {
@@ -1103,7 +1115,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
       : null;
 
   return (
-    <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
+    <div className="w-full max-w-[1760px] mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
       {/* Portal invisível na tela para impressão A4 nativa limpa */}
       {printPortalElement}
 
@@ -1214,7 +1226,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-[#0B3F7D] text-white hover:bg-[#083062] shadow-sm transition-colors cursor-pointer"
             >
               <Plus className="w-4 h-4" />
-              <span>+ Nova</span>
+              <span>Nova</span>
             </button>
 
             <button
@@ -1345,7 +1357,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
         {/* PAINEL ESQUERDO: PASTAS + LISTA DE ANOTAÇÕES */}
         <div
-          className={`lg:col-span-4 xl:col-span-3 space-y-3 no-print ${
+          className={`lg:col-span-3 space-y-3 no-print ${
             isMobileSidebarOpen ? 'block' : 'hidden lg:block'
           }`}
         >
@@ -1653,7 +1665,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
         </div>
 
         {/* ÁREA PRINCIPAL: CONTROLES DA NOTA + BARRA DE EDIÇÃO + FOLHA OFICIAL FÊNIX */}
-        <div className="lg:col-span-8 xl:col-span-9 space-y-3">
+        <div className="lg:col-span-9 space-y-3 min-w-0">
           {!draftNote ? (
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-10 text-center space-y-4 no-print">
               <div className="w-14 h-14 rounded-2xl bg-blue-50 text-[#0B3F7D] flex items-center justify-center mx-auto">
@@ -1738,7 +1750,13 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
 
                 {/* Status de salvamento + Botões de ação */}
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[11px] font-medium text-slate-500 flex items-center gap-1 px-2">
+                  <span
+                    className={`text-[11px] font-semibold flex items-center gap-1.5 px-2.5 py-1 rounded-lg ${
+                      hasUnsavedChanges
+                        ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
                     {isSaving ? (
                       <>
                         <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0B3F7D]" />
@@ -1746,13 +1764,13 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                       </>
                     ) : hasUnsavedChanges ? (
                       <>
-                        <span className="w-2 h-2 rounded-full bg-amber-500" />
-                        <span>Alterações pendentes</span>
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                        <span>Alterações não salvas</span>
                       </>
                     ) : (
                       <>
                         <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                        <span>{lastSavedAt ? `Salvo às ${lastSavedAt}` : 'Sincronizado'}</span>
+                        <span>{lastSavedAt ? `Salvo às ${lastSavedAt}` : 'Salvo no sistema'}</span>
                       </>
                     )}
                   </span>
@@ -1761,7 +1779,11 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                     type="button"
                     onClick={() => persistNoteNow(draftNote, false)}
                     disabled={isSaving}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-[#0B3F7D] text-white hover:bg-[#083062] disabled:opacity-60 cursor-pointer"
+                    className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold text-white disabled:opacity-60 cursor-pointer transition-colors ${
+                      hasUnsavedChanges
+                        ? 'bg-amber-600 hover:bg-amber-700 shadow-sm'
+                        : 'bg-[#0B3F7D] hover:bg-[#083062]'
+                    }`}
                   >
                     <Save className="w-3.5 h-3.5" />
                     <span>Salvar</span>
@@ -1773,7 +1795,6 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                       onClick={() => {
                         setIsEditing(false);
                         setIsHighlightMenuOpen(false);
-                        if (hasUnsavedChanges) persistNoteNow(draftNote, true);
                       }}
                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200 cursor-pointer"
                     >
@@ -1806,6 +1827,27 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                   )}
                 </div>
               </div>
+
+              {hasUnsavedChanges && (
+                <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900 no-print">
+                  <div className="flex items-center gap-2 font-semibold">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      Você possui alterações não salvas nesta anotação. Clique em{' '}
+                      <strong>Salvar</strong> para gravar no sistema.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => persistNoteNow(draftNote, false)}
+                    disabled={isSaving}
+                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold cursor-pointer disabled:opacity-60"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Salvar agora</span>
+                  </button>
+                </div>
+              )}
 
               {/* BARRA DE FERRAMENTAS COMPACTA — VISÍVEL SOMENTE DURANTE A EDIÇÃO */}
               {isEditing && (
@@ -2018,6 +2060,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                   sheetConfig={activeSheetConfig}
                   onTitleFocus={() => setIsEditing(true)}
                   onTitleChange={handleUpdateDraftTitle}
+                  onDateChange={isOwnedByCurrentUser ? handleUpdateDraftDate : undefined}
                   onBodyMouseDown={() => setIsEditing(true)}
                   refreshTrigger={draftNote.blocks}
                 >
@@ -2260,6 +2303,64 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                 className="px-3.5 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg cursor-pointer"
               >
                 Confirmar Exclusão
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* MODAL CONFIRMAÇÃO ALTERAÇÕES NÃO SALVAS */}
+      {pendingNavAction && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4 no-print">
+          <div className="bg-white rounded-xl border border-slate-200 shadow-xl max-w-md w-full p-5 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-sm font-bold text-slate-900">Alterações não salvas</h4>
+                <p className="text-xs text-slate-600 mt-1">{pendingNavAction.title}</p>
+                <p className="text-xs text-slate-500 mt-1">
+                  Deseja salvar antes de continuar ou descartar as alterações feitas?
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingNavAction(null)}
+                className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const act = pendingNavAction.run;
+                  setPendingNavAction(null);
+                  act();
+                }}
+                className="px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer"
+              >
+                Descartar alterações
+              </button>
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={async () => {
+                  const act = pendingNavAction.run;
+                  const currentDraft = draftNoteRef.current;
+                  setPendingNavAction(null);
+                  if (currentDraft) {
+                    const saved = await persistNoteNow(currentDraft, false);
+                    if (saved) act();
+                  } else {
+                    act();
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-[#0B3F7D] hover:bg-[#083062] rounded-lg disabled:opacity-60 cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>Salvar e continuar</span>
               </button>
             </div>
           </div>

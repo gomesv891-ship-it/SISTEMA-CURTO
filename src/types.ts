@@ -102,12 +102,16 @@ export interface MaterialRow {
 }
 
 export type OrcamentoStatus =
+  | 'Orçamento Enviado'
+  | 'Aguardando Retorno'
+  | 'Negociando'
+  | 'Vendido'
+  | 'Perdido'
   | 'Em aberto'
   | 'Aguardando retorno'
   | 'Fechados'
   | 'Fechado'
-  | 'Perdidos'
-  | 'Perdido';
+  | 'Perdidos';
 
 export interface SavedOrcamento {
   id: string;
@@ -137,6 +141,8 @@ export interface SavedOrcamento {
     unidade: string;
     precoUnitario: number;
     total: number;
+    requestedMl?: number;
+    barLengthMeters?: number;
   }[];
   freteAtivo?: boolean;
   freteValor: number;
@@ -152,6 +158,9 @@ export interface SavedOrcamento {
   descontoTexto?: string;
   totalFinal: number;
   status: OrcamentoStatus;
+  pedido?: string;
+  followUpId?: string;
+  numeroOrcamento?: string;
   savedAt: string;
   updatedAt?: string;
 }
@@ -163,7 +172,7 @@ export type TaskStatus = 'Pendente' | 'Atrasada' | 'Concluída';
 export interface TaskItem {
   id: string;
   title: string;
-  type: TaskType;
+  type?: TaskType;
   description?: string;
   clientId: string;
   clientName: string;
@@ -440,15 +449,14 @@ export interface MetaMensal {
   vendas: VendaMes[];
 }
 
-export type FollowUpStatus =
+export type OfficialFollowUpStatus =
   | 'Orçamento Enviado'
   | 'Aguardando Retorno'
   | 'Negociando'
   | 'Vendido'
-  | 'Perdido'
-  | 'Em Contato'
-  | 'Negociação'
-  | 'Aguardando Resposta';
+  | 'Perdido';
+
+export type FollowUpStatus = OfficialFollowUpStatus;
 
 export interface FollowUpHistoryEntry {
   id: string;

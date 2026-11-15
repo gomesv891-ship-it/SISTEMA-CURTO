@@ -16,11 +16,11 @@ import { RendimentoItem } from './rendimentosService';
 import {
   calculateRodapeInsumosForOrcamento,
   extractBarLengthFromProductName,
-  formatRodapeDetailText,
   isRodapeCalafetarCatalogProduct,
   isRodapeColaCatalogProduct,
   parseBarCountFromInput,
   parseRodapeDetails,
+  stripRodapeAutoDetail,
 } from './rodapeCalculator';
 
 export type PisoInsumoGroup =
@@ -241,6 +241,7 @@ export function applyRodapeTableQuantityChange(params: {
   existingLink?: RodapeInsumoLink;
   barLengthMeters?: number;
   forceTreatAsMl?: boolean;
+  inputMode?: 'barras' | 'ml';
 }): {
   updatedItem: EspelhoItem;
   bars: number;
@@ -253,11 +254,13 @@ export function applyRodapeTableQuantityChange(params: {
     rawQtdVal,
     existingLink,
     barLengthMeters,
-    forceTreatAsMl = true,
+    forceTreatAsMl = false,
+    inputMode = forceTreatAsMl ? 'ml' : 'barras',
   } = params;
   const barLen = Math.max(
     0.1,
     barLengthMeters ??
+      item.barLengthMeters ??
       existingLink?.barLengthMeters ??
       extractBarLengthFromProductName(item.descricao, 2.4)
   );
@@ -268,18 +271,15 @@ export function applyRodapeTableQuantityChange(params: {
     const effectiveMl = Math.round(bars * barLen * 100) / 100;
     const requestedMl = effectiveMl;
     const total = Math.round(bars * item.precoUnitario * 100) / 100;
-    const nextSubtitulo = formatRodapeDetailText({
-      requestedMl,
-      barCount: bars,
-      barLengthMeters: barLen,
-      existingDetail: item.subtitulo,
-    });
+    const nextSubtitulo = stripRodapeAutoDetail(item.subtitulo);
     return {
       updatedItem: {
         ...item,
         qtd: String(bars),
         unidade: item.unidade || 'barras',
         subtitulo: nextSubtitulo,
+        requestedMl,
+        barLengthMeters: barLen,
         total,
       },
       bars,
@@ -304,49 +304,40 @@ export function applyRodapeTableQuantityChange(params: {
     };
   }
 
-  const matchesSavedBarras =
-    !forceTreatAsMl &&
-    existingLink?.lastBarras !== undefined &&
-    existingLink.lastBarras > 0 &&
-    Math.abs(parsedNum - existingLink.lastBarras) <= 0.005;
-
-  if (matchesSavedBarras && existingLink?.lastBarras) {
-    const bars = existingLink.lastBarras;
+  if (inputMode === 'barras') {
+    const bars = Math.max(1, Math.round(parsedNum));
     const effectiveMl = Math.round(bars * barLen * 100) / 100;
-    const requestedMl = existingLink.requestedMl ?? effectiveMl;
+    const preservedExistingReqMl =
+      existingLink?.lastBarras !== undefined &&
+      bars === existingLink.lastBarras &&
+      (item.requestedMl ?? existingLink.requestedMl)
+        ? (item.requestedMl ?? existingLink.requestedMl!)
+        : effectiveMl;
     const total = Math.round(bars * item.precoUnitario * 100) / 100;
-    const nextSubtitulo = formatRodapeDetailText({
-      requestedMl,
-      barCount: bars,
-      barLengthMeters: barLen,
-      existingDetail: item.subtitulo,
-    });
+    const nextSubtitulo = stripRodapeAutoDetail(item.subtitulo);
     return {
       updatedItem: {
         ...item,
         qtd: String(bars),
         unidade: item.unidade || 'barras',
         subtitulo: nextSubtitulo,
+        requestedMl: preservedExistingReqMl,
+        barLengthMeters: barLen,
         total,
       },
       bars,
-      requestedMl,
+      requestedMl: preservedExistingReqMl,
       barLen,
       effectiveMl,
     };
   }
 
-  // REGRA PRINCIPAL: valor digitado representa metros lineares (ML) -> converte em barras arredondando para cima
+  // Modo ML: valor digitado representa metros lineares (ML) -> converte em barras arredondando para cima
   const requestedMl = parsedNum;
   const bars = Math.max(1, Math.ceil(requestedMl / barLen - 1e-9));
   const effectiveMl = Math.round(bars * barLen * 100) / 100;
   const total = Math.round(bars * item.precoUnitario * 100) / 100;
-  const nextSubtitulo = formatRodapeDetailText({
-    requestedMl,
-    barCount: bars,
-    barLengthMeters: barLen,
-    existingDetail: item.subtitulo,
-  });
+  const nextSubtitulo = stripRodapeAutoDetail(item.subtitulo);
 
   return {
     updatedItem: {
@@ -354,6 +345,8 @@ export function applyRodapeTableQuantityChange(params: {
       qtd: String(bars),
       unidade: item.unidade || 'barras',
       subtitulo: nextSubtitulo,
+      requestedMl,
+      barLengthMeters: barLen,
       total,
     },
     bars,
@@ -451,14 +444,19 @@ export function ensureRodapeLinkForExistingBudgetList(params: {
 
   const parsedSub = parseRodapeDetails(rodapeItem.subtitulo);
   const savedBars = Math.max(0, parsePtBrNumeric(rodapeItem.qtd));
-  const barLen = extractBarLengthFromProductName(rodapeItem.descricao, 2.4);
+  const barLen =
+    rodapeItem.barLengthMeters ||
+    extractBarLengthFromProductName(rodapeItem.descricao, 2.4);
 
   rodapeLinks.set(rodapeItem.id, {
     barLengthMeters: barLen,
     requestedMl:
-      parsedSub?.metrosDesejados && parsedSub.metrosDesejados > 0
+      (rodapeItem.requestedMl && rodapeItem.requestedMl > 0
+        ? rodapeItem.requestedMl
+        : undefined) ??
+      (parsedSub?.metrosDesejados && parsedSub.metrosDesejados > 0
         ? parsedSub.metrosDesejados
-        : undefined,
+        : undefined),
     lastBarras: savedBars > 0 ? savedBars : undefined,
     includeColar: existingColar,
     includeCalafetar: Boolean(existingCalafetarItem),
