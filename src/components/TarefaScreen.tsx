@@ -41,6 +41,7 @@ interface TarefaScreenProps {
   currentUserName?: string;
   onNavigateTab?: (tab: string) => void;
   initialOpenCreateTask?: boolean;
+  onConsumeOpenCreateTask?: () => void;
 }
 
 // Data dinâmica atual no formato YYYY-MM-DD
@@ -114,6 +115,7 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
   currentUserName = 'Vanessa Gomes',
   onNavigateTab,
   initialOpenCreateTask,
+  onConsumeOpenCreateTask,
 }) => {
   // Tasks State with localStorage persistence
   const [tasks, setTasks] = useState<TaskItem[]>(() => {
@@ -496,11 +498,15 @@ export const TarefaScreen: React.FC<TarefaScreenProps> = ({
     setIsDrawerOpen(true);
   };
 
+  const consumeOpenTaskRef = useRef(onConsumeOpenCreateTask);
+  consumeOpenTaskRef.current = onConsumeOpenCreateTask;
+
   useEffect(() => {
     if (initialOpenCreateTask) {
       handleOpenNewTask();
+      consumeOpenTaskRef.current?.();
     }
-  }, [initialOpenCreateTask]);
+  }, [initialOpenCreateTask, client]);
 
   // Open Modal for editing existing task
   const handleEditTask = (task: TaskItem) => {

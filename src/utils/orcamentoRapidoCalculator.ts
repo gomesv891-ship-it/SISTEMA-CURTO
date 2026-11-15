@@ -454,33 +454,61 @@ export function calculateMantaHospitalar(requestedSqm: number): {
   };
 }
 
+export function extractSuporteCantoCurvoPackMeters(productName?: string): number | null {
+  const raw = (productName || '').trim();
+  if (!raw) return null;
+
+  const pkgKeywordMatch = raw.match(
+    /(?:pct|pacote|rolo|bobina|caixa|cx)\s*(?:com|de|:)?\s*(\d+(?:[.,]\d+)?)\s*(?:ml|m)\b/i
+  );
+  if (pkgKeywordMatch && pkgKeywordMatch[1]) {
+    const val = parseFloat(pkgKeywordMatch[1].replace(',', '.'));
+    if (Number.isFinite(val) && val > 0) return val;
+  }
+
+  const norm = normalizeStr(raw);
+  if (/\b2[.,]2\s*cm\b/.test(norm) || /\b22\s*mm\b/.test(norm) || norm.includes('2,2') || norm.includes('2.2')) {
+    return 40;
+  }
+  if (/\b4[.,]5\s*cm\b/.test(norm) || /\b45\s*mm\b/.test(norm) || norm.includes('4,5') || norm.includes('4.5')) {
+    return 20;
+  }
+
+  return extractMantaAcabamentoPackMeters(raw);
+}
+
 export function resolveSuporteCantoCurvoQty(
   ml: number,
   prod: CatalogProduct
-): { qty: number; qtyDisplay: string } {
+): { qty: number; qtyDisplay: string; packs: number; effectiveMl: number } {
   const safeMl = Math.max(0, Number(ml) || 0);
-  if (safeMl <= 0) return { qty: 0, qtyDisplay: '0' };
+  if (safeMl <= 0) return { qty: 0, qtyDisplay: '0', packs: 0, effectiveMl: 0 };
+
+  const pkgMeters = extractSuporteCantoCurvoPackMeters(prod.name);
+  const packs =
+    pkgMeters && pkgMeters > 0
+      ? Math.ceil(safeMl / pkgMeters - 1e-9)
+      : 1;
+  const effectiveMl =
+    pkgMeters && pkgMeters > 0
+      ? Math.round(packs * pkgMeters * 100) / 100
+      : Math.round(safeMl * 100) / 100;
 
   const uNorm = normalizeStr(prod.unit);
-  if (uNorm === 'ml' || uNorm === 'm') {
+  if (uNorm === 'ml' || uNorm === 'm' || uNorm === 'metro' || uNorm === 'metros') {
     return {
-      qty: safeMl,
-      qtyDisplay: formatPtBrQuantity(safeMl, 2),
+      qty: effectiveMl,
+      qtyDisplay: formatPtBrQuantity(effectiveMl, 2),
+      packs,
+      effectiveMl,
     };
   }
 
-  const pkgMatch = prod.name.match(/\bpct\s*(?:com\s*)?(\d+(?:[.,]\d+)?)\s*m\b/i);
-  if (pkgMatch && pkgMatch[1]) {
-    const pkgMeters = parseFloat(pkgMatch[1].replace(',', '.'));
-    if (Number.isFinite(pkgMeters) && pkgMeters > 0) {
-      const qty = Math.ceil(safeMl / pkgMeters - 1e-9);
-      return { qty, qtyDisplay: String(qty) };
-    }
-  }
-
   return {
-    qty: safeMl,
-    qtyDisplay: formatPtBrQuantity(safeMl, 2),
+    qty: packs,
+    qtyDisplay: String(packs),
+    packs,
+    effectiveMl,
   };
 }
 

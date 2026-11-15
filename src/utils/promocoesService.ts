@@ -89,8 +89,8 @@ export function createDefaultPromoCategories(): PromoCategoryConfig[] {
       unit: 'barra',
       pricingType: 'escalonado',
       defaultRanges: [
-        { id: 'rng_rod_1', minQty: 30, maxQty: 49 },
-        { id: 'rng_rod_2', minQty: 50, maxQty: 99 },
+        { id: 'rng_rod_1', minQty: 30, maxQty: null },
+        { id: 'rng_rod_2', minQty: 50, maxQty: null },
         { id: 'rng_rod_3', minQty: 100, maxQty: null },
       ],
       order: 1,
@@ -101,8 +101,8 @@ export function createDefaultPromoCategories(): PromoCategoryConfig[] {
       unit: 'barra',
       pricingType: 'escalonado',
       defaultRanges: [
-        { id: 'rng_rip_1', minQty: 30, maxQty: 49 },
-        { id: 'rng_rip_2', minQty: 50, maxQty: 99 },
+        { id: 'rng_rip_1', minQty: 30, maxQty: null },
+        { id: 'rng_rip_2', minQty: 50, maxQty: null },
         { id: 'rng_rip_3', minQty: 100, maxQty: null },
       ],
       order: 2,
@@ -393,26 +393,12 @@ export function formatTierRangeLabel(
   unit: string
 ): string {
   const minQ = Math.max(1, Math.floor(Number(tier.minQty) || 1));
-  const hasMax =
-    tier.maxQty !== null &&
-    tier.maxQty !== undefined &&
-    Number.isFinite(Number(tier.maxQty)) &&
-    Number(tier.maxQty) >= minQ;
-  if (hasMax) {
-    const maxQ = Math.floor(Number(tier.maxQty));
-    return `${minQ}–${maxQ} ${pluralizePromoUnit(unit, maxQ)}`;
-  }
   return `+${minQ} ${pluralizePromoUnit(unit, minQ)}`;
 }
 
 export function getTierRangeSignature(tier: { minQty: number; maxQty?: number | null }): string {
   const minQ = Math.max(1, Math.floor(Number(tier.minQty) || 1));
-  const hasMax =
-    tier.maxQty !== null &&
-    tier.maxQty !== undefined &&
-    Number.isFinite(Number(tier.maxQty)) &&
-    Number(tier.maxQty) >= minQ;
-  return `${minQ}_${hasMax ? Math.floor(Number(tier.maxQty)) : 'plus'}`;
+  return `min_${minQ}`;
 }
 
 export function getCampaignCategories(campaign?: PromoCampaign | null): PromoCategoryConfig[] {
@@ -445,8 +431,10 @@ export function getOfferUnitPrice(
 
 /**
  * Resolve o preço unitário escalonado correspondente à quantidade total informada.
- * Regra comercial: o preço da faixa escolhida é aplicado à quantidade total da compra.
- * Ex.: 35 barras dentro da faixa 30–49 recebem o preço dessa faixa em todas as 35 barras.
+ * Regra comercial: faixas funcionam exclusivamente por quantidade mínima (sem intervalos fechados).
+ * Quando a quantidade atingir uma faixa (totalQty >= minQty), o preço da maior faixa atingida
+ * é aplicado a todas as unidades/barras do pedido.
+ * Ex.: ao comprar 35 barras, todas recebem o preço da faixa +30 barras.
  */
 export function resolveTierPriceForQuantity(
   offer: PromoOfferItem,
@@ -457,38 +445,21 @@ export function resolveTierPriceForQuantity(
     Number(offer.priceNormal ?? offer.price ?? offer.priceSqm ?? 0) || 0
   );
   const sortedTiers = [...(offer.tiers || [])]
-    .filter((t) => Number.isFinite(Number(t.minQty)) && Number(t.price) >= 0)
+    .filter((t) => Number.isFinite(Number(t.minQty)) && Number(t.minQty) >= 1 && Number(t.price) >= 0)
     .sort((a, b) => Number(a.minQty) - Number(b.minQty));
 
   if (sortedTiers.length === 0 || !Number.isFinite(totalQty) || totalQty <= 0) {
     return { unitPrice: baseFallback };
   }
 
-  // Busca exata pela faixa onde minQty <= totalQty <= maxQty (ou sem maxQty)
-  const exactMatches = sortedTiers.filter((t) => {
-    const minQ = Number(t.minQty);
-    const hasMax = t.maxQty !== null && t.maxQty !== undefined && Number.isFinite(Number(t.maxQty));
-    return totalQty >= minQ && (!hasMax || totalQty <= Number(t.maxQty));
-  });
+  const highestMatched = sortedTiers
+    .filter((t) => totalQty >= Number(t.minQty))
+    .pop();
 
-  if (exactMatches.length > 0) {
-    const chosen = exactMatches[exactMatches.length - 1];
-    return { unitPrice: Math.max(0, Number(chosen.price) || 0), matchedTier: chosen };
-  }
-
-  // Se estiver abaixo da menor faixa configurada, usa preço base (ou primeira faixa se não houver preço base)
-  if (totalQty < Number(sortedTiers[0].minQty)) {
+  if (highestMatched) {
     return {
-      unitPrice: baseFallback > 0 ? baseFallback : Math.max(0, Number(sortedTiers[0].price) || 0),
-    };
-  }
-
-  // Se ultrapassar o limite máximo de todas as faixas fechadas, aplica a última faixa alcançada
-  const highestBelow = sortedTiers.filter((t) => Number(t.minQty) <= totalQty).pop();
-  if (highestBelow) {
-    return {
-      unitPrice: Math.max(0, Number(highestBelow.price) || 0),
-      matchedTier: highestBelow,
+      unitPrice: Math.max(0, Number(highestMatched.price) || 0),
+      matchedTier: highestMatched,
     };
   }
 
@@ -638,35 +609,33 @@ export function detectPromoCategoryFromCrmProduct(category: string, name: string
 }
 
 function buildDefaultRangesFromTuple(tuple?: [number, number, number]): PromoTierDefaultRange[] {
-  const q1 = Math.max(1, Math.floor(Number(tuple?.[0]) || 30));
+  const q1 = Math.max(2, Math.floor(Number(tuple?.[0]) || 30));
   const q2 = Math.max(q1 + 1, Math.floor(Number(tuple?.[1]) || 50));
   const q3 = Math.max(q2 + 1, Math.floor(Number(tuple?.[2]) || 100));
   return [
-    { id: 'rng_1', minQty: q1, maxQty: q2 - 1 },
-    { id: 'rng_2', minQty: q2, maxQty: q3 - 1 },
+    { id: 'rng_1', minQty: q1, maxQty: null },
+    { id: 'rng_2', minQty: q2, maxQty: null },
     { id: 'rng_3', minQty: q3, maxQty: null },
   ];
 }
 
 function normalizeDefaultRanges(rawRanges: any): PromoTierDefaultRange[] | undefined {
   if (!Array.isArray(rawRanges)) return undefined;
-  const cleaned = rawRanges
+  const seen = new Set<number>();
+  const cleaned: PromoTierDefaultRange[] = [];
+  rawRanges
     .filter((r: any) => r && Number.isFinite(Number(r.minQty)))
-    .map((r: any, idx: number) => {
-      const minQty = Math.max(1, Math.floor(Number(r.minQty) || 1));
-      const hasMax =
-        r.maxQty !== null &&
-        r.maxQty !== undefined &&
-        r.maxQty !== '' &&
-        Number.isFinite(Number(r.maxQty));
-      const maxQty = hasMax ? Math.max(minQty, Math.floor(Number(r.maxQty))) : null;
-      return {
+    .forEach((r: any, idx: number) => {
+      const minQty = Math.floor(Number(r.minQty) || 0);
+      if (minQty < 2 || seen.has(minQty)) return;
+      seen.add(minQty);
+      cleaned.push({
         id: String(r.id || `rng_${idx}`),
         minQty,
-        maxQty,
-      };
-    })
-    .sort((a: PromoTierDefaultRange, b: PromoTierDefaultRange) => a.minQty - b.minQty);
+        maxQty: null,
+      });
+    });
+  cleaned.sort((a, b) => a.minQty - b.minQty);
   return cleaned;
 }
 
@@ -728,9 +697,9 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
         const defaultRanges =
           pricingType === 'escalonado'
             ? normalizeDefaultRanges(c.defaultRanges) || [
-                { id: 'rng_1', minQty: 1, maxQty: 29 },
-                { id: 'rng_2', minQty: 30, maxQty: 49 },
-                { id: 'rng_3', minQty: 50, maxQty: null },
+                { id: 'rng_1', minQty: 30, maxQty: null },
+                { id: 'rng_2', minQty: 50, maxQty: null },
+                { id: 'rng_3', minQty: 100, maxQty: null },
               ]
             : undefined;
         return {
@@ -853,25 +822,37 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
         // Preserva o ID exato da categoria (incluindo 'sem_categoria' e categorias personalizadas/preservadas)
         const rawCat = String(o.category || '').trim();
         const category: PromoCategory = rawCat || SEM_CATEGORIA_ID;
-        const tiers: PromoProgressiveTier[] | undefined = Array.isArray(o.tiers)
+        const rawTiers: PromoProgressiveTier[] | undefined = Array.isArray(o.tiers)
           ? o.tiers
               .filter((t: any) => t && Number.isFinite(Number(t?.minQty)))
-              .map((t: any, tIdx: number) => {
-                const minQty = Math.max(1, Math.floor(Number(t.minQty) || 1));
-                const hasMax =
-                  t.maxQty !== null &&
-                  t.maxQty !== undefined &&
-                  t.maxQty !== '' &&
-                  Number.isFinite(Number(t.maxQty));
-                const maxQty = hasMax ? Math.max(minQty, Math.floor(Number(t.maxQty))) : null;
-                return {
-                  id: t?.id ? String(t.id) : `tier_${idx}_${tIdx}`,
-                  minQty,
-                  maxQty,
-                  label: t?.label ? String(t.label) : undefined,
-                  price: Math.max(0, Number(t?.price) || 0),
-                };
+              .map((t: any, tIdx: number) => ({
+                id: t?.id ? String(t.id) : `tier_${idx}_${tIdx}`,
+                minQty: Math.max(1, Math.floor(Number(t.minQty) || 1)),
+                maxQty: null,
+                label: t?.label ? String(t.label) : undefined,
+                price: Math.max(0, Number(t?.price) || 0),
+              }))
+          : undefined;
+
+        const minOneTier = rawTiers?.find((t) => t.minQty <= 1 && t.price > 0);
+        const explicitNormal =
+          o.priceNormal !== undefined ? Math.max(0, Number(o.priceNormal) || 0) : undefined;
+        const resolvedPriceNormal =
+          explicitNormal !== undefined && explicitNormal > 0
+            ? explicitNormal
+            : minOneTier
+            ? minOneTier.price
+            : explicitNormal;
+
+        const seenMinQty = new Set<number>();
+        const tiers: PromoProgressiveTier[] | undefined = rawTiers
+          ? rawTiers
+              .filter((t) => {
+                if (t.minQty < 2 || seenMinQty.has(t.minQty)) return false;
+                seenMinQty.add(t.minQty);
+                return true;
               })
+              .sort((a, b) => a.minQty - b.minQty)
           : undefined;
 
         return {
@@ -885,7 +866,7 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
           active: o.active !== false,
           order: Number(o.order ?? idx),
           priceSqm: o.priceSqm !== undefined ? Math.max(0, Number(o.priceSqm) || 0) : undefined,
-          priceNormal: o.priceNormal !== undefined ? Math.max(0, Number(o.priceNormal) || 0) : undefined,
+          priceNormal: resolvedPriceNormal,
           tiers,
           price: o.price !== undefined ? Math.max(0, Number(o.price) || 0) : undefined,
         };

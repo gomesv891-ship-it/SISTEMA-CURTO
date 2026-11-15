@@ -377,7 +377,10 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
     } else if (action === 'go_calculadora') {
       onSelectClientAction('Calculadora', savedClient);
     } else if (action === 'go_orcamento') {
-      onSelectClientAction('Orçamentos', savedClient, { createOrcamento: true });
+      onSelectClientAction('Orçamentos', savedClient, {
+        createOrcamento: true,
+        scrollToProducts: true,
+      });
     } else if (action === 'go_tarefa') {
       onSelectClientAction('Tarefas', savedClient, { openNewTaskModal: true });
     }
@@ -1077,7 +1080,16 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
           }}
           onSelectAction={(action, client) => {
             setViewingClient(null);
-            onSelectClientAction(action, client);
+            if (action === 'Orçamentos') {
+              onSelectClientAction(action, client, {
+                createOrcamento: true,
+                scrollToProducts: true,
+              });
+            } else if (action === 'Tarefas') {
+              onSelectClientAction(action, client, { openNewTaskModal: true });
+            } else {
+              onSelectClientAction(action, client);
+            }
           }}
           onToggleImportant={(client) => {
             handleToggleImportant(client);

@@ -118,8 +118,8 @@
 
 /* Caderno Digital Fênix World — alinhamento sincronizado ao espaçamento real (32px) */
 .anotacao-rich-content {
-  font-size: 15px !important;
-  line-height: 32px !important;
+  font-size: 16px;
+  line-height: 32px;
 }
 
 .anotacao-rich-content p,
@@ -134,8 +134,7 @@
   padding-top: 0 !important;
   padding-bottom: 0 !important;
   min-height: 32px;
-  font-size: 15px !important;
-  line-height: 32px !important;
+  line-height: 32px;
   font-weight: inherit;
 }
 
@@ -160,8 +159,7 @@
   padding-top: 0 !important;
   padding-bottom: 0 !important;
   min-height: 32px;
-  font-size: 15px !important;
-  line-height: 32px !important;
+  line-height: 32px;
 }
 
 .anotacao-rich-content mark,
@@ -171,10 +169,10 @@
 .anotacao-rich-content i,
 .anotacao-rich-content em,
 .anotacao-rich-content u,
+.anotacao-rich-content s,
+.anotacao-rich-content strike,
 .anotacao-rich-content font,
 .anotacao-rich-content a {
-  line-height: inherit !important;
-  font-size: inherit !important;
   vertical-align: baseline;
 }
 
@@ -195,13 +193,21 @@
   font-style: italic !important;
 }
 
-.anotacao-rich-content u {
+.anotacao-rich-content u,
+.anotacao-checklist-editable u {
   text-decoration: underline !important;
 }
 
+.anotacao-rich-content s,
+.anotacao-rich-content strike,
+.anotacao-checklist-editable s,
+.anotacao-checklist-editable strike {
+  text-decoration: line-through !important;
+}
+
 .anotacao-checklist-editable {
-  font-size: 15px !important;
-  line-height: 32px !important;
+  font-size: 16px;
+  line-height: 32px;
   min-height: 32px;
 }
 
@@ -223,6 +229,10 @@
 }
 
 @media print {
+  .anotacao-checklist-header {
+    display: none !important;
+  }
+
   body.printing-anotacao-a4 > *:not(#fenix-anotacao-print-root) {
     display: none !important;
   }

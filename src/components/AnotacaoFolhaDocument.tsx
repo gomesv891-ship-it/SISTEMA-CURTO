@@ -844,7 +844,7 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
                 </span>
               )}
             </div>
-          ) : (
+          ) : isBlank ? (
             <div
               style={{
                 width: '158px',
@@ -871,7 +871,7 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
                 {formattedDate}
               </span>
             </div>
-          )}
+          ) : null}
         </div>
 
         {/* QUADRO CENTRAL COM PAUTAS SINCRONIZADAS AO DOM DO TEXTO E CHECKLISTS */}
@@ -895,7 +895,7 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
               flex: 1,
               position: 'relative',
               minHeight: `${maxRuleY}px`,
-              fontSize: '15px',
+              fontSize: '16px',
               lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
               color: '#0F172A',
             }}
@@ -932,7 +932,7 @@ export const AnotacaoFolhaDocument: React.FC<AnotacaoFolhaDocumentProps> = ({
               style={{
                 position: 'relative',
                 zIndex: 1,
-                fontSize: '15px',
+                fontSize: '16px',
                 lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
                 color: '#0F172A',
               }}

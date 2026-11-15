@@ -17,16 +17,28 @@ import {
 } from '../utils/anotacoesService';
 import { NOTEBOOK_LINE_HEIGHT } from './AnotacaoFolhaDocument';
 
-export const FONT_SIZE_STEPS = [12, 13, 15, 17, 19, 22, 25] as const;
-export const DEFAULT_FONT_SIZE = 15;
+export const FONT_SIZE_STEPS = [12, 13, 14, 15, 16, 18, 20, 22, 24, 28] as const;
+export const DEFAULT_FONT_SIZE = 16;
+
+export const FONT_FAMILY_OPTIONS = [
+  { id: 'inter', label: 'Inter (Padrão)', value: "'Inter', 'Segoe UI', Arial, sans-serif" },
+  { id: 'arial', label: 'Arial', value: 'Arial, Helvetica, sans-serif' },
+  { id: 'georgia', label: 'Georgia', value: "Georgia, 'Times New Roman', serif" },
+  { id: 'times', label: 'Times New Roman', value: "'Times New Roman', Times, serif" },
+  { id: 'courier', label: 'Courier New', value: "'Courier New', Courier, monospace" },
+  { id: 'verdana', label: 'Verdana', value: 'Verdana, Geneva, sans-serif' },
+  { id: 'trebuchet', label: 'Trebuchet MS', value: "'Trebuchet MS', sans-serif" },
+] as const;
 
 export interface ActiveFormatsState {
   bold: boolean;
   italic: boolean;
   underline: boolean;
+  strike: boolean;
   unorderedList: boolean;
   orderedList: boolean;
   fontSize?: number;
+  fontFamily?: string | null;
   textColor?: string | null;
 }
 
@@ -34,10 +46,18 @@ export interface AnotacaoRichEditorHandle {
   focusEditor: () => void;
   saveSelection: () => void;
   applyCommand: (
-    command: 'bold' | 'italic' | 'underline' | 'insertUnorderedList' | 'insertOrderedList'
+    command:
+      | 'bold'
+      | 'italic'
+      | 'underline'
+      | 'strikeThrough'
+      | 'insertUnorderedList'
+      | 'insertOrderedList'
   ) => void;
   applyHighlight: (color: string | null) => void;
   applyTextColor: (color: string | null) => void;
+  applyFontFamily: (fontFamily: string | null) => void;
+  setFontSize: (px: number) => void;
   changeFontSize: (direction: 'increase' | 'decrease') => void;
   insertChecklist: () => void;
   focusLastBlock: () => void;
@@ -79,7 +99,7 @@ function unwrapIfEmptyInlineWrapper(el: HTMLElement) {
 
 function stripInlineStyleFromFragment(
   root: ParentNode,
-  prop: 'color' | 'fontSize'
+  prop: 'color' | 'fontSize' | 'fontFamily'
 ) {
   const elements = Array.from(root.querySelectorAll('span, font, mark, b, strong, i, em, u, s, strike')) as HTMLElement[];
   for (const el of elements) {
@@ -90,6 +110,9 @@ function stripInlineStyleFromFragment(
       if (el.tagName === 'FONT') el.removeAttribute('size');
       el.style.fontSize = '';
       el.style.lineHeight = '';
+    } else if (prop === 'fontFamily') {
+      if (el.tagName === 'FONT') el.removeAttribute('face');
+      el.style.fontFamily = '';
     }
     if (!el.getAttribute('style')?.trim()) {
       el.removeAttribute('style');
@@ -138,14 +161,66 @@ function getEffectiveTextColorAtSelection(rootEl: HTMLElement, sel: Selection): 
   return null;
 }
 
+function getEffectiveFontFamilyAtSelection(rootEl: HTMLElement, sel: Selection): string | null {
+  let node: Node | null = sel.anchorNode || rootEl;
+  while (node && node !== rootEl) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      if (el.style?.fontFamily && el.style.fontFamily !== 'inherit') {
+        return el.style.fontFamily;
+      }
+      if (el.tagName === 'FONT' && el.getAttribute('face')) {
+        return el.getAttribute('face');
+      }
+    }
+    node = node.parentNode;
+  }
+  return null;
+}
+
 function applyStyledSpanToRange(
   rootEl: HTMLElement,
   sel: Selection,
-  prop: 'color' | 'fontSize',
+  prop: 'color' | 'fontSize' | 'fontFamily',
   value: string | null
 ) {
   if (sel.rangeCount === 0) return;
   const range = sel.getRangeAt(0);
+
+  const assignStyle = (el: HTMLElement, val: string) => {
+    if (prop === 'color') {
+      el.style.color = val;
+    } else if (prop === 'fontSize') {
+      el.style.fontSize = val;
+      const px = parseFloat(val);
+      el.style.lineHeight = px > 18 ? `${Math.ceil(px * 1.35)}px` : '';
+    } else {
+      el.style.fontFamily = val;
+    }
+  };
+
+  const clearStyle = (el: HTMLElement) => {
+    if (prop === 'color') {
+      el.style.color = '';
+      if (el.tagName === 'FONT') el.removeAttribute('color');
+    } else if (prop === 'fontSize') {
+      el.style.fontSize = '';
+      el.style.lineHeight = '';
+      if (el.tagName === 'FONT') el.removeAttribute('size');
+    } else {
+      el.style.fontFamily = '';
+      if (el.tagName === 'FONT') el.removeAttribute('face');
+    }
+    if (!el.getAttribute('style')?.trim()) {
+      el.removeAttribute('style');
+    }
+  };
+
+  const hasTargetProp = (el: HTMLElement) => {
+    if (prop === 'color') return Boolean(el.style?.color || el.getAttribute('color'));
+    if (prop === 'fontSize') return Boolean(el.style?.fontSize || el.getAttribute('size'));
+    return Boolean(el.style?.fontFamily || el.getAttribute('face'));
+  };
 
   if (value === null) {
     if (range.collapsed) {
@@ -154,10 +229,7 @@ function applyStyledSpanToRange(
       while (node && node !== rootEl) {
         if (node.nodeType === Node.ELEMENT_NODE) {
           const htmlEl = node as HTMLElement;
-          if (
-            (prop === 'color' && (htmlEl.style?.color || htmlEl.getAttribute('color'))) ||
-            (prop === 'fontSize' && htmlEl.style?.fontSize)
-          ) {
+          if (hasTargetProp(htmlEl)) {
             targetAncestor = htmlEl;
             break;
           }
@@ -166,16 +238,7 @@ function applyStyledSpanToRange(
       }
       if (targetAncestor) {
         if (!targetAncestor.textContent?.replace(/\u200B/g, '').trim()) {
-          if (prop === 'color') {
-            targetAncestor.style.color = '';
-            targetAncestor.removeAttribute('color');
-          } else {
-            targetAncestor.style.fontSize = '';
-            targetAncestor.style.lineHeight = '';
-          }
-          if (!targetAncestor.getAttribute('style')?.trim()) {
-            targetAncestor.removeAttribute('style');
-          }
+          clearStyle(targetAncestor);
           unwrapIfEmptyInlineWrapper(targetAncestor);
         } else {
           const afterRange = document.createRange();
@@ -188,23 +251,16 @@ function applyStyledSpanToRange(
       return;
     }
 
-    const candidates = Array.from(rootEl.querySelectorAll('span, font, mark, b, strong, i, em, u')) as HTMLElement[];
+    const candidates = Array.from(
+      rootEl.querySelectorAll('span, font, mark, b, strong, i, em, u, s, strike')
+    ) as HTMLElement[];
     for (const htmlNode of candidates) {
       try {
         if (!range.intersectsNode(htmlNode)) continue;
       } catch {
         continue;
       }
-      if (prop === 'color') {
-        htmlNode.style.color = '';
-        if (htmlNode.tagName === 'FONT') htmlNode.removeAttribute('color');
-      } else {
-        htmlNode.style.fontSize = '';
-        htmlNode.style.lineHeight = '';
-      }
-      if (!htmlNode.getAttribute('style')?.trim()) {
-        htmlNode.removeAttribute('style');
-      }
+      clearStyle(htmlNode);
       unwrapIfEmptyInlineWrapper(htmlNode);
     }
     return;
@@ -223,13 +279,7 @@ function applyStyledSpanToRange(
       startParent.tagName === 'SPAN' &&
       (startParent.textContent || '') === '\u200B'
     ) {
-      if (prop === 'color') {
-        startParent.style.color = value;
-      } else {
-        startParent.style.fontSize = value;
-        const px = parseFloat(value);
-        startParent.style.lineHeight = px > 18 ? `${Math.ceil(px * 1.35)}px` : '';
-      }
+      assignStyle(startParent, value);
       const r = document.createRange();
       r.selectNodeContents(startParent);
       r.collapse(false);
@@ -239,13 +289,7 @@ function applyStyledSpanToRange(
     }
 
     const span = document.createElement('span');
-    if (prop === 'color') {
-      span.style.color = value;
-    } else {
-      span.style.fontSize = value;
-      const px = parseFloat(value);
-      if (px > 18) span.style.lineHeight = `${Math.ceil(px * 1.35)}px`;
-    }
+    assignStyle(span, value);
     const zwsp = document.createTextNode('\u200B');
     span.appendChild(zwsp);
     range.insertNode(span);
@@ -268,13 +312,7 @@ function applyStyledSpanToRange(
 
   const createStyledSpan = () => {
     const span = document.createElement('span');
-    if (prop === 'color') {
-      span.style.color = value;
-    } else {
-      span.style.fontSize = value;
-      const px = parseFloat(value);
-      if (px > 18) span.style.lineHeight = `${Math.ceil(px * 1.35)}px`;
-    }
+    assignStyle(span, value);
     return span;
   };
 
@@ -672,17 +710,21 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
         const activeEl = getTargetElement(activeTargetRef.current);
         let fontSize = DEFAULT_FONT_SIZE;
         let textColor: string | null = null;
+        let fontFamily: string | null = null;
         if (sel && sel.rangeCount > 0 && activeEl && activeEl.contains(sel.anchorNode)) {
           fontSize = Math.round(getEffectiveFontSizeAtSelection(activeEl, sel));
           textColor = getEffectiveTextColorAtSelection(activeEl, sel);
+          fontFamily = getEffectiveFontFamilyAtSelection(activeEl, sel);
         }
         onActiveFormatsChange({
           bold: document.queryCommandState('bold'),
           italic: document.queryCommandState('italic'),
           underline: document.queryCommandState('underline'),
+          strike: document.queryCommandState('strikeThrough'),
           unorderedList: document.queryCommandState('insertUnorderedList'),
           orderedList: document.queryCommandState('insertOrderedList'),
           fontSize,
+          fontFamily,
           textColor,
         });
       } catch {}
@@ -789,7 +831,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
     );
 
     const syncTargetDom = useCallback(
-      (targetEl: HTMLDivElement, target: EditorTarget) => {
+      (targetEl: HTMLDivElement, target: EditorTarget, flushImmediate = false) => {
         const currentBlocks = latestBlocksRef.current;
         if (target.kind === 'text') {
           const html = targetEl.innerHTML;
@@ -801,7 +843,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
             b.id === target.blockId && b.kind === 'text' ? { ...b, html } : b
           );
           latestBlocksRef.current = nextBlocks;
-          onChangeBlocks(nextBlocks, false);
+          onChangeBlocks(nextBlocks, flushImmediate);
           return;
         }
 
@@ -817,7 +859,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           };
         });
         latestBlocksRef.current = nextBlocks;
-        onChangeBlocks(nextBlocks, false);
+        onChangeBlocks(nextBlocks, flushImmediate);
       },
       [onChangeBlocks]
     );
@@ -930,7 +972,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                 document.execCommand(command, false);
                 saveSelection();
                 emitActiveFormats();
-                syncTargetDom(newEl, { kind: 'text', blockId: newText.id });
+                syncTargetDom(newEl, { kind: 'text', blockId: newText.id }, true);
               }, 30);
               return;
             }
@@ -945,7 +987,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           document.execCommand(command, false);
           saveSelection();
           emitActiveFormats();
-          syncTargetDom(resolved.el, resolved.target);
+          syncTargetDom(resolved.el, resolved.target, true);
         },
         applyHighlight: (color) => {
           onActivateEditing?.();
@@ -1026,7 +1068,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
             sel.removeAllRanges();
             sel.addRange(innerRange);
           } else {
-            // Limpa apenas <mark> / backgroundColor no trecho mantendo cor da fonte, tamanho, negrito, itálico e sublinhado
+            // Limpa apenas <mark> / backgroundColor no trecho mantendo cor da fonte, tamanho, negrito, itálico, sublinhado e tachado
             const frag = range.extractContents();
             const nestedHighlights = Array.from(frag.querySelectorAll('mark, span')) as HTMLElement[];
             for (const nh of nestedHighlights) {
@@ -1100,7 +1142,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
 
           saveSelection();
           emitActiveFormats();
-          syncTargetDom(el, target);
+          syncTargetDom(el, target, true);
         },
         applyTextColor: (color) => {
           onActivateEditing?.();
@@ -1112,7 +1154,32 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           applyStyledSpanToRange(resolved.el, sel, 'color', color);
           saveSelection();
           emitActiveFormats();
-          syncTargetDom(resolved.el, resolved.target);
+          syncTargetDom(resolved.el, resolved.target, true);
+        },
+        applyFontFamily: (fontFamily) => {
+          onActivateEditing?.();
+          const resolved = restoreSelectionOrFocus();
+          if (!resolved) return;
+          const sel = window.getSelection();
+          if (!sel || sel.rangeCount === 0) return;
+
+          applyStyledSpanToRange(resolved.el, sel, 'fontFamily', fontFamily);
+          saveSelection();
+          emitActiveFormats();
+          syncTargetDom(resolved.el, resolved.target, true);
+        },
+        setFontSize: (px) => {
+          onActivateEditing?.();
+          const resolved = restoreSelectionOrFocus();
+          if (!resolved) return;
+          const sel = window.getSelection();
+          if (!sel || sel.rangeCount === 0) return;
+
+          const clamped = Math.min(36, Math.max(10, Math.round(px)));
+          applyStyledSpanToRange(resolved.el, sel, 'fontSize', `${clamped}px`);
+          saveSelection();
+          emitActiveFormats();
+          syncTargetDom(resolved.el, resolved.target, true);
         },
         changeFontSize: (direction) => {
           onActivateEditing?.();
@@ -1141,7 +1208,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           applyStyledSpanToRange(resolved.el, sel, 'fontSize', `${nextPx}px`);
           saveSelection();
           emitActiveFormats();
-          syncTargetDom(resolved.el, resolved.target);
+          syncTargetDom(resolved.el, resolved.target, true);
         },
         insertChecklist: handleInsertChecklist,
       }),

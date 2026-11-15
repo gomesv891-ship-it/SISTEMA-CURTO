@@ -268,10 +268,12 @@ export function sanitizeNoteHtml(rawHtml: string): string {
     const targetTag = tag === 'FONT' ? 'SPAN' : tag;
     const outEl = document.createElement(targetTag.toLowerCase());
 
-    // Preserva estilos seguros (destaques, cor do texto, tamanho da fonte e text-decoration)
+    // Preserva estilos seguros (destaques, cor do texto, fonte, tamanho da fonte e text-decoration)
     const bg = el.style?.backgroundColor;
     const fontColorAttr = tag === 'FONT' ? el.getAttribute('color') : null;
+    const fontFaceAttr = tag === 'FONT' ? el.getAttribute('face') : null;
     const color = el.style?.color || fontColorAttr;
+    const fontFamily = el.style?.fontFamily || fontFaceAttr;
     const rawFontSize = el.style?.fontSize;
     const textDecoration = el.style?.textDecoration;
     const fontWeight = el.style?.fontWeight;
@@ -287,10 +289,16 @@ export function sanitizeNoteHtml(rawHtml: string): string {
     if (color && color !== 'inherit') {
       outEl.style.color = color;
     }
+    if (fontFamily && fontFamily !== 'inherit') {
+      const safeFamily = fontFamily.replace(/[;{}<>]/g, '').trim();
+      if (safeFamily) {
+        outEl.style.fontFamily = safeFamily;
+      }
+    }
     if (rawFontSize) {
       const pxMatch = rawFontSize.trim().match(/^(\d+(?:\.\d+)?)px$/i);
       if (pxMatch) {
-        const px = Math.min(28, Math.max(11, Math.round(parseFloat(pxMatch[1]))));
+        const px = Math.min(36, Math.max(10, Math.round(parseFloat(pxMatch[1]))));
         outEl.style.fontSize = `${px}px`;
         if (px > 18) {
           outEl.style.lineHeight = `${Math.ceil(px * 1.35)}px`;

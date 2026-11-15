@@ -192,6 +192,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 }) => {
   const ACTIVE_DRAFT_KEY = `fenix_orcamento_in_progress_draft_${currentUserName || 'default'}`;
   const adicionarProdutosRef = useRef<HTMLElement | null>(null);
+  const consumeScrollRef = useRef(onConsumeScrollToProducts);
+  consumeScrollRef.current = onConsumeScrollToProducts;
 
   useEffect(() => {
     if (!scrollToProductsOnMount) return;
@@ -204,13 +206,13 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       if (target) {
         target.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
-      onConsumeScrollToProducts?.();
-    }, 120);
+      consumeScrollRef.current?.();
+    }, 150);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [scrollToProductsOnMount, onConsumeScrollToProducts]);
+  }, [scrollToProductsOnMount]);
 
   // Recupera o rascunho de orçamento em preenchimento de forma síncrona para evitar qualquer perda ao alternar abas
   const initialDraft = useMemo(() => {

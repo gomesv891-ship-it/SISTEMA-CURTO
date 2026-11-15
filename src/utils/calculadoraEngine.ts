@@ -1,5 +1,17 @@
 import { MaterialRow } from '../types';
 import { getOfficialProducts, getOfficialCategories } from '../data/productCatalog';
+import { extractSuporteCantoCurvoPackMeters } from './orcamentoRapidoCalculator';
+
+export function calculateSuporteCantoCurvoEffectiveMl(ml: number, productName?: string): number {
+  const safeMl = Math.max(0, Number(ml) || 0);
+  if (safeMl <= 0) return 0;
+  const pkgMeters = extractSuporteCantoCurvoPackMeters(productName);
+  if (pkgMeters && pkgMeters > 0) {
+    const packs = Math.ceil(safeMl / pkgMeters - 1e-9);
+    return Math.round(packs * pkgMeters * 100) / 100;
+  }
+  return Math.round(safeMl * 100) / 100;
+}
 
 export const NO_PRODUCTS_LABEL = 'Nenhum produto cadastrado nesta categoria.';
 
@@ -1450,18 +1462,23 @@ export function generateAllMaterialRows(
     // Suporte Canto Curvo (pertencente a Manta Hospitalar)
     if (liveSuporteProds.length > 0) {
       const prevSuporte = getExisting('mat_manta_suporte');
+      const selectedSuporte =
+        prevSuporte?.selectedProduct && liveSuporteProds.includes(prevSuporte.selectedProduct)
+          ? prevSuporte.selectedProduct
+          : liveSuporteProds[0];
+      const effectiveSuporteMl = calculateSuporteCantoCurvoEffectiveMl(
+        manta.metroLinear,
+        selectedSuporte
+      );
       rows.push({
         id: 'mat_manta_suporte',
         typeKey: 'manta_suporte',
         included: prevSuporte ? prevSuporte.included : true,
-        selectedProduct:
-          prevSuporte?.selectedProduct && liveSuporteProds.includes(prevSuporte.selectedProduct)
-            ? prevSuporte.selectedProduct
-            : liveSuporteProds[0],
+        selectedProduct: selectedSuporte,
         productOptions: liveSuporteProds,
         quantity: prevSuporte?.isCustomQuantity
           ? prevSuporte.quantity
-          : formatBRL(manta.metroLinear, 2),
+          : formatBRL(effectiveSuporteMl, 2),
         unit: 'metros',
         isCustomQuantity: prevSuporte?.isCustomQuantity,
       });

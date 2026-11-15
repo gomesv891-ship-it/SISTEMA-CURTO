@@ -703,6 +703,7 @@ export default function App() {
               <TarefaScreen
                 client={activeClient}
                 initialOpenCreateTask={initialOpenTaskModal}
+                onConsumeOpenCreateTask={() => setInitialOpenTaskModal(false)}
                 onBackToCadastro={() => setCurrentTab('Clientes')}
                 currentUserName={currentUserName}
                 onNavigateTab={(tab) => setCurrentTab(tab as any)}

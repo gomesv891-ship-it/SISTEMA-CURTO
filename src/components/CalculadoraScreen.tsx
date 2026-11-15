@@ -44,6 +44,7 @@ import {
   parseBRLNumber,
   parsePisoVinilicoName,
   generateAllMaterialRows,
+  calculateSuporteCantoCurvoEffectiveMl,
   PisoState,
   RodapeState,
   TetoState,
@@ -724,6 +725,15 @@ export const CalculadoraScreen: React.FC<CalculadoraScreenProps> = ({
             : pisoMetrics.area;
           const bags = area > 0 ? Math.ceil(area * 0.255) : 0;
           return { ...row, selectedProduct: newProduct, quantity: String(bags) };
+        }
+        if (row.typeKey === 'manta_suporte' && !row.isCustomQuantity) {
+          const ml = parseBRLNumber(mantaMlInput);
+          const effectiveMl = calculateSuporteCantoCurvoEffectiveMl(ml, newProduct);
+          return {
+            ...row,
+            selectedProduct: newProduct,
+            quantity: formatBRL(effectiveMl, 2),
+          };
         }
         return { ...row, selectedProduct: newProduct };
       })

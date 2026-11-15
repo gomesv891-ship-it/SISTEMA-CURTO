@@ -27,7 +27,7 @@ interface CadastroScreenProps {
   onQuickAction?: (
     action: 'Calculadora' | 'Orçamentos' | 'Tarefas',
     client: ClientRecord,
-    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean }
+    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean; scrollToProducts?: boolean }
   ) => void;
   onClientSaved?: (client: ClientRecord) => void;
 }
@@ -259,7 +259,7 @@ export const CadastroScreen: React.FC<CadastroScreenProps> = ({
 
   const handleGoToQuickAction = async (
     action: 'Calculadora' | 'Orçamentos' | 'Tarefas',
-    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean }
+    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean; scrollToProducts?: boolean }
   ) => {
     const clientToUse: ClientRecord = activeClient || {
       id: `cli_${Date.now()}`,
@@ -344,7 +344,12 @@ export const CadastroScreen: React.FC<CadastroScreenProps> = ({
           <div className="flex items-center gap-2.5 w-full lg:w-auto flex-wrap sm:flex-nowrap">
             <button
               type="button"
-              onClick={() => handleGoToQuickAction('Orçamentos', { createOrcamento: true })}
+              onClick={() =>
+                handleGoToQuickAction('Orçamentos', {
+                  createOrcamento: true,
+                  scrollToProducts: true,
+                })
+              }
               className="flex-1 sm:flex-initial h-11 px-4.5 rounded-xl bg-[#0057ff] hover:bg-blue-600 text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-md shadow-blue-500/25 transition-all cursor-pointer group active:scale-[0.98]"
               title="Criar novo orçamento comercial oficial"
             >
@@ -639,7 +644,12 @@ export const CadastroScreen: React.FC<CadastroScreenProps> = ({
 
               <button
                 type="button"
-                onClick={() => handleGoToQuickAction('Orçamentos')}
+                onClick={() =>
+                  handleGoToQuickAction('Orçamentos', {
+                    createOrcamento: true,
+                    scrollToProducts: true,
+                  })
+                }
                 className="flex-1 sm:flex-initial h-10 sm:h-10.5 px-3.5 sm:px-4.5 rounded-xl border border-slate-200 bg-white hover:border-[#0057ff]/70 hover:bg-blue-50/30 active:scale-[0.98] text-[#091122] font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all duration-150 cursor-pointer shadow-[0_2px_8px_-2px_rgba(9,17,34,0.04)] hover:shadow-[0_4px_12px_-2px_rgba(0,87,255,0.08)] group"
               >
                 <FileText className="w-4 h-4 text-[#0057ff] stroke-[2] flex-shrink-0 transition-transform group-hover:scale-105" />
@@ -648,7 +658,7 @@ export const CadastroScreen: React.FC<CadastroScreenProps> = ({
 
               <button
                 type="button"
-                onClick={() => handleGoToQuickAction('Tarefas')}
+                onClick={() => handleGoToQuickAction('Tarefas', { openNewTaskModal: true })}
                 className="flex-1 sm:flex-initial h-10 sm:h-10.5 px-3.5 sm:px-4.5 rounded-xl border border-slate-200 bg-white hover:border-[#0057ff]/70 hover:bg-blue-50/30 active:scale-[0.98] text-[#091122] font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all duration-150 cursor-pointer shadow-[0_2px_8px_-2px_rgba(9,17,34,0.04)] hover:shadow-[0_4px_12px_-2px_rgba(0,87,255,0.08)] group"
               >
                 <CheckSquare className="w-4 h-4 text-[#0057ff] stroke-[2] flex-shrink-0 transition-transform group-hover:scale-105" />
