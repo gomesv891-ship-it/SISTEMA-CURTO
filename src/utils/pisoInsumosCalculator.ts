@@ -14,7 +14,9 @@ export type InsumoKind =
   | 'primer_18'
   | 'primer_antiumidade'
   | 'cola_4'
-  | 'cola_18';
+  | 'cola_18'
+  | 'globalfix_36'
+  | 'globalfix_20';
 
 export interface CalculatedInsumoLine {
   kind: InsumoKind;
@@ -181,6 +183,21 @@ export function isPisoVinilicoColado(
     return false;
   }
   return true;
+}
+
+/**
+ * Identifica exclusivamente produtos de Piso Vinílico Colado da marca Tarkett.
+ * Piso Tarkett Clicado e outras marcas retornam false.
+ */
+export function isTarkettColado(
+  productName?: string,
+  categoryName?: string,
+  categoryId?: string
+): boolean {
+  if (!isPisoVinilicoColado(productName, categoryName, categoryId)) {
+    return false;
+  }
+  return normalizeStr(productName).includes('tarkett');
 }
 
 /**
@@ -560,6 +577,42 @@ function findCatalogInsumoProduct(
     );
   }
 
+  if (kind === 'globalfix_20') {
+    const candidates = catalog.filter((p) => {
+      const name = normalizeStr(p.name);
+      return name.includes('globalfix');
+    });
+    const preferred =
+      candidates.find((p) => {
+        const n = normalizeStr(p.name);
+        return /\b20\s*kg\b|\(20\b|20kg/.test(n);
+      }) ||
+      candidates.find((p) => {
+        const n = normalizeStr(p.name);
+        return /\b23\s*kg\b|\(23\b|23kg/.test(n);
+      }) ||
+      candidates[0];
+    return pickPrice(preferred, 'Cola Globalfix 20Kg', 'balde');
+  }
+
+  if (kind === 'globalfix_36') {
+    const candidates = catalog.filter((p) => {
+      const name = normalizeStr(p.name);
+      return name.includes('globalfix');
+    });
+    const preferred =
+      candidates.find((p) => {
+        const n = normalizeStr(p.name);
+        return n.includes('3,6') || n.includes('3.6');
+      }) ||
+      candidates.find((p) => {
+        const n = normalizeStr(p.name);
+        return /\b4\s*kg\b|\(4\b|4kg/.test(n);
+      }) ||
+      candidates[0];
+    return pickPrice(preferred, 'Cola Globalfix 3,6Kg', 'balde');
+  }
+
   // cola_4
   const candidates = catalog.filter((p) => {
     const cat = normalizeStr(p.category);
@@ -760,32 +813,62 @@ export function calculatePisoInsumosForOrcamento(params: {
       });
     }
 
-    // 3. Cola para Piso (apenas para instalação colada): 4 kg (13 m²) e 18 kg (60 m²) -> combinação com menor sobra sobre insumoBaseSqm
+    // 3. Cola para Piso (apenas para instalação colada):
+    //    - Tarkett Colado: Globalfix 3,6 kg (12 m²) e 20 kg (75 m²)
+    //    - Demais pisos colados e Manta: 4 kg (13 m²) e 18 kg (60 m²)
     if (!skipCola) {
-      const cola = solveMinimumWastePackages(insumoBaseSqm, 13, 60);
-      if (cola.bigQty > 0) {
-        const cat = findCatalogInsumoProduct('cola_18', priceTable, catalogOverride);
-        insumos.push({
-          kind: 'cola_18',
-          modalLabel: 'Cola para Piso 18 kg',
-          quantity: cola.bigQty,
-          quantityDisplay: `${cola.bigQty} ${cola.bigQty === 1 ? 'balde' : 'baldes'}`,
-          catalogName: cat.name,
-          catalogUnit: cat.unit,
-          catalogPrice: cat.price,
-        });
-      }
-      if (cola.smallQty > 0) {
-        const cat = findCatalogInsumoProduct('cola_4', priceTable, catalogOverride);
-        insumos.push({
-          kind: 'cola_4',
-          modalLabel: 'Cola para Piso 4 kg',
-          quantity: cola.smallQty,
-          quantityDisplay: `${cola.smallQty} ${cola.smallQty === 1 ? 'balde' : 'baldes'}`,
-          catalogName: cat.name,
-          catalogUnit: cat.unit,
-          catalogPrice: cat.price,
-        });
+      if (isTarkettColado(productName)) {
+        const globalfix = solveMinimumWastePackages(insumoBaseSqm, 12, 75);
+        if (globalfix.bigQty > 0) {
+          const cat = findCatalogInsumoProduct('globalfix_20', priceTable, catalogOverride);
+          insumos.push({
+            kind: 'globalfix_20',
+            modalLabel: 'Globalfix 20 kg',
+            quantity: globalfix.bigQty,
+            quantityDisplay: `${globalfix.bigQty} ${globalfix.bigQty === 1 ? 'balde' : 'baldes'}`,
+            catalogName: cat.name,
+            catalogUnit: cat.unit,
+            catalogPrice: cat.price,
+          });
+        }
+        if (globalfix.smallQty > 0) {
+          const cat = findCatalogInsumoProduct('globalfix_36', priceTable, catalogOverride);
+          insumos.push({
+            kind: 'globalfix_36',
+            modalLabel: 'Globalfix 3,6 kg',
+            quantity: globalfix.smallQty,
+            quantityDisplay: `${globalfix.smallQty} ${globalfix.smallQty === 1 ? 'balde' : 'baldes'}`,
+            catalogName: cat.name,
+            catalogUnit: cat.unit,
+            catalogPrice: cat.price,
+          });
+        }
+      } else {
+        const cola = solveMinimumWastePackages(insumoBaseSqm, 13, 60);
+        if (cola.bigQty > 0) {
+          const cat = findCatalogInsumoProduct('cola_18', priceTable, catalogOverride);
+          insumos.push({
+            kind: 'cola_18',
+            modalLabel: 'Cola para Piso 18 kg',
+            quantity: cola.bigQty,
+            quantityDisplay: `${cola.bigQty} ${cola.bigQty === 1 ? 'balde' : 'baldes'}`,
+            catalogName: cat.name,
+            catalogUnit: cat.unit,
+            catalogPrice: cat.price,
+          });
+        }
+        if (cola.smallQty > 0) {
+          const cat = findCatalogInsumoProduct('cola_4', priceTable, catalogOverride);
+          insumos.push({
+            kind: 'cola_4',
+            modalLabel: 'Cola para Piso 4 kg',
+            quantity: cola.smallQty,
+            quantityDisplay: `${cola.smallQty} ${cola.smallQty === 1 ? 'balde' : 'baldes'}`,
+            catalogName: cat.name,
+            catalogUnit: cat.unit,
+            catalogPrice: cat.price,
+          });
+        }
       }
     }
 

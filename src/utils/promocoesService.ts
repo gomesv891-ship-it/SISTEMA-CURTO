@@ -11,8 +11,54 @@ export const PROMOCOES_SUPABASE_KEY = 'fenix_promocoes_ativas_db';
 const PROMOCOES_CACHE_KEY = 'fenix_promocoes_ativas_cache_v1';
 
 export type PromoModality = 'cliente_final' | 'construtora' | 'revenda';
-export type PromoCategory = 'piso_vinilico' | 'rodapes' | 'ripados' | 'teto_vinilico' | 'outros';
+export type FixedPromoCategory = 'piso_vinilico' | 'rodapes' | 'ripados' | 'teto_vinilico' | 'outros';
+export type PromoCategory = FixedPromoCategory | (string & {});
 export type PromoCampaignStatus = 'ativa' | 'inativa' | 'encerrada';
+export type PromoCategoryUnit =
+  | 'm²'
+  | 'ml'
+  | 'barra'
+  | 'régua'
+  | 'caixa'
+  | 'unidade'
+  | 'rolo'
+  | 'pacote';
+export type PromoCategoryPricingType = 'unitario' | 'escalonado';
+
+export const PROMO_CATEGORY_UNITS: PromoCategoryUnit[] = [
+  'm²',
+  'ml',
+  'barra',
+  'régua',
+  'caixa',
+  'unidade',
+  'rolo',
+  'pacote',
+];
+
+export const SEM_CATEGORIA_ID = 'sem_categoria';
+
+export interface PromoTierDefaultRange {
+  id: string;
+  minQty: number;
+  maxQty?: number | null;
+}
+
+export interface PromoCategoryConfig {
+  id: string;
+  label: string;
+  unit: PromoCategoryUnit;
+  pricingType: PromoCategoryPricingType;
+  defaultRanges?: PromoTierDefaultRange[];
+  order: number;
+}
+
+export interface PromoCustomCategory {
+  id: string;
+  label: string;
+  pricingType: 'sqm' | 'simple';
+  order: number;
+}
 
 export const PROMO_MODALITIES: { id: PromoModality; label: string; shortLabel: string; crmTier: string }[] = [
   { id: 'cliente_final', label: 'CLIENTE FINAL', shortLabel: 'Cliente Final', crmTier: 'Cliente Final' },
@@ -27,6 +73,56 @@ export const PROMO_CATEGORIES: { id: PromoCategory; label: string }[] = [
   { id: 'teto_vinilico', label: 'TETO VINÍLICO' },
   { id: 'outros', label: 'OUTROS PRODUTOS' },
 ];
+
+export function createDefaultPromoCategories(): PromoCategoryConfig[] {
+  return [
+    {
+      id: 'piso_vinilico',
+      label: 'Piso Vinílico',
+      unit: 'm²',
+      pricingType: 'unitario',
+      order: 0,
+    },
+    {
+      id: 'rodapes',
+      label: 'Rodapés',
+      unit: 'barra',
+      pricingType: 'escalonado',
+      defaultRanges: [
+        { id: 'rng_rod_1', minQty: 30, maxQty: 49 },
+        { id: 'rng_rod_2', minQty: 50, maxQty: 99 },
+        { id: 'rng_rod_3', minQty: 100, maxQty: null },
+      ],
+      order: 1,
+    },
+    {
+      id: 'ripados',
+      label: 'Ripados',
+      unit: 'barra',
+      pricingType: 'escalonado',
+      defaultRanges: [
+        { id: 'rng_rip_1', minQty: 30, maxQty: 49 },
+        { id: 'rng_rip_2', minQty: 50, maxQty: 99 },
+        { id: 'rng_rip_3', minQty: 100, maxQty: null },
+      ],
+      order: 2,
+    },
+    {
+      id: 'teto_vinilico',
+      label: 'Teto Vinílico',
+      unit: 'm²',
+      pricingType: 'unitario',
+      order: 3,
+    },
+    {
+      id: 'outros',
+      label: 'Outros Produtos',
+      unit: 'unidade',
+      pricingType: 'unitario',
+      order: 4,
+    },
+  ];
+}
 
 export interface PromoSubcategory {
   id: string;
@@ -129,7 +225,9 @@ export interface PromoLotSale {
 }
 
 export interface PromoProgressiveTier {
+  id?: string;
   minQty: number;
+  maxQty?: number | null;
   label?: string;
   price: number;
 }
@@ -144,12 +242,12 @@ export interface PromoOfferItem {
   specs?: string;
   active: boolean;
   order: number;
-  // Piso Vinílico e Teto Vinílico
+  // Piso Vinílico e Teto Vinílico (ou unitário m²)
   priceSqm?: number;
-  // Rodapés e Ripados (preço normal + 3 faixas progressivas editáveis)
+  // Escalonado (preço base opcional + N faixas min/max/price)
   priceNormal?: number;
   tiers?: PromoProgressiveTier[];
-  // Outros Produtos
+  // Unitário genérico
   price?: number;
 }
 
@@ -162,7 +260,7 @@ export type PromoSheetModel = 'oficial_colorido' | 'pb_economico' | 'compacto_a4
 
 export interface PromoSheetSettings {
   model: PromoSheetModel;
-  includedCategories: Record<PromoCategory, boolean>;
+  includedCategories: Record<string, boolean>;
   showModalityLabel: boolean;
   showSubcategories: boolean;
   subcategoriesToggledByUser?: boolean;
@@ -183,6 +281,8 @@ export interface PromoCampaign {
   sheetSettings?: PromoSheetSettings;
   conditionsByModality: Record<PromoModality, string>;
   tierQuantitiesByModality: Record<PromoModality, PromoTierQuantities>;
+  categories?: PromoCategoryConfig[];
+  customCategories?: PromoCustomCategory[];
   subcategories: PromoSubcategory[];
   lotGroups?: PromoLotGroup[];
   lots: PromoFloorLot[];
@@ -251,10 +351,160 @@ export function getDefaultSheetSettings(showSubcategories = true): PromoSheetSet
       ripados: true,
       teto_vinilico: true,
       outros: true,
+      [SEM_CATEGORIA_ID]: false,
     },
     showModalityLabel: false,
     showSubcategories,
     density: 'padrao',
+  };
+}
+
+export function normalizePromoCategoryUnit(
+  value: unknown,
+  fallback: PromoCategoryUnit = 'unidade'
+): PromoCategoryUnit {
+  const s = String(value || '').trim().toLowerCase();
+  if (s === 'm²' || s === 'm2') return 'm²';
+  if (s === 'ml') return 'ml';
+  if (s === 'barra' || s === 'barras') return 'barra';
+  if (s === 'régua' || s === 'regua' || s === 'réguas' || s === 'reguas') return 'régua';
+  if (s === 'caixa' || s === 'caixas') return 'caixa';
+  if (s === 'unidade' || s === 'unidades' || s === 'un') return 'unidade';
+  if (s === 'rolo' || s === 'rolos') return 'rolo';
+  if (s === 'pacote' || s === 'pacotes' || s === 'pct') return 'pacote';
+  return fallback;
+}
+
+export function pluralizePromoUnit(unit: PromoCategoryUnit | string, qty?: number): string {
+  const norm = normalizePromoCategoryUnit(unit);
+  if (norm === 'm²' || norm === 'ml') return norm;
+  if (qty === 1) return norm;
+  if (norm === 'barra') return 'barras';
+  if (norm === 'régua') return 'réguas';
+  if (norm === 'caixa') return 'caixas';
+  if (norm === 'unidade') return 'unidades';
+  if (norm === 'rolo') return 'rolos';
+  if (norm === 'pacote') return 'pacotes';
+  return norm;
+}
+
+export function formatTierRangeLabel(
+  tier: { minQty: number; maxQty?: number | null; label?: string },
+  unit: string
+): string {
+  const minQ = Math.max(1, Math.floor(Number(tier.minQty) || 1));
+  const hasMax =
+    tier.maxQty !== null &&
+    tier.maxQty !== undefined &&
+    Number.isFinite(Number(tier.maxQty)) &&
+    Number(tier.maxQty) >= minQ;
+  if (hasMax) {
+    const maxQ = Math.floor(Number(tier.maxQty));
+    return `${minQ}–${maxQ} ${pluralizePromoUnit(unit, maxQ)}`;
+  }
+  return `+${minQ} ${pluralizePromoUnit(unit, minQ)}`;
+}
+
+export function getTierRangeSignature(tier: { minQty: number; maxQty?: number | null }): string {
+  const minQ = Math.max(1, Math.floor(Number(tier.minQty) || 1));
+  const hasMax =
+    tier.maxQty !== null &&
+    tier.maxQty !== undefined &&
+    Number.isFinite(Number(tier.maxQty)) &&
+    Number(tier.maxQty) >= minQ;
+  return `${minQ}_${hasMax ? Math.floor(Number(tier.maxQty)) : 'plus'}`;
+}
+
+export function getCampaignCategories(campaign?: PromoCampaign | null): PromoCategoryConfig[] {
+  if (!campaign) return createDefaultPromoCategories();
+  if (Array.isArray(campaign.categories)) {
+    return [...campaign.categories].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  }
+  const defaults = createDefaultPromoCategories();
+  const custom: PromoCategoryConfig[] = (campaign.customCategories || []).map((c, idx) => ({
+    id: c.id,
+    label: c.label,
+    unit: c.pricingType === 'sqm' ? 'm²' : 'unidade',
+    pricingType: 'unitario',
+    order: defaults.length + idx,
+  }));
+  return [...defaults, ...custom];
+}
+
+export function getOfferUnitPrice(
+  offer: PromoOfferItem,
+  category?: Pick<PromoCategoryConfig, 'unit' | 'pricingType'>
+): number {
+  if (category?.unit === 'm²') {
+    const val = offer.priceSqm ?? offer.price ?? offer.priceNormal ?? 0;
+    return Number.isFinite(Number(val)) ? Math.max(0, Number(val)) : 0;
+  }
+  const val = offer.price ?? offer.priceSqm ?? offer.priceNormal ?? 0;
+  return Number.isFinite(Number(val)) ? Math.max(0, Number(val)) : 0;
+}
+
+/**
+ * Resolve o preço unitário escalonado correspondente à quantidade total informada.
+ * Regra comercial: o preço da faixa escolhida é aplicado à quantidade total da compra.
+ * Ex.: 35 barras dentro da faixa 30–49 recebem o preço dessa faixa em todas as 35 barras.
+ */
+export function resolveTierPriceForQuantity(
+  offer: PromoOfferItem,
+  totalQty: number
+): { unitPrice: number; matchedTier?: PromoProgressiveTier } {
+  const baseFallback = Math.max(
+    0,
+    Number(offer.priceNormal ?? offer.price ?? offer.priceSqm ?? 0) || 0
+  );
+  const sortedTiers = [...(offer.tiers || [])]
+    .filter((t) => Number.isFinite(Number(t.minQty)) && Number(t.price) >= 0)
+    .sort((a, b) => Number(a.minQty) - Number(b.minQty));
+
+  if (sortedTiers.length === 0 || !Number.isFinite(totalQty) || totalQty <= 0) {
+    return { unitPrice: baseFallback };
+  }
+
+  // Busca exata pela faixa onde minQty <= totalQty <= maxQty (ou sem maxQty)
+  const exactMatches = sortedTiers.filter((t) => {
+    const minQ = Number(t.minQty);
+    const hasMax = t.maxQty !== null && t.maxQty !== undefined && Number.isFinite(Number(t.maxQty));
+    return totalQty >= minQ && (!hasMax || totalQty <= Number(t.maxQty));
+  });
+
+  if (exactMatches.length > 0) {
+    const chosen = exactMatches[exactMatches.length - 1];
+    return { unitPrice: Math.max(0, Number(chosen.price) || 0), matchedTier: chosen };
+  }
+
+  // Se estiver abaixo da menor faixa configurada, usa preço base (ou primeira faixa se não houver preço base)
+  if (totalQty < Number(sortedTiers[0].minQty)) {
+    return {
+      unitPrice: baseFallback > 0 ? baseFallback : Math.max(0, Number(sortedTiers[0].price) || 0),
+    };
+  }
+
+  // Se ultrapassar o limite máximo de todas as faixas fechadas, aplica a última faixa alcançada
+  const highestBelow = sortedTiers.filter((t) => Number(t.minQty) <= totalQty).pop();
+  if (highestBelow) {
+    return {
+      unitPrice: Math.max(0, Number(highestBelow.price) || 0),
+      matchedTier: highestBelow,
+    };
+  }
+
+  return { unitPrice: baseFallback };
+}
+
+export function calculateEscalonadoTotal(
+  offer: PromoOfferItem,
+  totalQty: number
+): { unitPrice: number; totalPrice: number; matchedTier?: PromoProgressiveTier } {
+  const qty = Math.max(0, Number(totalQty) || 0);
+  const { unitPrice, matchedTier } = resolveTierPriceForQuantity(offer, qty);
+  return {
+    unitPrice,
+    totalPrice: Math.round(qty * unitPrice * 100) / 100,
+    matchedTier,
   };
 }
 
@@ -387,6 +637,39 @@ export function detectPromoCategoryFromCrmProduct(category: string, name: string
   return 'outros';
 }
 
+function buildDefaultRangesFromTuple(tuple?: [number, number, number]): PromoTierDefaultRange[] {
+  const q1 = Math.max(1, Math.floor(Number(tuple?.[0]) || 30));
+  const q2 = Math.max(q1 + 1, Math.floor(Number(tuple?.[1]) || 50));
+  const q3 = Math.max(q2 + 1, Math.floor(Number(tuple?.[2]) || 100));
+  return [
+    { id: 'rng_1', minQty: q1, maxQty: q2 - 1 },
+    { id: 'rng_2', minQty: q2, maxQty: q3 - 1 },
+    { id: 'rng_3', minQty: q3, maxQty: null },
+  ];
+}
+
+function normalizeDefaultRanges(rawRanges: any): PromoTierDefaultRange[] | undefined {
+  if (!Array.isArray(rawRanges)) return undefined;
+  const cleaned = rawRanges
+    .filter((r: any) => r && Number.isFinite(Number(r.minQty)))
+    .map((r: any, idx: number) => {
+      const minQty = Math.max(1, Math.floor(Number(r.minQty) || 1));
+      const hasMax =
+        r.maxQty !== null &&
+        r.maxQty !== undefined &&
+        r.maxQty !== '' &&
+        Number.isFinite(Number(r.maxQty));
+      const maxQty = hasMax ? Math.max(minQty, Math.floor(Number(r.maxQty))) : null;
+      return {
+        id: String(r.id || `rng_${idx}`),
+        minQty,
+        maxQty,
+      };
+    })
+    .sort((a: PromoTierDefaultRange, b: PromoTierDefaultRange) => a.minQty - b.minQty);
+  return cleaned;
+}
+
 function normalizeCampaign(raw: any): PromoCampaign | null {
   if (!raw || typeof raw !== 'object') return null;
   const id = String(raw.id || '').trim();
@@ -397,19 +680,101 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
       ? raw.status
       : 'inativa';
 
+  const customCategories: PromoCustomCategory[] = Array.isArray(raw.customCategories)
+    ? raw.customCategories
+        .filter((c: any) => c && c.id && typeof c.label === 'string' && c.label.trim())
+        .map((c: any, idx: number) => ({
+          id: String(c.id).trim(),
+          label: String(c.label).trim(),
+          pricingType: c.pricingType === 'sqm' ? 'sqm' : 'simple',
+          order: Number(c.order ?? idx),
+        }))
+        .sort((a: PromoCustomCategory, b: PromoCustomCategory) => a.order - b.order)
+    : [];
+
+  const normalizeTQ = (tq: any): PromoTierQuantities => ({
+    rodapes:
+      Array.isArray(tq?.rodapes) && tq.rodapes.length === 3
+        ? [
+            Math.max(1, Math.floor(Number(tq.rodapes[0]) || 30)),
+            Math.max(1, Math.floor(Number(tq.rodapes[1]) || 50)),
+            Math.max(1, Math.floor(Number(tq.rodapes[2]) || 100)),
+          ]
+        : [30, 50, 100],
+    ripados:
+      Array.isArray(tq?.ripados) && tq.ripados.length === 3
+        ? [
+            Math.max(1, Math.floor(Number(tq.ripados[0]) || 30)),
+            Math.max(1, Math.floor(Number(tq.ripados[1]) || 50)),
+            Math.max(1, Math.floor(Number(tq.ripados[2]) || 100)),
+          ]
+        : [30, 50, 100],
+  });
+
+  const rawTQs = raw.tierQuantitiesByModality || {};
+  const tierQuantitiesByModality: Record<PromoModality, PromoTierQuantities> = {
+    cliente_final: normalizeTQ(rawTQs.cliente_final),
+    construtora: normalizeTQ(rawTQs.construtora),
+    revenda: normalizeTQ(rawTQs.revenda),
+  };
+
+  let categories: PromoCategoryConfig[];
+  if (Array.isArray(raw.categories)) {
+    categories = raw.categories
+      .filter((c: any) => c && c.id && typeof c.label === 'string' && c.label.trim())
+      .map((c: any, idx: number) => {
+        const pricingType: PromoCategoryPricingType =
+          c.pricingType === 'escalonado' ? 'escalonado' : 'unitario';
+        const defaultRanges =
+          pricingType === 'escalonado'
+            ? normalizeDefaultRanges(c.defaultRanges) || [
+                { id: 'rng_1', minQty: 1, maxQty: 29 },
+                { id: 'rng_2', minQty: 30, maxQty: 49 },
+                { id: 'rng_3', minQty: 50, maxQty: null },
+              ]
+            : undefined;
+        return {
+          id: String(c.id).trim(),
+          label: String(c.label).trim(),
+          unit: normalizePromoCategoryUnit(c.unit, 'unidade'),
+          pricingType,
+          ...(defaultRanges ? { defaultRanges } : {}),
+          order: Number(c.order ?? idx),
+        };
+      })
+      .sort((a: PromoCategoryConfig, b: PromoCategoryConfig) => a.order - b.order);
+  } else {
+    const baseDefaults = createDefaultPromoCategories().map((cat) => {
+      if (cat.id === 'rodapes') {
+        return {
+          ...cat,
+          defaultRanges: buildDefaultRangesFromTuple(tierQuantitiesByModality.revenda.rodapes),
+        };
+      }
+      if (cat.id === 'ripados') {
+        return {
+          ...cat,
+          defaultRanges: buildDefaultRangesFromTuple(tierQuantitiesByModality.revenda.ripados),
+        };
+      }
+      return cat;
+    });
+    const migratedCustom: PromoCategoryConfig[] = customCategories.map((c, idx) => ({
+      id: c.id,
+      label: c.label,
+      unit: c.pricingType === 'sqm' ? 'm²' : 'unidade',
+      pricingType: 'unitario',
+      order: baseDefaults.length + idx,
+    }));
+    categories = [...baseDefaults, ...migratedCustom];
+  }
+
   const subcategories: PromoSubcategory[] = Array.isArray(raw.subcategories)
     ? raw.subcategories
         .filter((s: any) => s && typeof s.name === 'string' && s.name.trim())
         .map((s: any, idx: number) => ({
           id: String(s.id || `sub_${idx}`),
-          category:
-            s.category === 'piso_vinilico' ||
-            s.category === 'rodapes' ||
-            s.category === 'ripados' ||
-            s.category === 'teto_vinilico' ||
-            s.category === 'outros'
-              ? s.category
-              : 'piso_vinilico',
+          category: String(s.category || '').trim() || 'piso_vinilico',
           name: String(s.name).trim(),
           order: Number(s.order ?? idx),
         }))
@@ -485,20 +850,28 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
     return arr
       .filter((o: any) => o && o.id)
       .map((o: any, idx: number) => {
-        const category: PromoCategory =
-          o.category === 'piso_vinilico' ||
-          o.category === 'rodapes' ||
-          o.category === 'ripados' ||
-          o.category === 'teto_vinilico' ||
-          o.category === 'outros'
-            ? o.category
-            : 'outros';
+        // Preserva o ID exato da categoria (incluindo 'sem_categoria' e categorias personalizadas/preservadas)
+        const rawCat = String(o.category || '').trim();
+        const category: PromoCategory = rawCat || SEM_CATEGORIA_ID;
         const tiers: PromoProgressiveTier[] | undefined = Array.isArray(o.tiers)
-          ? o.tiers.map((t: any, tIdx: number) => ({
-              minQty: Math.max(1, Math.floor(Number(t?.minQty) || [30, 50, 100][tIdx] || 30)),
-              label: t?.label ? String(t.label) : undefined,
-              price: Math.max(0, Number(t?.price) || 0),
-            }))
+          ? o.tiers
+              .filter((t: any) => t && Number.isFinite(Number(t?.minQty)))
+              .map((t: any, tIdx: number) => {
+                const minQty = Math.max(1, Math.floor(Number(t.minQty) || 1));
+                const hasMax =
+                  t.maxQty !== null &&
+                  t.maxQty !== undefined &&
+                  t.maxQty !== '' &&
+                  Number.isFinite(Number(t.maxQty));
+                const maxQty = hasMax ? Math.max(minQty, Math.floor(Number(t.maxQty))) : null;
+                return {
+                  id: t?.id ? String(t.id) : `tier_${idx}_${tIdx}`,
+                  minQty,
+                  maxQty,
+                  label: t?.label ? String(t.label) : undefined,
+                  price: Math.max(0, Number(t?.price) || 0),
+                };
+              })
           : undefined;
 
         return {
@@ -531,32 +904,6 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
     cliente_final: typeof rawCond.cliente_final === 'string' ? rawCond.cliente_final : '',
     construtora: typeof rawCond.construtora === 'string' ? rawCond.construtora : '',
     revenda: typeof rawCond.revenda === 'string' ? rawCond.revenda : '',
-  };
-
-  const normalizeTQ = (tq: any): PromoTierQuantities => ({
-    rodapes:
-      Array.isArray(tq?.rodapes) && tq.rodapes.length === 3
-        ? [
-            Math.max(1, Math.floor(Number(tq.rodapes[0]) || 30)),
-            Math.max(1, Math.floor(Number(tq.rodapes[1]) || 50)),
-            Math.max(1, Math.floor(Number(tq.rodapes[2]) || 100)),
-          ]
-        : [30, 50, 100],
-    ripados:
-      Array.isArray(tq?.ripados) && tq.ripados.length === 3
-        ? [
-            Math.max(1, Math.floor(Number(tq.ripados[0]) || 30)),
-            Math.max(1, Math.floor(Number(tq.ripados[1]) || 50)),
-            Math.max(1, Math.floor(Number(tq.ripados[2]) || 100)),
-          ]
-        : [30, 50, 100],
-  });
-
-  const rawTQs = raw.tierQuantitiesByModality || {};
-  const tierQuantitiesByModality: Record<PromoModality, PromoTierQuantities> = {
-    cliente_final: normalizeTQ(rawTQs.cliente_final),
-    construtora: normalizeTQ(rawTQs.construtora),
-    revenda: normalizeTQ(rawTQs.revenda),
   };
 
   const rawSheet = raw.sheetSettings || {};
@@ -596,14 +943,17 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
       : hasAssignedPisoSubcategories ||
         (rawSheet.showSubcategories === undefined && raw.showSubcategoriesOnSheet === undefined);
 
+  const dynamicIncluded: Record<string, boolean> = {};
+  categories.forEach((c) => {
+    dynamicIncluded[c.id] = rawIncluded[c.id] !== false;
+  });
+
   const sheetSettings: PromoSheetSettings = {
     model: sheetModel,
     includedCategories: {
-      piso_vinilico: rawIncluded.piso_vinilico !== false,
-      rodapes: rawIncluded.rodapes !== false,
-      ripados: rawIncluded.ripados !== false,
-      teto_vinilico: rawIncluded.teto_vinilico !== false,
-      outros: rawIncluded.outros !== false,
+      ...rawIncluded,
+      ...dynamicIncluded,
+      [SEM_CATEGORIA_ID]: rawIncluded[SEM_CATEGORIA_ID] === true,
     },
     showModalityLabel: Boolean(rawSheet.showModalityLabel),
     showSubcategories: resolvedShowSubcategories,
@@ -625,6 +975,8 @@ function normalizeCampaign(raw: any): PromoCampaign | null {
     sheetSettings,
     conditionsByModality,
     tierQuantitiesByModality,
+    categories,
+    ...(customCategories.length > 0 ? { customCategories } : {}),
     subcategories,
     ...(lotGroups !== undefined ? { lotGroups } : {}),
     lots,
@@ -919,11 +1271,18 @@ export async function duplicateCampaignInSupabase(
       tiers: o.tiers ? o.tiers.map((t) => ({ ...t })) : undefined,
     }));
 
+  const clonedCategories: PromoCategoryConfig[] = getCampaignCategories(source).map((c) => ({
+    ...c,
+    defaultRanges: c.defaultRanges ? c.defaultRanges.map((r) => ({ ...r })) : undefined,
+  }));
+
   const cloned: PromoCampaign = {
     ...source,
     id: `camp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     name: `${source.name} (Cópia)`,
     status: 'inativa',
+    categories: clonedCategories,
+    ...(source.customCategories ? { customCategories: source.customCategories.map((c) => ({ ...c })) } : {}),
     subcategories: newSubs,
     ...(newLotGroups !== undefined ? { lotGroups: newLotGroups } : {}),
     lots: newLots,

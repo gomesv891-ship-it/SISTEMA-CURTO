@@ -17,6 +17,7 @@ export interface AnotacaoLine {
 export interface AnotacaoChecklistItem {
   id: string;
   text: string;
+  html?: string;
   checked: boolean;
 }
 
@@ -80,6 +81,7 @@ export interface AnotacoesDatabaseV2 {
   version: 2;
   notes: AnotacaoItem[];
   categoriesByUser: Record<AnotacaoUserKey, AnotacaoCategory[]>;
+  deletedCategoryIdsByUser?: Record<AnotacaoUserKey, string[]>;
   sheetConfigByUser: Record<AnotacaoUserKey, AnotacaoSheetConfig>;
 }
 
@@ -266,9 +268,11 @@ export function sanitizeNoteHtml(rawHtml: string): string {
     const targetTag = tag === 'FONT' ? 'SPAN' : tag;
     const outEl = document.createElement(targetTag.toLowerCase());
 
-    // Preserva estilos seguros (destaques e text-decoration)
+    // Preserva estilos seguros (destaques, cor do texto, tamanho da fonte e text-decoration)
     const bg = el.style?.backgroundColor;
-    const color = el.style?.color;
+    const fontColorAttr = tag === 'FONT' ? el.getAttribute('color') : null;
+    const color = el.style?.color || fontColorAttr;
+    const rawFontSize = el.style?.fontSize;
     const textDecoration = el.style?.textDecoration;
     const fontWeight = el.style?.fontWeight;
     const fontStyle = el.style?.fontStyle;
@@ -282,6 +286,16 @@ export function sanitizeNoteHtml(rawHtml: string): string {
     }
     if (color && color !== 'inherit') {
       outEl.style.color = color;
+    }
+    if (rawFontSize) {
+      const pxMatch = rawFontSize.trim().match(/^(\d+(?:\.\d+)?)px$/i);
+      if (pxMatch) {
+        const px = Math.min(28, Math.max(11, Math.round(parseFloat(pxMatch[1]))));
+        outEl.style.fontSize = `${px}px`;
+        if (px > 18) {
+          outEl.style.lineHeight = `${Math.ceil(px * 1.35)}px`;
+        }
+      }
     }
     if (textDecoration && textDecoration !== 'none') {
       outEl.style.textDecoration = textDecoration;
@@ -435,10 +449,31 @@ function convertLegacyLinesToBlocks(lines: AnotacaoLine[]): AnotacaoBlock[] {
   return blocks;
 }
 
-function normalizeCategories(rawList: unknown): AnotacaoCategory[] {
-  const defaults = createDefaultCategories();
+function normalizeDeletedCategoryIds(rawIds: unknown): string[] {
+  if (!Array.isArray(rawIds)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of rawIds) {
+    const id = String(raw || '').trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+function normalizeCategories(rawList: unknown, deletedIds: string[] = []): AnotacaoCategory[] {
+  const deletedSet = new Set(deletedIds);
+  const nowIso = new Date().toISOString();
+  const safeFallbackList = (): AnotacaoCategory[] => {
+    const survivingDefaults = createDefaultCategories(nowIso).filter((c) => !deletedSet.has(c.id));
+    if (survivingDefaults.length > 0) return survivingDefaults;
+    return [{ id: 'cat_geral_ativa', name: 'Geral', order: 0, createdAt: nowIso }];
+  };
+
   if (!Array.isArray(rawList) || rawList.length === 0) {
-    return defaults;
+    return safeFallbackList();
   }
 
   const seenIds = new Set<string>();
@@ -447,17 +482,17 @@ function normalizeCategories(rawList: unknown): AnotacaoCategory[] {
     if (!raw || typeof raw !== 'object') return;
     const id = String(raw.id || '').trim() || generateUid('cat');
     const name = String(raw.name || '').trim();
-    if (!name || seenIds.has(id)) return;
+    if (!name || seenIds.has(id) || deletedSet.has(id)) return;
     seenIds.add(id);
     list.push({
       id,
       name,
       order: typeof raw.order === 'number' ? raw.order : index,
-      createdAt: raw.createdAt || new Date().toISOString(),
+      createdAt: raw.createdAt || nowIso,
     });
   });
 
-  if (list.length === 0) return defaults;
+  if (list.length === 0) return safeFallbackList();
   return list.sort((a, b) => a.order - b.order);
 }
 
@@ -500,11 +535,21 @@ function normalizeBlocks(rawBlocks: unknown, legacyLines?: unknown, legacyConten
       if (!b || typeof b !== 'object') continue;
       if (b.kind === 'checklist') {
         const items: AnotacaoChecklistItem[] = Array.isArray(b.items)
-          ? b.items.map((it: any, idx: number) => ({
-              id: String(it?.id || `${idPrefix}_chk_${i}_${idx}`),
-              text: typeof it?.text === 'string' ? it.text : String(it?.text || ''),
-              checked: Boolean(it?.checked),
-            }))
+          ? b.items.map((it: any, idx: number) => {
+              const rawText = typeof it?.text === 'string' ? it.text : String(it?.text || '');
+              const cleanHtml =
+                typeof it?.html === 'string' && it.html.trim()
+                  ? sanitizeNoteHtml(it.html)
+                  : undefined;
+              const derivedText =
+                cleanHtml !== undefined ? stripHtmlToPlainText(cleanHtml) || rawText : rawText;
+              return {
+                id: String(it?.id || `${idPrefix}_chk_${i}_${idx}`),
+                text: derivedText,
+                ...(cleanHtml !== undefined ? { html: cleanHtml } : {}),
+                checked: Boolean(it?.checked),
+              };
+            })
           : [];
         normalized.push({
           id: String(b.id || `${idPrefix}_cl_${i}`),
@@ -605,6 +650,10 @@ export function createEmptyDatabase(): AnotacoesDatabaseV2 {
       vanessa: createDefaultCategories(),
       jhessica: createDefaultCategories(),
     },
+    deletedCategoryIdsByUser: {
+      vanessa: [],
+      jhessica: [],
+    },
     sheetConfigByUser: {
       vanessa: { ...DEFAULT_SHEET_CONFIG },
       jhessica: { ...DEFAULT_SHEET_CONFIG },
@@ -650,9 +699,13 @@ export function parseAnotacoesDatabase(rawPayload: unknown): AnotacoesDatabaseV2
 
   if (typeof data === 'object') {
     const obj = data as Record<string, any>;
+    const deletedCategoryIdsByUser: Record<AnotacaoUserKey, string[]> = {
+      vanessa: normalizeDeletedCategoryIds(obj.deletedCategoryIdsByUser?.vanessa),
+      jhessica: normalizeDeletedCategoryIds(obj.deletedCategoryIdsByUser?.jhessica),
+    };
     const categoriesByUser: Record<AnotacaoUserKey, AnotacaoCategory[]> = {
-      vanessa: normalizeCategories(obj.categoriesByUser?.vanessa),
-      jhessica: normalizeCategories(obj.categoriesByUser?.jhessica),
+      vanessa: normalizeCategories(obj.categoriesByUser?.vanessa, deletedCategoryIdsByUser.vanessa),
+      jhessica: normalizeCategories(obj.categoriesByUser?.jhessica, deletedCategoryIdsByUser.jhessica),
     };
 
     const sheetConfigByUser: Record<AnotacaoUserKey, AnotacaoSheetConfig> = {
@@ -675,6 +728,7 @@ export function parseAnotacoesDatabase(rawPayload: unknown): AnotacoesDatabaseV2
       version: 2,
       notes: sortAnotacoes(notes),
       categoriesByUser,
+      deletedCategoryIdsByUser,
       sheetConfigByUser,
     };
   }
@@ -852,11 +906,24 @@ function sanitizeBlocks(blocks: AnotacaoBlock[]): AnotacaoBlock[] {
         title: typeof b.title === 'string' ? b.title : '',
         strikeCompleted: b.strikeCompleted !== false,
         items: Array.isArray(b.items)
-          ? b.items.map((it) => ({
-              id: it.id || generateUid('chk'),
-              text: typeof it.text === 'string' ? it.text : '',
-              checked: Boolean(it.checked),
-            }))
+          ? b.items.map((it) => {
+              const cleanHtml =
+                typeof it.html === 'string' && it.html.trim()
+                  ? sanitizeNoteHtml(it.html)
+                  : undefined;
+              const plainText =
+                cleanHtml !== undefined
+                  ? stripHtmlToPlainText(cleanHtml) || (typeof it.text === 'string' ? it.text : '')
+                  : typeof it.text === 'string'
+                  ? it.text
+                  : '';
+              return {
+                id: it.id || generateUid('chk'),
+                text: plainText,
+                ...(cleanHtml !== undefined ? { html: cleanHtml } : {}),
+                checked: Boolean(it.checked),
+              };
+            })
           : [],
       };
     }
@@ -965,16 +1032,26 @@ export async function saveUserCategoriesInDb(
   error?: string;
 }> {
   return fetchAndMutateDb(currentUser, (remoteDb) => {
+    const nowIso = new Date().toISOString();
     const cleanCats: AnotacaoCategory[] = categories
       .map((c, idx) => ({
         id: c.id || generateUid('cat'),
         name: c.name.trim(),
         order: idx,
-        createdAt: c.createdAt || new Date().toISOString(),
+        createdAt: c.createdAt || nowIso,
       }))
       .filter((c) => Boolean(c.name));
 
-    const finalCats = cleanCats.length > 0 ? cleanCats : createDefaultCategories();
+    const prevDeleted = remoteDb.deletedCategoryIdsByUser?.[userKey] || [];
+    const prevActiveIds = (remoteDb.categoriesByUser[userKey] || []).map((c) => c.id);
+    const nextActiveIdSet = new Set(cleanCats.map((c) => c.id));
+    const removedIds = prevActiveIds.filter((id) => !nextActiveIdSet.has(id));
+    const nextDeletedIds = Array.from(
+      new Set([...prevDeleted.filter((id) => !nextActiveIdSet.has(id)), ...removedIds])
+    );
+
+    const finalCats =
+      cleanCats.length > 0 ? cleanCats : normalizeCategories([], nextDeletedIds);
     const validIds = new Set(finalCats.map((c) => c.id));
     const fallbackId =
       (reassignDeletedCategoryToId && validIds.has(reassignDeletedCategoryToId)
@@ -986,7 +1063,7 @@ export async function saveUserCategoriesInDb(
     // Atualiza categoria das notas do usuário caso alguma pasta tenha sido excluída
     const nextNotes = remoteDb.notes.map((n) => {
       if (n.ownerKey === userKey && !validIds.has(n.categoryId)) {
-        return { ...n, categoryId: fallbackId };
+        return { ...n, categoryId: fallbackId, updatedAt: nowIso };
       }
       return n;
     });
@@ -997,6 +1074,11 @@ export async function saveUserCategoriesInDb(
       categoriesByUser: {
         ...remoteDb.categoriesByUser,
         [userKey]: finalCats,
+      },
+      deletedCategoryIdsByUser: {
+        vanessa: remoteDb.deletedCategoryIdsByUser?.vanessa || [],
+        jhessica: remoteDb.deletedCategoryIdsByUser?.jhessica || [],
+        [userKey]: nextDeletedIds,
       },
     };
   });

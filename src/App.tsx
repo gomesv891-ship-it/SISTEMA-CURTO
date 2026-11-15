@@ -129,6 +129,7 @@ export default function App() {
   const [orcamentoViewMode, setOrcamentoViewMode] = useState<'list' | 'create' | 'edit'>('list');
   const [selectedOrcamento, setSelectedOrcamento] = useState<SavedOrcamento | null>(null);
   const [isOrcamentoInProgress, setIsOrcamentoInProgress] = useState(false);
+  const [scrollToOrcamentoProducts, setScrollToOrcamentoProducts] = useState(false);
   const [initialOpenTaskModal, setInitialOpenTaskModal] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -283,7 +284,12 @@ export default function App() {
   const handleQuickAction = (
     action: 'Calculadora' | 'Orçamentos' | 'Tarefas',
     client: ClientRecord,
-    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean; openOrcamento?: SavedOrcamento }
+    options?: {
+      createOrcamento?: boolean;
+      openNewTaskModal?: boolean;
+      openOrcamento?: SavedOrcamento;
+      scrollToProducts?: boolean;
+    }
   ) => {
     setActiveClient(client);
     try {
@@ -293,6 +299,7 @@ export default function App() {
     }
 
     if (action === 'Calculadora') {
+      setScrollToOrcamentoProducts(false);
       setCurrentTab('Calculadora');
       return;
     }
@@ -301,6 +308,7 @@ export default function App() {
       if (options?.openOrcamento) {
         setSelectedOrcamento(options.openOrcamento);
         setOrcamentoViewMode('edit');
+        setScrollToOrcamentoProducts(false);
       } else if (options?.createOrcamento) {
         try {
           const userKey = `fenix_orcamento_in_progress_draft_${currentUserName || 'default'}`;
@@ -309,9 +317,11 @@ export default function App() {
         } catch {}
         setOrcamentoViewMode('create');
         setSelectedOrcamento(null);
+        setScrollToOrcamentoProducts(!!options?.scrollToProducts);
       } else {
         setOrcamentoViewMode('list');
         setSelectedOrcamento(null);
+        setScrollToOrcamentoProducts(false);
       }
       setCurrentTab('Orçamentos');
       return;
@@ -663,19 +673,24 @@ export default function App() {
                   key={selectedOrcamento?.id || (orcamentoViewMode === 'create' ? 'novo_orcamento' : 'orcamento_screen')}
                   client={activeClient}
                   initialOrcamento={selectedOrcamento}
+                  scrollToProductsOnMount={scrollToOrcamentoProducts}
+                  onConsumeScrollToProducts={() => setScrollToOrcamentoProducts(false)}
                   onStatusChangeInProgress={(inProgress) => setIsOrcamentoInProgress(inProgress)}
                   onBackToList={() => {
                     setIsOrcamentoInProgress(false);
+                    setScrollToOrcamentoProducts(false);
                     setActiveClient(null);
                     setSelectedOrcamento(null);
                     setOrcamentoViewMode('list');
                   }}
                   onBackToCadastro={() => {
                     setIsOrcamentoInProgress(false);
+                    setScrollToOrcamentoProducts(false);
                     setCurrentTab('Cadastro');
                   }}
                   onSaveSuccess={() => {
                     setIsOrcamentoInProgress(false);
+                    setScrollToOrcamentoProducts(false);
                     setActiveClient(null);
                     setSelectedOrcamento(null);
                     setOrcamentoViewMode('list');

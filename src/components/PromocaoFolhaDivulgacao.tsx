@@ -3,23 +3,28 @@ import { Calendar, CreditCard, Tag } from 'lucide-react';
 import { FENIX_OFFICIAL_LOGO_BASE64 } from '../assets/fenixLogoBase64';
 import {
   PromoCampaign,
-  PromoCategory,
+  PromoCategoryConfig,
   PromoModality,
   PromoOfferItem,
   PromoSheetModel,
   PROMO_MODALITIES,
+  SEM_CATEGORIA_ID,
   computeLotMetrics,
   formatCurrencyBRL,
   formatDateBR,
   formatSqmBR,
+  formatTierRangeLabel,
+  getCampaignCategories,
   getDefaultSheetSettings,
+  getOfferUnitPrice,
+  getTierRangeSignature,
   splitCampaignBadgeTitle,
 } from '../utils/promocoesService';
 
 interface PromocaoFolhaDivulgacaoProps {
   campaign: PromoCampaign;
   modality: PromoModality;
-  includedCategories?: Record<PromoCategory, boolean>;
+  includedCategories?: Record<string, boolean>;
   sheetModel?: PromoSheetModel;
   showModalityLabel?: boolean;
   showSubcategories?: boolean;
@@ -55,7 +60,7 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
       ? Boolean(campaign.showSubcategoriesOnSheet)
       : true;
 
-  const catEnabled: Record<PromoCategory, boolean> = includedCategories || settings.includedCategories || defaults.includedCategories;
+  const catEnabled: Record<string, boolean> = includedCategories || settings.includedCategories || defaults.includedCategories;
 
   const palette = isMono
     ? {
@@ -91,8 +96,8 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
         mutedText: '#334155',
       };
 
-  const cellPad = isCompact ? '3px 10px' : '5px 12px';
-  const numCellPad = isCompact ? '3px 6px' : '5px 8px';
+  const cellPad = isCompact ? '3px 8px' : '5px 10px';
+  const numCellPad = isCompact ? '3px 5px' : '5px 7px';
   const headerFontSize = isCompact ? '14.5px' : '17px';
   const headerPad = isCompact ? '4px 14px' : '5.5px 16px';
   const bodyFontSize = isCompact ? '11.2px' : '12.5px';
@@ -106,80 +111,51 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
     campaign.badgeBottomText
   );
 
+  const campaignCategories = React.useMemo(
+    () => getCampaignCategories(campaign),
+    [campaign]
+  );
+  const configuredCategoryIds = React.useMemo(
+    () => new Set(campaignCategories.map((c) => c.id)),
+    [campaignCategories]
+  );
+
   const modalityOffers = (campaign.offersByModality?.[modality] || [])
     .filter((o) => o.active !== false)
     .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
-  // 1. PISO VINÍLICO: mostra apenas lotes ativos com saldo disponível > 0
-  const pisoRows = catEnabled.piso_vinilico
-    ? modalityOffers
-        .filter((o) => o.category === 'piso_vinilico')
-        .map((offer) => {
-          const lot = offer.lotId
-            ? campaign.lots.find((l) => l.id === offer.lotId)
-            : undefined;
-          if (!lot) return null;
-          const metrics = computeLotMetrics(lot);
-          if (!metrics.isAvailable) return null;
-          const subId = offer.subcategoryId || lot.subcategoryId;
-          const subName = subId
-            ? campaign.subcategories.find((s) => s.id === subId)?.name || ''
-            : '';
-          return {
-            offer,
-            lot,
-            metrics,
-            subName,
-            description: offer.description?.trim() || lot.description,
-            priceSqm: Number(offer.priceSqm ?? 0),
-          };
-        })
-        .filter((item): item is NonNullable<typeof item> => item !== null)
-    : [];
+  const getPisoRowsForCategory = (catId: string) =>
+    modalityOffers
+      .filter((o) => o.category === catId)
+      .map((offer) => {
+        const lot = offer.lotId
+          ? campaign.lots.find((l) => l.id === offer.lotId)
+          : undefined;
+        if (!lot) return null;
+        const metrics = computeLotMetrics(lot);
+        if (!metrics.isAvailable) return null;
+        const subId = offer.subcategoryId || lot.subcategoryId;
+        const subName = subId
+          ? campaign.subcategories.find((s) => s.id === subId)?.name || ''
+          : '';
+        return {
+          offer,
+          lot,
+          metrics,
+          subName,
+          description: offer.description?.trim() || lot.description,
+          priceSqm: Number(offer.priceSqm ?? offer.price ?? 0),
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
 
-  const rodapeRows = catEnabled.rodapes
-    ? modalityOffers.filter((o) => o.category === 'rodapes')
-    : [];
-  const ripadoRows = catEnabled.ripados
-    ? modalityOffers.filter((o) => o.category === 'ripados')
-    : [];
-  const tetoRows = catEnabled.teto_vinilico !== false
-    ? modalityOffers.filter((o) => o.category === 'teto_vinilico')
-    : [];
-  const outroRows = catEnabled.outros
-    ? modalityOffers.filter((o) => o.category === 'outros')
-    : [];
+  const pisoCategoryConfig = campaignCategories.find((c) => c.id === 'piso_vinilico');
+  const pisoUsesSpecialLotTable =
+    Boolean(pisoCategoryConfig) &&
+    pisoCategoryConfig!.pricingType === 'unitario' &&
+    catEnabled.piso_vinilico !== false;
 
-  const rodapeQuantities = campaign.tierQuantitiesByModality?.[modality]?.rodapes || [30, 50, 100];
-  const ripadoQuantities = campaign.tierQuantitiesByModality?.[modality]?.ripados || [30, 50, 100];
-
-  const getTierPrice = (
-    offer: PromoOfferItem,
-    idx: number,
-    defaultQuantities: [number, number, number]
-  ) => {
-    const tier = offer.tiers?.[idx];
-    if (tier && Number.isFinite(Number(tier.price))) {
-      return Number(tier.price);
-    }
-    const targetQty = defaultQuantities[idx];
-    const matched = offer.tiers?.find((t) => Number(t.minQty) === Number(targetQty));
-    return matched ? Number(matched.price) : 0;
-  };
-
-  const commercialCondition = (campaign.conditionsByModality?.[modality] || '').trim();
-  const paymentCondition = (campaign.paymentConditionText || '').trim();
-  const hasPaymentCondition = Boolean(paymentCondition);
-  const hasCustomValidity = Boolean(campaign.validityText && campaign.validityText.trim());
-  const startFormatted = formatDateBR(campaign.startDate);
-  const endFormatted = formatDateBR(campaign.endDate);
-
-  const hasAnyItem =
-    pisoRows.length > 0 ||
-    rodapeRows.length > 0 ||
-    ripadoRows.length > 0 ||
-    tetoRows.length > 0 ||
-    outroRows.length > 0;
+  const pisoRows = pisoUsesSpecialLotTable ? getPisoRowsForCategory('piso_vinilico') : [];
 
   const groupedPisoRows = React.useMemo(() => {
     if (!groupSubcategories) {
@@ -209,6 +185,51 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
     groups.sort((a, b) => a.order - b.order);
     return groups.map(({ subName, items }) => ({ subName, items }));
   }, [pisoRows, groupSubcategories, campaign.subcategories]);
+
+  const orphanOffers = modalityOffers.filter(
+    (o) => o.category === SEM_CATEGORIA_ID || !configuredCategoryIds.has(o.category)
+  );
+
+  const dynamicSections = React.useMemo(() => {
+    const list: { cat: PromoCategoryConfig; rows: PromoOfferItem[]; isSpecialPiso: boolean }[] = [];
+    campaignCategories.forEach((cat) => {
+      const isEnabled = catEnabled[cat.id] !== false;
+      if (!isEnabled) return;
+      if (cat.id === 'piso_vinilico' && cat.pricingType === 'unitario') {
+        if (pisoRows.length > 0) {
+          list.push({ cat, rows: [], isSpecialPiso: true });
+        }
+        return;
+      }
+      const rows = modalityOffers.filter((o) => o.category === cat.id);
+      if (rows.length > 0) {
+        list.push({ cat, rows, isSpecialPiso: false });
+      }
+    });
+    if (catEnabled[SEM_CATEGORIA_ID] === true && orphanOffers.length > 0) {
+      list.push({
+        cat: {
+          id: SEM_CATEGORIA_ID,
+          label: 'Outros Itens',
+          unit: 'unidade',
+          pricingType: 'unitario',
+          order: 99999,
+        },
+        rows: orphanOffers,
+        isSpecialPiso: false,
+      });
+    }
+    return list;
+  }, [campaignCategories, catEnabled, pisoRows.length, modalityOffers, orphanOffers]);
+
+  const hasAnyItem = dynamicSections.length > 0;
+
+  const commercialCondition = (campaign.conditionsByModality?.[modality] || '').trim();
+  const paymentCondition = (campaign.paymentConditionText || '').trim();
+  const hasPaymentCondition = Boolean(paymentCondition);
+  const hasCustomValidity = Boolean(campaign.validityText && campaign.validityText.trim());
+  const startFormatted = formatDateBR(campaign.startDate);
+  const endFormatted = formatDateBR(campaign.endDate);
 
   return (
     <div
@@ -423,136 +444,331 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
             </div>
           )}
 
-          {/* 1. PISO VINÍLICO */}
-          {pisoRows.length > 0 && (
-            <div
-              style={{
-                border: `1.5px solid ${palette.primaryBorder}`,
-                borderRadius: '14px',
-                overflow: 'hidden',
-                backgroundColor: '#ffffff',
-                pageBreakInside: 'avoid',
-              }}
-            >
-              <div
-                style={{
-                  backgroundColor: palette.primary,
-                  color: '#ffffff',
-                  padding: headerPad,
-                  fontSize: headerFontSize,
-                  fontWeight: 800,
-                  letterSpacing: '0.03em',
-                  textTransform: 'uppercase',
-                }}
-              >
-                PISO VINÍLICO
-              </div>
-
-              <table
-                style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  tableLayout: 'fixed',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <colgroup>
-                  <col style={{ width: '52%' }} />
-                  <col style={{ width: '12%' }} />
-                  <col style={{ width: '18%' }} />
-                  <col style={{ width: '18%' }} />
-                </colgroup>
-                <thead>
-                  <tr
+          {dynamicSections.map(({ cat, rows, isSpecialPiso }) => {
+            if (isSpecialPiso) {
+              return (
+                <div
+                  key={cat.id}
+                  style={{
+                    border: `1.5px solid ${palette.primaryBorder}`,
+                    borderRadius: '14px',
+                    overflow: 'hidden',
+                    backgroundColor: '#ffffff',
+                    pageBreakInside: 'avoid',
+                  }}
+                >
+                  <div
                     style={{
-                      background: palette.subHeaderBg,
-                      borderBottom: `1px solid ${palette.subHeaderBorder}`,
+                      backgroundColor: palette.primary,
+                      color: '#ffffff',
+                      padding: headerPad,
+                      fontSize: headerFontSize,
+                      fontWeight: 800,
+                      letterSpacing: '0.03em',
+                      textTransform: 'uppercase',
                     }}
                   >
-                    <th
-                      style={{
-                        padding: cellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Descrição
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Caixas
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Total (m²)
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                      }}
-                    >
-                      Preço (m²)
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {groupedPisoRows.map((group, gIdx) => (
-                    <React.Fragment key={`${group.subName}_${gIdx}`}>
-                      {groupSubcategories && group.subName && (
-                        <tr
+                    {cat.label}
+                  </div>
+
+                  <table
+                    style={{
+                      width: '100%',
+                      borderCollapse: 'collapse',
+                      tableLayout: 'auto',
+                      fontVariantNumeric: 'tabular-nums',
+                    }}
+                  >
+                    <thead>
+                      <tr
+                        style={{
+                          background: palette.subHeaderBg,
+                          borderBottom: `1px solid ${palette.subHeaderBorder}`,
+                        }}
+                      >
+                        <th
                           style={{
-                            backgroundColor: isMono ? '#e5e7eb' : '#e8f0fa',
-                            borderBottom: `1px solid ${palette.cellBorder}`,
+                            padding: cellPad,
+                            fontSize: thFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            textAlign: 'center',
+                            borderRight: `1px solid ${palette.cellBorder}`,
+                            whiteSpace: 'nowrap',
                           }}
                         >
-                          <td
-                            colSpan={4}
+                          Descrição
+                        </th>
+                        <th
+                          style={{
+                            width: '1%',
+                            padding: numCellPad,
+                            fontSize: thFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            textAlign: 'center',
+                            borderRight: `1px solid ${palette.cellBorder}`,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          Caixas
+                        </th>
+                        <th
+                          style={{
+                            width: '1%',
+                            padding: numCellPad,
+                            fontSize: thFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            textAlign: 'center',
+                            borderRight: `1px solid ${palette.cellBorder}`,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          Total (m²)
+                        </th>
+                        <th
+                          style={{
+                            width: '1%',
+                            padding: numCellPad,
+                            fontSize: thFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            textAlign: 'center',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          Preço ({cat.unit})
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {groupedPisoRows.map((group, gIdx) => (
+                        <React.Fragment key={`${group.subName}_${gIdx}`}>
+                          {groupSubcategories && group.subName && (
+                            <tr
+                              style={{
+                                backgroundColor: isMono ? '#e5e7eb' : '#e8f0fa',
+                                borderBottom: `1px solid ${palette.cellBorder}`,
+                              }}
+                            >
+                              <td
+                                colSpan={4}
+                                style={{
+                                  padding: isCompact ? '3.5px 10px' : '4.5px 12px',
+                                  fontSize: isCompact ? '10.5px' : '11.5px',
+                                  fontWeight: 800,
+                                  color: palette.primary,
+                                  textTransform: 'uppercase',
+                                  letterSpacing: '0.04em',
+                                  textAlign: 'left',
+                                }}
+                              >
+                                {group.subName}
+                              </td>
+                            </tr>
+                          )}
+                          {group.items.map((row, idx) => (
+                            <tr
+                              key={row.offer.id}
+                              style={{
+                                backgroundColor: '#ffffff',
+                                borderBottom:
+                                  gIdx === groupedPisoRows.length - 1 &&
+                                  idx === group.items.length - 1
+                                    ? 'none'
+                                    : `1px solid ${palette.cellBorder}`,
+                              }}
+                            >
+                              <td
+                                style={{
+                                  padding: cellPad,
+                                  fontSize: bodyFontSize,
+                                  fontWeight: 700,
+                                  color: palette.text,
+                                  borderRight: `1px solid ${palette.cellBorder}`,
+                                  textAlign: 'left',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {row.description}
+                              </td>
+                              <td
+                                style={{
+                                  width: '1%',
+                                  padding: numCellPad,
+                                  fontSize: bodyFontSize,
+                                  fontWeight: 700,
+                                  color: palette.text,
+                                  borderRight: `1px solid ${palette.cellBorder}`,
+                                  textAlign: 'center',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {row.metrics.availableBoxes}
+                              </td>
+                              <td
+                                style={{
+                                  width: '1%',
+                                  padding: numCellPad,
+                                  fontSize: bodyFontSize,
+                                  fontWeight: 700,
+                                  color: palette.text,
+                                  borderRight: `1px solid ${palette.cellBorder}`,
+                                  textAlign: 'center',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {formatSqmBR(row.metrics.availableSqm)}
+                              </td>
+                              <td
+                                style={{
+                                  width: '1%',
+                                  padding: numCellPad,
+                                  fontSize: bodyFontSize,
+                                  fontWeight: 700,
+                                  color: palette.text,
+                                  textAlign: 'center',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {formatCurrencyBRL(row.priceSqm)}
+                              </td>
+                            </tr>
+                          ))}
+                        </React.Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            }
+
+            if (cat.pricingType === 'escalonado') {
+              const rangeMap = new Map<
+                string,
+                { sig: string; minQty: number; maxQty?: number | null }
+              >();
+              (cat.defaultRanges || []).forEach((r) => {
+                const sig = getTierRangeSignature(r);
+                if (!rangeMap.has(sig)) {
+                  rangeMap.set(sig, { sig, minQty: r.minQty, maxQty: r.maxQty ?? null });
+                }
+              });
+              rows.forEach((offer) => {
+                (offer.tiers || []).forEach((t) => {
+                  const sig = getTierRangeSignature(t);
+                  if (!rangeMap.has(sig)) {
+                    rangeMap.set(sig, { sig, minQty: t.minQty, maxQty: t.maxQty ?? null });
+                  }
+                });
+              });
+              const rangeCols = Array.from(rangeMap.values()).sort((a, b) => {
+                if (a.minQty !== b.minQty) return a.minQty - b.minQty;
+                return (a.maxQty ?? Infinity) - (b.maxQty ?? Infinity);
+              });
+              const hasBasePrice = rows.some((o) => Number(o.priceNormal) > 0);
+
+              return (
+                <div
+                  key={cat.id}
+                  style={{
+                    border: `1.5px solid ${palette.primaryBorder}`,
+                    borderRadius: '14px',
+                    overflow: 'hidden',
+                    backgroundColor: '#ffffff',
+                    pageBreakInside: 'avoid',
+                  }}
+                >
+                  <div
+                    style={{
+                      backgroundColor: palette.primary,
+                      color: '#ffffff',
+                      padding: headerPad,
+                      fontSize: headerFontSize,
+                      fontWeight: 800,
+                      letterSpacing: '0.03em',
+                      textTransform: 'uppercase',
+                    }}
+                  >
+                    {cat.label}
+                  </div>
+
+                  <table
+                    style={{
+                      width: '100%',
+                      borderCollapse: 'collapse',
+                      tableLayout: 'auto',
+                      fontVariantNumeric: 'tabular-nums',
+                    }}
+                  >
+                    <thead>
+                      <tr
+                        style={{
+                          background: palette.subHeaderBg,
+                          borderBottom: `1px solid ${palette.subHeaderBorder}`,
+                        }}
+                      >
+                        <th
+                          style={{
+                            padding: cellPad,
+                            fontSize: thFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            textAlign: 'center',
+                            borderRight: `1px solid ${palette.cellBorder}`,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          Descrição
+                        </th>
+                        {hasBasePrice && (
+                          <th
                             style={{
-                              padding: isCompact ? '3.5px 10px' : '4.5px 12px',
-                              fontSize: isCompact ? '10.5px' : '11.5px',
-                              fontWeight: 800,
-                              color: palette.primary,
-                              textTransform: 'uppercase',
-                              letterSpacing: '0.04em',
-                              textAlign: 'left',
+                              width: '1%',
+                              padding: numCellPad,
+                              fontSize: thFontSize,
+                              fontWeight: 700,
+                              color: palette.text,
+                              textAlign: 'center',
+                              borderRight:
+                                rangeCols.length > 0 ? `1px solid ${palette.cellBorder}` : 'none',
+                              whiteSpace: 'nowrap',
                             }}
                           >
-                            {group.subName}
-                          </td>
-                        </tr>
-                      )}
-                      {group.items.map((row, idx) => (
+                            Preço ({cat.unit})
+                          </th>
+                        )}
+                        {rangeCols.map((col, cIdx) => (
+                          <th
+                            key={col.sig}
+                            style={{
+                              width: '1%',
+                              padding: numCellPad,
+                              fontSize: thFontSize,
+                              fontWeight: 700,
+                              color: palette.text,
+                              textAlign: 'center',
+                              borderRight:
+                                cIdx < rangeCols.length - 1
+                                  ? `1px solid ${palette.cellBorder}`
+                                  : 'none',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {formatTierRangeLabel(col, cat.unit)}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((offer, idx) => (
                         <tr
-                          key={row.offer.id}
+                          key={offer.id}
                           style={{
                             backgroundColor: '#ffffff',
                             borderBottom:
-                              gIdx === groupedPisoRows.length - 1 && idx === group.items.length - 1
-                                ? 'none'
-                                : `1px solid ${palette.cellBorder}`,
+                              idx === rows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
                           }}
                         >
                           <td
@@ -563,566 +779,186 @@ export const PromocaoFolhaDivulgacao: React.FC<PromocaoFolhaDivulgacaoProps> = (
                               color: palette.text,
                               borderRight: `1px solid ${palette.cellBorder}`,
                               textAlign: 'left',
-                              wordBreak: 'break-word',
+                              whiteSpace: 'nowrap',
                             }}
                           >
-                            {row.description}
+                            {offer.description}
+                            {offer.specs ? (
+                              <span style={{ fontWeight: 500, color: palette.mutedText }}>
+                                {' '}
+                                ({offer.specs})
+                              </span>
+                            ) : null}
                           </td>
-                          <td
-                            style={{
-                              padding: numCellPad,
-                              fontSize: bodyFontSize,
-                              fontWeight: 700,
-                              color: palette.text,
-                              borderRight: `1px solid ${palette.cellBorder}`,
-                              textAlign: 'center',
-                            }}
-                          >
-                            {row.metrics.availableBoxes}
-                          </td>
-                          <td
-                            style={{
-                              padding: numCellPad,
-                              fontSize: bodyFontSize,
-                              fontWeight: 700,
-                              color: palette.text,
-                              borderRight: `1px solid ${palette.cellBorder}`,
-                              textAlign: 'center',
-                            }}
-                          >
-                            {formatSqmBR(row.metrics.availableSqm)}
-                          </td>
-                          <td
-                            style={{
-                              padding: numCellPad,
-                              fontSize: bodyFontSize,
-                              fontWeight: 700,
-                              color: palette.text,
-                              textAlign: 'center',
-                            }}
-                          >
-                            {formatCurrencyBRL(row.priceSqm)}
-                          </td>
+                          {hasBasePrice && (
+                            <td
+                              style={{
+                                width: '1%',
+                                padding: numCellPad,
+                                fontSize: bodyFontSize,
+                                fontWeight: 700,
+                                color: palette.text,
+                                borderRight:
+                                  rangeCols.length > 0 ? `1px solid ${palette.cellBorder}` : 'none',
+                                textAlign: 'center',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {Number(offer.priceNormal) > 0
+                                ? formatCurrencyBRL(offer.priceNormal)
+                                : '—'}
+                            </td>
+                          )}
+                          {rangeCols.map((col, cIdx) => {
+                            const matched = (offer.tiers || []).find(
+                              (t) => getTierRangeSignature(t) === col.sig
+                            );
+                            return (
+                              <td
+                                key={col.sig}
+                                style={{
+                                  width: '1%',
+                                  padding: numCellPad,
+                                  fontSize: bodyFontSize,
+                                  fontWeight: 700,
+                                  color: palette.text,
+                                  borderRight:
+                                    cIdx < rangeCols.length - 1
+                                      ? `1px solid ${palette.cellBorder}`
+                                      : 'none',
+                                  textAlign: 'center',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {matched ? formatCurrencyBRL(matched.price) : '—'}
+                              </td>
+                            );
+                          })}
                         </tr>
                       ))}
-                    </React.Fragment>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            }
 
-          {/* 2. RODAPÉS */}
-          {rodapeRows.length > 0 && (
-            <div
-              style={{
-                border: `1.5px solid ${palette.primaryBorder}`,
-                borderRadius: '14px',
-                overflow: 'hidden',
-                backgroundColor: '#ffffff',
-                pageBreakInside: 'avoid',
-              }}
-            >
+            return (
               <div
+                key={cat.id}
                 style={{
-                  backgroundColor: palette.primary,
-                  color: '#ffffff',
-                  padding: headerPad,
-                  fontSize: headerFontSize,
-                  fontWeight: 800,
-                  letterSpacing: '0.03em',
-                  textTransform: 'uppercase',
+                  border: `1.5px solid ${palette.primaryBorder}`,
+                  borderRadius: '14px',
+                  overflow: 'hidden',
+                  backgroundColor: '#ffffff',
+                  pageBreakInside: 'avoid',
                 }}
               >
-                RODAPÉS
-              </div>
+                <div
+                  style={{
+                    backgroundColor: palette.primary,
+                    color: '#ffffff',
+                    padding: headerPad,
+                    fontSize: headerFontSize,
+                    fontWeight: 800,
+                    letterSpacing: '0.03em',
+                    textTransform: 'uppercase',
+                  }}
+                >
+                  {cat.label}
+                </div>
 
-              <table
-                style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  tableLayout: 'fixed',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <colgroup>
-                  <col style={{ width: '38%' }} />
-                  <col style={{ width: '14%' }} />
-                  <col style={{ width: '16%' }} />
-                  <col style={{ width: '16%' }} />
-                  <col style={{ width: '16%' }} />
-                </colgroup>
-                <thead>
-                  <tr
-                    style={{
-                      background: palette.subHeaderBg,
-                      borderBottom: `1px solid ${palette.subHeaderBorder}`,
-                    }}
-                  >
-                    <th
+                <table
+                  style={{
+                    width: '100%',
+                    borderCollapse: 'collapse',
+                    tableLayout: 'auto',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  <thead>
+                    <tr
                       style={{
-                        padding: cellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
+                        background: palette.subHeaderBg,
+                        borderBottom: `1px solid ${palette.subHeaderBorder}`,
                       }}
                     >
-                      Descrição
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Preço
-                    </th>
-                    {rodapeQuantities.map((qty, idx) => (
                       <th
-                        key={`rod_q_${idx}`}
                         style={{
+                          padding: cellPad,
+                          fontSize: thFontSize,
+                          fontWeight: 700,
+                          color: palette.text,
+                          textAlign: 'center',
+                          borderRight: `1px solid ${palette.cellBorder}`,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        Descrição
+                      </th>
+                      <th
+                        style={{
+                          width: '1%',
                           padding: numCellPad,
                           fontSize: thFontSize,
                           fontWeight: 700,
                           color: palette.text,
                           textAlign: 'center',
-                          borderRight: idx < 2 ? `1px solid ${palette.cellBorder}` : 'none',
+                          whiteSpace: 'nowrap',
                         }}
                       >
-                        + {qty} barras
+                        Preço ({cat.unit})
                       </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rodapeRows.map((offer, idx) => (
-                    <tr
-                      key={offer.id}
-                      style={{
-                        backgroundColor: '#ffffff',
-                        borderBottom:
-                          idx === rodapeRows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      <td
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((offer, idx) => (
+                      <tr
+                        key={offer.id}
                         style={{
-                          padding: cellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'left',
+                          backgroundColor: '#ffffff',
+                          borderBottom:
+                            idx === rows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
                         }}
                       >
-                        {offer.description}
-                      </td>
-                      <td
-                        style={{
-                          padding: numCellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'center',
-                        }}
-                      >
-                        {formatCurrencyBRL(offer.priceNormal)}
-                      </td>
-                      {[0, 1, 2].map((tIdx) => (
                         <td
-                          key={`rod_t_${tIdx}`}
                           style={{
+                            padding: cellPad,
+                            fontSize: bodyFontSize,
+                            fontWeight: 700,
+                            color: palette.text,
+                            borderRight: `1px solid ${palette.cellBorder}`,
+                            textAlign: 'left',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {offer.description}
+                          {offer.specs ? (
+                            <span style={{ fontWeight: 500, color: palette.mutedText }}>
+                              {' '}
+                              ({offer.specs})
+                            </span>
+                          ) : null}
+                        </td>
+                        <td
+                          style={{
+                            width: '1%',
                             padding: numCellPad,
                             fontSize: bodyFontSize,
                             fontWeight: 700,
                             color: palette.text,
-                            borderRight: tIdx < 2 ? `1px solid ${palette.cellBorder}` : 'none',
                             textAlign: 'center',
+                            whiteSpace: 'nowrap',
                           }}
                         >
-                          {formatCurrencyBRL(getTierPrice(offer, tIdx, rodapeQuantities))}
+                          {formatCurrencyBRL(getOfferUnitPrice(offer, cat))}
                         </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* 3. RIPADOS */}
-          {ripadoRows.length > 0 && (
-            <div
-              style={{
-                border: `1.5px solid ${palette.primaryBorder}`,
-                borderRadius: '14px',
-                overflow: 'hidden',
-                backgroundColor: '#ffffff',
-                pageBreakInside: 'avoid',
-              }}
-            >
-              <div
-                style={{
-                  backgroundColor: palette.primary,
-                  color: '#ffffff',
-                  padding: headerPad,
-                  fontSize: headerFontSize,
-                  fontWeight: 800,
-                  letterSpacing: '0.03em',
-                  textTransform: 'uppercase',
-                }}
-              >
-                RIPADOS
-              </div>
-
-              <table
-                style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  tableLayout: 'fixed',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <colgroup>
-                  <col style={{ width: '38%' }} />
-                  <col style={{ width: '14%' }} />
-                  <col style={{ width: '16%' }} />
-                  <col style={{ width: '16%' }} />
-                  <col style={{ width: '16%' }} />
-                </colgroup>
-                <thead>
-                  <tr
-                    style={{
-                      background: palette.subHeaderBg,
-                      borderBottom: `1px solid ${palette.subHeaderBorder}`,
-                    }}
-                  >
-                    <th
-                      style={{
-                        padding: cellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Descrição
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Preço
-                    </th>
-                    {ripadoQuantities.map((qty, idx) => (
-                      <th
-                        key={`rip_q_${idx}`}
-                        style={{
-                          padding: numCellPad,
-                          fontSize: thFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          textAlign: 'center',
-                          borderRight: idx < 2 ? `1px solid ${palette.cellBorder}` : 'none',
-                        }}
-                      >
-                        + {qty} barras
-                      </th>
+                      </tr>
                     ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {ripadoRows.map((offer, idx) => (
-                    <tr
-                      key={offer.id}
-                      style={{
-                        backgroundColor: '#ffffff',
-                        borderBottom:
-                          idx === ripadoRows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      <td
-                        style={{
-                          padding: cellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'left',
-                        }}
-                      >
-                        {offer.description}
-                        {offer.specs ? (
-                          <span style={{ fontWeight: 500, color: palette.mutedText }}>
-                            {' '}
-                            ({offer.specs})
-                          </span>
-                        ) : null}
-                      </td>
-                      <td
-                        style={{
-                          padding: numCellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'center',
-                        }}
-                      >
-                        {formatCurrencyBRL(offer.priceNormal)}
-                      </td>
-                      {[0, 1, 2].map((tIdx) => (
-                        <td
-                          key={`rip_t_${tIdx}`}
-                          style={{
-                            padding: numCellPad,
-                            fontSize: bodyFontSize,
-                            fontWeight: 700,
-                            color: palette.text,
-                            borderRight: tIdx < 2 ? `1px solid ${palette.cellBorder}` : 'none',
-                            textAlign: 'center',
-                          }}
-                        >
-                          {formatCurrencyBRL(getTierPrice(offer, tIdx, ripadoQuantities))}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* 4. TETO VINÍLICO */}
-          {tetoRows.length > 0 && (
-            <div
-              style={{
-                border: `1.5px solid ${palette.primaryBorder}`,
-                borderRadius: '14px',
-                overflow: 'hidden',
-                backgroundColor: '#ffffff',
-                pageBreakInside: 'avoid',
-              }}
-            >
-              <div
-                style={{
-                  backgroundColor: palette.primary,
-                  color: '#ffffff',
-                  padding: headerPad,
-                  fontSize: headerFontSize,
-                  fontWeight: 800,
-                  letterSpacing: '0.03em',
-                  textTransform: 'uppercase',
-                }}
-              >
-                TETO VINÍLICO
+                  </tbody>
+                </table>
               </div>
-
-              <table
-                style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  tableLayout: 'fixed',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <colgroup>
-                  <col style={{ width: '74%' }} />
-                  <col style={{ width: '26%' }} />
-                </colgroup>
-                <thead>
-                  <tr
-                    style={{
-                      background: palette.subHeaderBg,
-                      borderBottom: `1px solid ${palette.subHeaderBorder}`,
-                    }}
-                  >
-                    <th
-                      style={{
-                        padding: cellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Descrição
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                      }}
-                    >
-                      Preço (m²)
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {tetoRows.map((offer, idx) => (
-                    <tr
-                      key={offer.id}
-                      style={{
-                        backgroundColor: '#ffffff',
-                        borderBottom:
-                          idx === tetoRows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      <td
-                        style={{
-                          padding: cellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'left',
-                        }}
-                      >
-                        {offer.description}
-                      </td>
-                      <td
-                        style={{
-                          padding: numCellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          textAlign: 'center',
-                        }}
-                      >
-                        {formatCurrencyBRL(offer.priceSqm)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* 5. OUTROS PRODUTOS */}
-          {outroRows.length > 0 && (
-            <div
-              style={{
-                border: `1.5px solid ${palette.primaryBorder}`,
-                borderRadius: '14px',
-                overflow: 'hidden',
-                backgroundColor: '#ffffff',
-                pageBreakInside: 'avoid',
-              }}
-            >
-              <div
-                style={{
-                  backgroundColor: palette.primary,
-                  color: '#ffffff',
-                  padding: headerPad,
-                  fontSize: headerFontSize,
-                  fontWeight: 800,
-                  letterSpacing: '0.03em',
-                  textTransform: 'uppercase',
-                }}
-              >
-                OUTROS PRODUTOS
-              </div>
-
-              <table
-                style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  tableLayout: 'fixed',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <colgroup>
-                  <col style={{ width: '74%' }} />
-                  <col style={{ width: '26%' }} />
-                </colgroup>
-                <thead>
-                  <tr
-                    style={{
-                      background: palette.subHeaderBg,
-                      borderBottom: `1px solid ${palette.subHeaderBorder}`,
-                    }}
-                  >
-                    <th
-                      style={{
-                        padding: cellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                        borderRight: `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      Descrição
-                    </th>
-                    <th
-                      style={{
-                        padding: numCellPad,
-                        fontSize: thFontSize,
-                        fontWeight: 700,
-                        color: palette.text,
-                        textAlign: 'center',
-                      }}
-                    >
-                      Preço
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {outroRows.map((offer, idx) => (
-                    <tr
-                      key={offer.id}
-                      style={{
-                        backgroundColor: '#ffffff',
-                        borderBottom:
-                          idx === outroRows.length - 1 ? 'none' : `1px solid ${palette.cellBorder}`,
-                      }}
-                    >
-                      <td
-                        style={{
-                          padding: cellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          borderRight: `1px solid ${palette.cellBorder}`,
-                          textAlign: 'left',
-                        }}
-                      >
-                        {offer.description}
-                      </td>
-                      <td
-                        style={{
-                          padding: numCellPad,
-                          fontSize: bodyFontSize,
-                          fontWeight: 700,
-                          color: palette.text,
-                          textAlign: 'center',
-                        }}
-                      >
-                        {formatCurrencyBRL(offer.price)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+            );
+          })}
 
         </div>
       </div>

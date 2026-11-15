@@ -114,7 +114,6 @@ interface ConfiguracoesScreenProps {
 }
 
 type TabType =
-  | 'Gestão de Usuários'
   | 'Notificações & Alertas'
   | 'Segurança & Acesso'
   | 'Mensagem WhatsApp'
@@ -207,8 +206,8 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
   const isDirector = isEderPerez(currentUserName);
   const canManageUsers = isDirector;
 
-  // Aba ativa: padrão "Gestão de Usuários"
-  const [activeTab, setActiveTab] = useState<TabType>('Gestão de Usuários');
+  // Aba ativa padrão
+  const [activeTab, setActiveTab] = useState<TabType>('Notificações & Alertas');
 
   // Feedback Toast flutuante
   const [toastMessage, setToastMessage] = useState<string>('');
@@ -1362,7 +1361,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
               Configurações
             </h1>
             <p className="text-sm text-slate-500 font-normal mt-0.5">
-              Gerencie usuários, notificações, alertas sonoros e segurança do sistema.
+              Gerencie notificações, alertas sonoros, mensagens e segurança do sistema.
             </p>
           </div>
         </div>
@@ -1372,7 +1371,6 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
       <div className="bg-white rounded-2xl border border-slate-200 p-2 sm:p-2.5 shadow-xs flex items-center gap-1.5 overflow-x-auto select-none custom-scrollbar">
         {(
           [
-            { id: 'Gestão de Usuários', label: 'Gestão de Usuários', icon: Users },
             { id: 'Notificações & Alertas', label: 'Notificações & Alertas', icon: Bell },
             { id: 'Segurança & Acesso', label: 'Segurança & Acesso', icon: Shield },
             { id: 'Mensagem WhatsApp', label: 'Mensagem WhatsApp', icon: MessageSquare },
@@ -1398,212 +1396,7 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         })}
       </div>
 
-      {/* 3. CONTEÚDO DA ABA 1: GESTÃO DE USUÁRIOS */}
-      {activeTab === 'Gestão de Usuários' && (
-        <div className="space-y-4 animate-in fade-in duration-200">
-          {!isDirector && (
-            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 flex items-center gap-3 text-xs text-slate-600">
-              <Shield className="w-4 h-4 text-slate-400 flex-shrink-0" />
-              <span>
-                Visualização do quadro de colaboradores. A alteração de acessos, senhas e logins de outros colaboradores é restrita ao <strong>Diretor Eder Perez</strong>.
-              </span>
-            </div>
-          )}
-
-          {/* Barra superior com campo de busca e botão "+ Novo Usuário" */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="relative flex-1 max-w-md">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type="text"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="Buscar por nome, e-mail ou cargo..."
-                className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs sm:text-sm text-slate-800 bg-slate-50/70 focus:bg-white focus:outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-blue-500/10 transition-all font-medium"
-              />
-              {searchTerm && (
-                <button
-                  type="button"
-                  onClick={() => setSearchTerm('')}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs"
-                >
-                  Limpar
-                </button>
-              )}
-            </div>
-
-            {canManageUsers && (
-              <button
-                type="button"
-                onClick={handleOpenNewUser}
-                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-[#1D4ED8] hover:bg-[#1e40af] text-white text-xs sm:text-sm font-semibold shadow-sm hover:shadow transition-all cursor-pointer flex-shrink-0"
-              >
-                <UserPlus className="w-4 h-4 stroke-[2.5]" />
-                <span>Novo Usuário</span>
-              </button>
-            )}
-          </div>
-
-          {/* Tabela em Card Branco */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs sm:text-sm border-collapse">
-                <thead>
-                  <tr className="bg-slate-50/80 border-b border-slate-200 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-                    <th className="py-3.5 px-4 sm:px-6">Usuário</th>
-                    <th className="py-3.5 px-4">Cargo / Função</th>
-                    <th className="py-3.5 px-4">Acesso ao Sistema</th>
-                    <th className="py-3.5 px-4 text-center">Status</th>
-                    <th className="py-3.5 px-4 sm:px-6 text-right">Ações</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredUsers.length === 0 ? (
-                    <tr>
-                      <td colSpan={5} className="py-12 text-center text-slate-400 text-sm">
-                        Nenhum usuário encontrado para a busca realizada.
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredUsers.map((user) => {
-                      const isTargetDirector = user.cargo === 'Diretor' || user.nome.toLowerCase().includes('eder');
-                      const canManageThisUser = isDirector;
-
-                      return (
-                        <tr
-                          key={user.id}
-                          className="hover:bg-slate-50/60 transition-colors group"
-                        >
-                          {/* Usuário (Avatar Oficial + Nome e E-mail) */}
-                          <td className="py-3.5 px-4 sm:px-6">
-                            <div className="flex items-center gap-3">
-                              <UserAvatar
-                                userName={user.nome}
-                                avatarColor={(user as any).avatarColor}
-                                size="sm"
-                                className="shadow-xs"
-                              />
-                              <div>
-                                <div className="font-bold text-slate-900 leading-tight flex items-center gap-1.5">
-                                  <span>{user.nome}</span>
-                                  {isTargetDirector && (
-                                    <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-100 text-amber-800 font-bold border border-amber-200">
-                                      👑 Diretor
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-xs text-slate-500 font-normal">
-                                  {user.email}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
-
-                          {/* Cargo / Função */}
-                          <td className="py-3.5 px-4 font-medium text-slate-700">
-                            {user.cargo}
-                          </td>
-
-                          {/* Acesso ao Sistema */}
-                          <td className="py-3.5 px-4">
-                            <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-blue-50 text-[#1D4ED8] border border-blue-200/80">
-                              {user.acesso}
-                            </span>
-                          </td>
-
-                          {/* Status */}
-                          <td className="py-3.5 px-4 text-center">
-                            <span
-                              className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
-                                user.status === 'Ativo'
-                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                  : 'bg-slate-100 text-slate-600 border-slate-300'
-                              }`}
-                            >
-                              <span
-                                className={`w-1.5 h-1.5 rounded-full mr-1.5 ${
-                                  user.status === 'Ativo' ? 'bg-emerald-500' : 'bg-slate-400'
-                                }`}
-                              />
-                              {user.status}
-                            </span>
-                          </td>
-
-                          {/* Ações na linha */}
-                          <td className="py-3.5 px-4 sm:px-6 text-right">
-                            <div className="flex items-center justify-end gap-1.5">
-                              {canManageThisUser ? (
-                                <>
-                                  {/* Gerar/Redefinir Senha do Funcionário */}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenResetPassword(user)}
-                                    title={`Gerar/Alterar Senha de ${user.nome}`}
-                                    className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-blue-50 hover:border-blue-300 text-slate-600 hover:text-[#1D4ED8] transition-colors cursor-pointer shadow-2xs flex items-center gap-1 text-xs"
-                                  >
-                                    <KeyRound className="w-3.5 h-3.5" />
-                                    {isDirector && <span className="hidden xl:inline text-[11px] font-semibold">Senha</span>}
-                                  </button>
-
-                                  {/* Editar Login e Permissões */}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenEditUser(user)}
-                                    title={`Editar Login e Acessos de ${user.nome}`}
-                                    className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-amber-50 hover:border-amber-300 text-slate-600 hover:text-amber-700 transition-colors cursor-pointer shadow-2xs flex items-center gap-1 text-xs"
-                                  >
-                                    <Pencil className="w-3.5 h-3.5" />
-                                    {isDirector && <span className="hidden xl:inline text-[11px] font-semibold">Editar</span>}
-                                  </button>
-
-                                  {/* Excluir / Desativar (Apenas Diretor Eder Perez e não para si mesmo) */}
-                                  {isDirector && !isTargetDirector && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setDeleteConfirmModal({ isOpen: true, user })
-                                      }
-                                      title={`Desativar/Excluir ${user.nome}`}
-                                      className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-rose-50 hover:border-rose-300 text-slate-600 hover:text-rose-600 transition-colors cursor-pointer shadow-2xs"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                </>
-                              ) : (
-                                <span
-                                  title="Apenas o Diretor Eder Perez pode alterar este login"
-                                  className="p-1.5 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed inline-flex items-center gap-1 text-[11px]"
-                                >
-                                  <Lock className="w-3 h-3" />
-                                  <span className="hidden sm:inline">Bloqueado</span>
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Rodapé da tabela com contagem */}
-            <div className="bg-slate-50/50 px-4 sm:px-6 py-3 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
-              <span>
-                Mostrando <strong className="text-slate-700">{filteredUsers.length}</strong> de{' '}
-                <strong className="text-slate-700">{users.length}</strong> usuários cadastrados
-              </span>
-              <span className="text-[11px] text-slate-400">
-                Acessos e senhas controlados pela administração Fênix World
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 4. CONTEÚDO DA ABA 2: NOTIFICAÇÕES & ALERTAS */}
+      {/* 3. CONTEÚDO DA ABA: NOTIFICAÇÕES & ALERTAS */}
       {activeTab === 'Notificações & Alertas' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-xs space-y-7 animate-in fade-in duration-200 max-w-5xl">
           <div>

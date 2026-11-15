@@ -28,6 +28,7 @@ import {
   extractBarLengthFromProductName,
   formatRodapeDetailText,
   parseBarCountFromInput,
+  stripRodapeAutoDetail,
 } from '../utils/rodapeCalculator';
 import {
   convertBoxesToPisoSqm,

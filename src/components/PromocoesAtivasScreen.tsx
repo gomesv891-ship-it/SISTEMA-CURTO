@@ -28,10 +28,14 @@ import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import {
   PROMO_CATEGORIES,
+  PROMO_CATEGORY_UNITS,
   PROMO_MODALITIES,
   PromoCampaign,
   PromoCampaignStatus,
   PromoCategory,
+  PromoCategoryConfig,
+  PromoCategoryPricingType,
+  PromoCategoryUnit,
   PromoFloorLot,
   PromoLotGroup,
   PromoModality,
@@ -40,9 +44,12 @@ import {
   PromoSheetModel,
   PromoSheetSettings,
   PromoSubcategory,
+  PromoTierDefaultRange,
+  SEM_CATEGORIA_ID,
   buildDefaultLotGroupsForCampaign,
   canManagePromocoes,
   computeLotMetrics,
+  createDefaultPromoCategories,
   createEmptyConditionsByModality,
   createEmptyOffersByModality,
   createEmptyTierQuantitiesByModality,
@@ -56,11 +63,16 @@ import {
   formatCurrencyBRL,
   formatDateBR,
   formatSqmBR,
+  formatTierRangeLabel,
+  getCampaignCategories,
   getDefaultSheetSettings,
+  getOfferUnitPrice,
+  getTierRangeSignature,
   getTodayIsoDate,
   initializeLotGroupsInSupabase,
   parseNumberFlexible,
   parsePromocoesPayload,
+  pluralizePromoUnit,
   saveCampaignToSupabase,
   updateLotGroupInSupabase,
   updateLotStockInSupabase,
@@ -79,14 +91,6 @@ const AUDIENCE_ORDER: PromoModality[] = ['revenda', 'construtora', 'cliente_fina
 const ORDERED_MODALITIES = AUDIENCE_ORDER.map(
   (id) => PROMO_MODALITIES.find((m) => m.id === id)!
 );
-
-const FIXED_CATEGORIES: { id: PromoCategory; sidebarLabel: string; tableTitle: string }[] = [
-  { id: 'piso_vinilico', sidebarLabel: 'Piso Vinílico', tableTitle: 'Piso Vinílico' },
-  { id: 'rodapes', sidebarLabel: 'Rodapés', tableTitle: 'Rodapés' },
-  { id: 'ripados', sidebarLabel: 'Ripados', tableTitle: 'Ripados' },
-  { id: 'teto_vinilico', sidebarLabel: 'Teto Vinílico', tableTitle: 'Teto Vinílico' },
-  { id: 'outros', sidebarLabel: 'Outros', tableTitle: 'Outros Produtos' },
-];
 
 const SHEET_MODELS: { id: PromoSheetModel; label: string }[] = [
   { id: 'oficial_colorido', label: 'Oficial Fênix (Colorido)' },
@@ -161,6 +165,18 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
   const [editingSubId, setEditingSubId] = useState<string | null>(null);
   const [editingSubName, setEditingSubName] = useState('');
 
+  // Gerenciar Categorias (Adicionar / Editar / Excluir)
+  const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
+  const [editingCategory, setEditingCategory] = useState<PromoCategoryConfig | null>(null);
+  const [catFormName, setCatFormName] = useState('');
+  const [catFormUnit, setCatFormUnit] = useState<PromoCategoryUnit>('unidade');
+  const [catFormPricingType, setCatFormPricingType] = useState<PromoCategoryPricingType>('unitario');
+  const [catFormRanges, setCatFormRanges] = useState<
+    { id: string; minQty: string; maxQty: string }[]
+  >([]);
+  const [catFormError, setCatFormError] = useState<string | null>(null);
+  const [categoryToDelete, setCategoryToDelete] = useState<PromoCategoryConfig | null>(null);
+
   // Modal Cadastrar / Editar Oferta (por categoria)
   const [isOfferModalOpen, setIsOfferModalOpen] = useState(false);
   const [editingOffer, setEditingOffer] = useState<PromoOfferItem | null>(null);
@@ -170,34 +186,24 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
   const [offerDescription, setOfferDescription] = useState('');
   const [offerSpecs, setOfferSpecs] = useState('');
   const [offerActive, setOfferActive] = useState(true);
-  // Piso Vinílico
+  // Piso Vinílico (lotes)
   const [offerLotMode, setOfferLotMode] = useState<'new' | 'existing'>('new');
   const [offerExistingLotId, setOfferExistingLotId] = useState('');
   const [offerLotPattern, setOfferLotPattern] = useState('');
   const [offerLotThickness, setOfferLotThickness] = useState('');
   const [offerLotSqmPerBox, setOfferLotSqmPerBox] = useState('');
   const [offerLotInitialBoxes, setOfferLotInitialBoxes] = useState('');
-  const [offerPriceSqm, setOfferPriceSqm] = useState('');
-  // Rodapés / Ripados
+  // Preço unitário (m², ml, barra, régua, caixa, unidade, rolo, pacote)
+  const [offerUnitPrice, setOfferUnitPrice] = useState('');
+  // Preço escalonado (preço base opcional + N faixas min/max/preço)
   const [offerPriceNormal, setOfferPriceNormal] = useState('');
-  const [offerTier1Qty, setOfferTier1Qty] = useState('30');
-  const [offerTier1Price, setOfferTier1Price] = useState('');
-  const [offerTier2Qty, setOfferTier2Qty] = useState('50');
-  const [offerTier2Price, setOfferTier2Price] = useState('');
-  const [offerTier3Qty, setOfferTier3Qty] = useState('100');
-  const [offerTier3Price, setOfferTier3Price] = useState('');
-  // Outros Produtos
-  const [offerSimplePrice, setOfferSimplePrice] = useState('');
+  const [offerTiersForm, setOfferTiersForm] = useState<
+    { id: string; minQty: string; maxQty: string; price: string }[]
+  >([]);
   const [offerFormError, setOfferFormError] = useState<string | null>(null);
 
   // Picker de Produtos do CRM
   const [isCrmPickerOpen, setIsCrmPickerOpen] = useState(false);
-
-  // Modal Editar Quantidades das Faixas Progressivas (Rodapés / Ripados)
-  const [tierHeaderEditCat, setTierHeaderEditCat] = useState<'rodapes' | 'ripados' | null>(null);
-  const [tierHeaderQ1, setTierHeaderQ1] = useState('30');
-  const [tierHeaderQ2, setTierHeaderQ2] = useState('50');
-  const [tierHeaderQ3, setTierHeaderQ3] = useState('100');
 
   // Modal Copiar Oferta para Outros Públicos
   const [offerToReplicate, setOfferToReplicate] = useState<PromoOfferItem | null>(null);
@@ -435,17 +441,69 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     );
   }, [selectedCampaign, activeModality]);
 
+  const campaignCategories = useMemo(
+    () => getCampaignCategories(selectedCampaign),
+    [selectedCampaign]
+  );
+
+  const configuredCatIdSet = useMemo(
+    () => new Set(campaignCategories.map((c) => c.id)),
+    [campaignCategories]
+  );
+
+  const preservedOffersCountAllModalities = useMemo(() => {
+    if (!selectedCampaign) return 0;
+    return AUDIENCE_ORDER.reduce((sum, mod) => {
+      const list = selectedCampaign.offersByModality?.[mod] || [];
+      return (
+        sum +
+        list.filter((o) => o.category === SEM_CATEGORIA_ID || !configuredCatIdSet.has(o.category))
+          .length
+      );
+    }, 0);
+  }, [selectedCampaign, configuredCatIdSet]);
+
+  type SidebarCategoryItem = PromoCategoryConfig & { isVirtualPreserved?: boolean };
+
+  const sidebarCategories = useMemo<SidebarCategoryItem[]>(() => {
+    const base: SidebarCategoryItem[] = campaignCategories.map((c) => ({
+      ...c,
+      isVirtualPreserved: false,
+    }));
+    if (preservedOffersCountAllModalities > 0) {
+      base.push({
+        id: SEM_CATEGORIA_ID,
+        label: 'Sem Categoria',
+        unit: 'unidade',
+        pricingType: 'unitario',
+        order: 99999,
+        isVirtualPreserved: true,
+      });
+    }
+    return base;
+  }, [campaignCategories, preservedOffersCountAllModalities]);
+
   const activeCategoryOffers = useMemo(() => {
     const q = productSearch.trim().toLowerCase();
     return activeModalityOffers.filter((o) => {
-      if (o.category !== activeCategory) return false;
+      const belongs =
+        activeCategory === SEM_CATEGORIA_ID
+          ? o.category === SEM_CATEGORIA_ID || !configuredCatIdSet.has(o.category)
+          : o.category === activeCategory;
+      if (!belongs) return false;
       if (!q) return true;
       return (
         o.description.toLowerCase().includes(q) ||
         (o.specs || '').toLowerCase().includes(q)
       );
     });
-  }, [activeModalityOffers, activeCategory, productSearch]);
+  }, [activeModalityOffers, activeCategory, productSearch, configuredCatIdSet]);
+
+  useEffect(() => {
+    if (sidebarCategories.length > 0 && !sidebarCategories.some((c) => c.id === activeCategory)) {
+      setActiveCategory(sidebarCategories[0].id);
+    }
+  }, [sidebarCategories, activeCategory]);
 
   const sheetSettings = useMemo<PromoSheetSettings>(() => {
     if (!selectedCampaign) return getDefaultSheetSettings(true);
@@ -557,6 +615,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
           sheetSettings: getDefaultSheetSettings(true),
           conditionsByModality: createEmptyConditionsByModality(),
           tierQuantitiesByModality: createEmptyTierQuantitiesByModality(),
+          categories: createDefaultPromoCategories(),
           subcategories: [],
           lots: [],
           lotSales: [],
@@ -682,16 +741,235 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     );
   };
 
+  const openNewCategoryModal = () => {
+    setEditingCategory(null);
+    setCatFormName('');
+    setCatFormUnit('unidade');
+    setCatFormPricingType('unitario');
+    setCatFormRanges([
+      { id: `rng_${Date.now()}_1`, minQty: '1', maxQty: '29' },
+      { id: `rng_${Date.now()}_2`, minQty: '30', maxQty: '49' },
+      { id: `rng_${Date.now()}_3`, minQty: '50', maxQty: '99' },
+    ]);
+    setCatFormError(null);
+    setIsCategoryModalOpen(true);
+  };
+
+  const openEditCategoryModal = (cat: PromoCategoryConfig) => {
+    setEditingCategory(cat);
+    setCatFormName(cat.label);
+    setCatFormUnit(cat.unit);
+    setCatFormPricingType(cat.pricingType);
+    setCatFormRanges(
+      cat.defaultRanges && cat.defaultRanges.length > 0
+        ? cat.defaultRanges.map((r) => ({
+            id: r.id,
+            minQty: String(r.minQty),
+            maxQty: r.maxQty != null ? String(r.maxQty) : '',
+          }))
+        : [
+            { id: `rng_${Date.now()}_1`, minQty: '1', maxQty: '29' },
+            { id: `rng_${Date.now()}_2`, minQty: '30', maxQty: '49' },
+            { id: `rng_${Date.now()}_3`, minQty: '50', maxQty: '99' },
+          ]
+    );
+    setCatFormError(null);
+    setIsCategoryModalOpen(true);
+  };
+
+  const handleSaveCategoryModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCampaign) return;
+    const label = catFormName.trim();
+    if (!label) {
+      setCatFormError('Informe o nome da categoria.');
+      return;
+    }
+
+    const norm = label.toLowerCase();
+    if (
+      campaignCategories.some(
+        (c) => c.id !== editingCategory?.id && c.label.trim().toLowerCase() === norm
+      )
+    ) {
+      setCatFormError('Já existe uma categoria com esse nome.');
+      return;
+    }
+
+    let parsedRanges: PromoTierDefaultRange[] | undefined = undefined;
+    if (catFormPricingType === 'escalonado') {
+      if (catFormRanges.length === 0) {
+        setCatFormError('Adicione pelo menos uma faixa de quantidade para o preço escalonado.');
+        return;
+      }
+      const normalized: PromoTierDefaultRange[] = [];
+      for (let i = 0; i < catFormRanges.length; i++) {
+        const row = catFormRanges[i];
+        const minQty = Math.floor(Number(row.minQty));
+        if (!Number.isFinite(minQty) || minQty < 1) {
+          setCatFormError(`Faixa ${i + 1}: informe uma quantidade mínima válida (>= 1).`);
+          return;
+        }
+        const trimmedMax = row.maxQty.trim();
+        let maxQty: number | null = null;
+        if (trimmedMax !== '') {
+          const parsedMax = Math.floor(Number(trimmedMax));
+          if (!Number.isFinite(parsedMax) || parsedMax < minQty) {
+            setCatFormError(
+              `Faixa ${i + 1}: a quantidade máxima deve ser maior ou igual à mínima (${minQty}).`
+            );
+            return;
+          }
+          maxQty = parsedMax;
+        }
+        normalized.push({
+          id: row.id || `rng_${Date.now()}_${i}`,
+          minQty,
+          maxQty,
+        });
+      }
+      normalized.sort((a, b) => a.minQty - b.minQty);
+      parsedRanges = normalized;
+    }
+
+    const targetId =
+      editingCategory?.id || `cat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+    const nextCategoryConfig: PromoCategoryConfig = {
+      id: targetId,
+      label,
+      unit: catFormUnit,
+      pricingType: catFormPricingType,
+      ...(parsedRanges ? { defaultRanges: parsedRanges } : {}),
+      order: editingCategory ? editingCategory.order : campaignCategories.length,
+    };
+
+    const nextCategories: PromoCategoryConfig[] = editingCategory
+      ? campaignCategories.map((c) => (c.id === editingCategory.id ? nextCategoryConfig : c))
+      : [...campaignCategories, nextCategoryConfig];
+
+    const nextCustomCategories = (selectedCampaign.customCategories || []).map((c) =>
+      c.id === targetId
+        ? {
+            ...c,
+            label,
+            pricingType: (catFormUnit === 'm²' ? 'sqm' : 'simple') as 'sqm' | 'simple',
+          }
+        : c
+    );
+
+    const nextSheet: PromoSheetSettings = {
+      ...(selectedCampaign.sheetSettings || getDefaultSheetSettings(true)),
+      includedCategories: {
+        ...(selectedCampaign.sheetSettings?.includedCategories ||
+          getDefaultSheetSettings(true).includedCategories),
+        [targetId]:
+          editingCategory !== null
+            ? selectedCampaign.sheetSettings?.includedCategories?.[targetId] !== false
+            : true,
+      },
+    };
+
+    const ok = await persistCampaign(
+      {
+        ...selectedCampaign,
+        categories: nextCategories,
+        customCategories: nextCustomCategories,
+        sheetSettings: nextSheet,
+      },
+      editingCategory ? `Categoria "${label}" atualizada!` : `Categoria "${label}" adicionada!`
+    );
+
+    if (ok) {
+      setIsCategoryModalOpen(false);
+      setEditingCategory(null);
+      setActiveCategory(targetId);
+    }
+  };
+
+  const handleConfirmDeleteCategory = async () => {
+    if (!selectedCampaign || !categoryToDelete) return;
+    const targetId = categoryToDelete.id;
+    const targetLabel = categoryToDelete.label;
+
+    // Preserva todos os produtos vinculados em todos os públicos, movendo-os para 'sem_categoria'
+    const preservedOffersByModality = { ...selectedCampaign.offersByModality };
+    AUDIENCE_ORDER.forEach((mod) => {
+      preservedOffersByModality[mod] = (preservedOffersByModality[mod] || []).map((o) =>
+        o.category === targetId ? { ...o, category: SEM_CATEGORIA_ID } : o
+      );
+    });
+
+    const nextCategories = campaignCategories
+      .filter((c) => c.id !== targetId)
+      .map((c, idx) => ({ ...c, order: idx }));
+
+    const currentIncluded = {
+      ...(selectedCampaign.sheetSettings?.includedCategories ||
+        getDefaultSheetSettings(true).includedCategories),
+    };
+    delete currentIncluded[targetId];
+
+    const ok = await persistCampaign(
+      {
+        ...selectedCampaign,
+        categories: nextCategories,
+        customCategories: (selectedCampaign.customCategories || [])
+          .filter((c) => c.id !== targetId)
+          .map((c, idx) => ({ ...c, order: idx })),
+        offersByModality: preservedOffersByModality,
+        sheetSettings: selectedCampaign.sheetSettings
+          ? {
+              ...selectedCampaign.sheetSettings,
+              includedCategories: currentIncluded,
+            }
+          : undefined,
+      },
+      `Categoria "${targetLabel}" excluída. Os produtos vinculados foram preservados em Sem Categoria.`
+    );
+
+    setCategoryToDelete(null);
+    if (ok && activeCategory === targetId) {
+      setActiveCategory(nextCategories[0]?.id || SEM_CATEGORIA_ID);
+    }
+  };
+
+  const buildInitialTiersForm = (
+    cat?: PromoCategoryConfig,
+    existingTiers?: PromoProgressiveTier[],
+    fallbackPriceStr = ''
+  ) => {
+    if (existingTiers && existingTiers.length > 0) {
+      return existingTiers.map((t, idx) => ({
+        id: t.id || `tier_${Date.now()}_${idx}`,
+        minQty: String(t.minQty),
+        maxQty: t.maxQty != null ? String(t.maxQty) : '',
+        price: Number.isFinite(Number(t.price)) ? String(t.price) : fallbackPriceStr,
+      }));
+    }
+    if (cat?.defaultRanges && cat.defaultRanges.length > 0) {
+      return cat.defaultRanges.map((r, idx) => ({
+        id: r.id || `tier_${Date.now()}_${idx}`,
+        minQty: String(r.minQty),
+        maxQty: r.maxQty != null ? String(r.maxQty) : '',
+        price: fallbackPriceStr,
+      }));
+    }
+    return [
+      { id: `tier_${Date.now()}_1`, minQty: '1', maxQty: '29', price: fallbackPriceStr },
+      { id: `tier_${Date.now()}_2`, minQty: '30', maxQty: '49', price: fallbackPriceStr },
+      { id: `tier_${Date.now()}_3`, minQty: '50', maxQty: '99', price: fallbackPriceStr },
+    ];
+  };
+
   const openNewOfferModal = (category: PromoCategory) => {
     if (!selectedCampaign) return;
-    const tq = selectedCampaign.tierQuantitiesByModality?.[activeModality] || {
-      rodapes: [30, 50, 100],
-      ripados: [30, 50, 100],
-    };
-    const qArr = category === 'ripados' ? tq.ripados : tq.rodapes;
+    const resolvedCatId =
+      category === SEM_CATEGORIA_ID ? campaignCategories[0]?.id || SEM_CATEGORIA_ID : category;
+    const catConfig = campaignCategories.find((c) => c.id === resolvedCatId);
 
     setEditingOffer(null);
-    setOfferCategory(category);
+    setOfferCategory(resolvedCatId);
     setOfferSubcategoryId('');
     setOfferCrmProductId(undefined);
     setOfferDescription('');
@@ -703,59 +981,53 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     setOfferLotThickness('');
     setOfferLotSqmPerBox('');
     setOfferLotInitialBoxes('');
-    setOfferPriceSqm('');
+    setOfferUnitPrice('');
     setOfferPriceNormal('');
-    setOfferTier1Qty(String(qArr[0]));
-    setOfferTier1Price('');
-    setOfferTier2Qty(String(qArr[1]));
-    setOfferTier2Price('');
-    setOfferTier3Qty(String(qArr[2]));
-    setOfferTier3Price('');
-    setOfferSimplePrice('');
+    setOfferTiersForm(buildInitialTiersForm(catConfig));
     setOfferFormError(null);
     setIsOfferModalOpen(true);
   };
 
   const openEditOfferModal = (offer: PromoOfferItem) => {
     if (!selectedCampaign) return;
-    const tq = selectedCampaign.tierQuantitiesByModality?.[activeModality] || {
-      rodapes: [30, 50, 100],
-      ripados: [30, 50, 100],
-    };
-    const qArr = offer.category === 'ripados' ? tq.ripados : tq.rodapes;
+    const resolvedCatId = configuredCatIdSet.has(offer.category)
+      ? offer.category
+      : SEM_CATEGORIA_ID;
+    const catConfig = campaignCategories.find((c) => c.id === resolvedCatId);
     const linkedLot = offer.lotId
       ? selectedCampaign.lots.find((l) => l.id === offer.lotId)
       : undefined;
 
     setEditingOffer(offer);
-    setOfferCategory(offer.category);
+    setOfferCategory(resolvedCatId);
     setOfferSubcategoryId(offer.subcategoryId || linkedLot?.subcategoryId || '');
     setOfferCrmProductId(offer.crmProductId);
     setOfferDescription(offer.description);
     setOfferSpecs(offer.specs || '');
     setOfferActive(offer.active !== false);
 
-    if (offer.category === 'piso_vinilico') {
-      setOfferLotMode('existing');
-      setOfferExistingLotId(linkedLot?.id || '');
-      setOfferLotPattern(linkedLot?.pattern || '');
-      setOfferLotThickness(linkedLot?.thickness || '');
-      setOfferLotSqmPerBox(linkedLot ? String(linkedLot.sqmPerBox) : '');
-      setOfferLotInitialBoxes(linkedLot ? String(linkedLot.initialBoxes) : '');
-      setOfferPriceSqm(offer.priceSqm !== undefined ? String(offer.priceSqm) : '');
-    } else if (offer.category === 'rodapes' || offer.category === 'ripados') {
-      setOfferPriceNormal(offer.priceNormal !== undefined ? String(offer.priceNormal) : '');
-      setOfferTier1Qty(String(offer.tiers?.[0]?.minQty || qArr[0]));
-      setOfferTier1Price(offer.tiers?.[0] ? String(offer.tiers[0].price) : '');
-      setOfferTier2Qty(String(offer.tiers?.[1]?.minQty || qArr[1]));
-      setOfferTier2Price(offer.tiers?.[1] ? String(offer.tiers[1].price) : '');
-      setOfferTier3Qty(String(offer.tiers?.[2]?.minQty || qArr[2]));
-      setOfferTier3Price(offer.tiers?.[2] ? String(offer.tiers[2].price) : '');
-    } else if (offer.category === 'teto_vinilico') {
-      setOfferPriceSqm(offer.priceSqm !== undefined ? String(offer.priceSqm) : '');
-    } else {
-      setOfferSimplePrice(offer.price !== undefined ? String(offer.price) : '');
-    }
+    setOfferLotMode('existing');
+    setOfferExistingLotId(linkedLot?.id || '');
+    setOfferLotPattern(linkedLot?.pattern || '');
+    setOfferLotThickness(linkedLot?.thickness || '');
+    setOfferLotSqmPerBox(linkedLot ? String(linkedLot.sqmPerBox) : '');
+    setOfferLotInitialBoxes(linkedLot ? String(linkedLot.initialBoxes) : '');
+
+    const currentUnitPrice = getOfferUnitPrice(offer, catConfig);
+    const fallbackUnitStr =
+      currentUnitPrice > 0
+        ? String(currentUnitPrice)
+        : offer.tiers?.[0]?.price
+        ? String(offer.tiers[0].price)
+        : '';
+
+    setOfferUnitPrice(fallbackUnitStr);
+    setOfferPriceNormal(
+      offer.priceNormal !== undefined && Number(offer.priceNormal) > 0
+        ? String(offer.priceNormal)
+        : ''
+    );
+    setOfferTiersForm(buildInitialTiersForm(catConfig, offer.tiers, fallbackUnitStr));
 
     setOfferFormError(null);
     setIsOfferModalOpen(true);
@@ -770,15 +1042,15 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     setIsCrmPickerOpen(false);
     if (!selectedCampaign) return;
 
-    const cat = activeCategory;
-    const tq = selectedCampaign.tierQuantitiesByModality?.[activeModality] || {
-      rodapes: [30, 50, 100],
-      ripados: [30, 50, 100],
-    };
-    const qArr = cat === 'ripados' ? tq.ripados : tq.rodapes;
+    const resolvedCatId =
+      activeCategory === SEM_CATEGORIA_ID
+        ? campaignCategories[0]?.id || SEM_CATEGORIA_ID
+        : activeCategory;
+    const catConfig = campaignCategories.find((c) => c.id === resolvedCatId);
+    const suggestedStr = payload.suggestedPrice > 0 ? payload.suggestedPrice.toFixed(2) : '';
 
     setEditingOffer(null);
-    setOfferCategory(cat);
+    setOfferCategory(resolvedCatId);
     setOfferSubcategoryId('');
     setOfferCrmProductId(payload.crmProduct.id);
     setOfferDescription(payload.crmProduct.name);
@@ -790,15 +1062,9 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     setOfferLotThickness('');
     setOfferLotSqmPerBox(payload.extractedSqmPerBox > 0 ? String(payload.extractedSqmPerBox) : '');
     setOfferLotInitialBoxes('');
-    setOfferPriceSqm(payload.suggestedPrice > 0 ? payload.suggestedPrice.toFixed(2) : '');
-    setOfferPriceNormal(payload.suggestedPrice > 0 ? payload.suggestedPrice.toFixed(2) : '');
-    setOfferTier1Qty(String(qArr[0]));
-    setOfferTier1Price('');
-    setOfferTier2Qty(String(qArr[1]));
-    setOfferTier2Price('');
-    setOfferTier3Qty(String(qArr[2]));
-    setOfferTier3Price('');
-    setOfferSimplePrice(payload.suggestedPrice > 0 ? payload.suggestedPrice.toFixed(2) : '');
+    setOfferUnitPrice(suggestedStr);
+    setOfferPriceNormal(suggestedStr);
+    setOfferTiersForm(buildInitialTiersForm(catConfig, undefined, ''));
     setOfferFormError(null);
     setIsOfferModalOpen(true);
   };
@@ -813,14 +1079,19 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       return;
     }
 
+    const catConfig = campaignCategories.find((c) => c.id === offerCategory);
+    const effectivePricingType: PromoCategoryPricingType = catConfig?.pricingType || 'unitario';
+    const effectiveUnit: PromoCategoryUnit = catConfig?.unit || 'unidade';
+    const isSpecialPisoLot = offerCategory === 'piso_vinilico' && effectivePricingType === 'unitario';
+
     const nowIso = new Date().toISOString();
     let updatedLots = [...selectedCampaign.lots];
     let linkedLotId: string | undefined = undefined;
 
-    if (offerCategory === 'piso_vinilico') {
-      const priceSqm = parseNumberFlexible(offerPriceSqm);
-      if (priceSqm <= 0) {
-        setOfferFormError('Informe um preço promocional (R$/m²) válido maior que zero.');
+    if (isSpecialPisoLot) {
+      const unitVal = parseNumberFlexible(offerUnitPrice);
+      if (unitVal <= 0) {
+        setOfferFormError(`Informe um preço promocional (R$/${effectiveUnit}) válido maior que zero.`);
         return;
       }
 
@@ -892,7 +1163,8 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
     const currentList = selectedCampaign.offersByModality?.[activeModality] || [];
     let newOffer: PromoOfferItem;
 
-    if (offerCategory === 'piso_vinilico') {
+    if (isSpecialPisoLot) {
+      const unitVal = parseNumberFlexible(offerUnitPrice);
       newOffer = {
         id: editingOffer?.id || `off_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         category: 'piso_vinilico',
@@ -902,92 +1174,87 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
         description: desc,
         active: offerActive,
         order: editingOffer?.order ?? currentList.length,
-        priceSqm: parseNumberFlexible(offerPriceSqm),
+        priceSqm: unitVal,
+        price: unitVal,
       };
-    } else if (offerCategory === 'rodapes' || offerCategory === 'ripados') {
-      const normal = parseNumberFlexible(offerPriceNormal);
-      if (normal <= 0) {
-        setOfferFormError('Informe o preço normal válido.');
+    } else if (effectivePricingType === 'escalonado') {
+      if (offerTiersForm.length === 0) {
+        setOfferFormError('Adicione pelo menos uma faixa de quantidade e preço.');
         return;
       }
-      const q1 = Math.max(1, Math.floor(parseNumberFlexible(offerTier1Qty) || 30));
-      const q2 = Math.max(1, Math.floor(parseNumberFlexible(offerTier2Qty) || 50));
-      const q3 = Math.max(1, Math.floor(parseNumberFlexible(offerTier3Qty) || 100));
-      const p1 = parseNumberFlexible(offerTier1Price) || normal;
-      const p2 = parseNumberFlexible(offerTier2Price) || p1;
-      const p3 = parseNumberFlexible(offerTier3Price) || p2;
 
-      const tiers: PromoProgressiveTier[] = [
-        { minQty: q1, price: p1 },
-        { minQty: q2, price: p2 },
-        { minQty: q3, price: p3 },
-      ];
+      const parsedTiers: PromoProgressiveTier[] = [];
+      for (let i = 0; i < offerTiersForm.length; i++) {
+        const row = offerTiersForm[i];
+        const minQty = Math.floor(Number(row.minQty));
+        if (!Number.isFinite(minQty) || minQty < 1) {
+          setOfferFormError(`Faixa ${i + 1}: informe uma quantidade mínima válida (>= 1).`);
+          return;
+        }
+        const trimmedMax = row.maxQty.trim();
+        let maxQty: number | null = null;
+        if (trimmedMax !== '') {
+          const parsedMax = Math.floor(Number(trimmedMax));
+          if (!Number.isFinite(parsedMax) || parsedMax < minQty) {
+            setOfferFormError(
+              `Faixa ${i + 1}: a quantidade máxima deve ser >= mínima (${minQty}).`
+            );
+            return;
+          }
+          maxQty = parsedMax;
+        }
+        const tierPrice = parseNumberFlexible(row.price);
+        if (tierPrice <= 0) {
+          setOfferFormError(`Faixa ${i + 1}: informe um preço válido maior que zero.`);
+          return;
+        }
+        parsedTiers.push({
+          id: row.id || `tier_${Date.now()}_${i}`,
+          minQty,
+          maxQty,
+          price: tierPrice,
+        });
+      }
+      parsedTiers.sort((a, b) => a.minQty - b.minQty);
 
+      const normalVal = parseNumberFlexible(offerPriceNormal);
       newOffer = {
         id: editingOffer?.id || `off_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         category: offerCategory,
         subcategoryId: offerSubcategoryId || undefined,
         crmProductId: offerCrmProductId,
         description: desc,
-        specs: offerCategory === 'ripados' ? offerSpecs.trim() || undefined : undefined,
+        specs: offerSpecs.trim() || undefined,
         active: offerActive,
         order: editingOffer?.order ?? currentList.length,
-        priceNormal: normal,
-        tiers,
-      };
-    } else if (offerCategory === 'teto_vinilico') {
-      const priceSqm = parseNumberFlexible(offerPriceSqm);
-      if (priceSqm <= 0) {
-        setOfferFormError('Informe um preço promocional (R$/m²) válido maior que zero.');
-        return;
-      }
-      newOffer = {
-        id: editingOffer?.id || `off_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        category: 'teto_vinilico',
-        subcategoryId: offerSubcategoryId || undefined,
-        crmProductId: offerCrmProductId,
-        description: desc,
-        active: offerActive,
-        order: editingOffer?.order ?? currentList.length,
-        priceSqm,
+        ...(normalVal > 0 ? { priceNormal: normalVal } : {}),
+        tiers: parsedTiers,
       };
     } else {
-      const priceVal = parseNumberFlexible(offerSimplePrice);
-      if (priceVal <= 0) {
-        setOfferFormError('Informe o preço promocional válido.');
+      const unitVal = parseNumberFlexible(offerUnitPrice);
+      if (unitVal <= 0) {
+        setOfferFormError(
+          `Informe o preço promocional (R$/${effectiveUnit}) válido maior que zero.`
+        );
         return;
       }
       newOffer = {
         id: editingOffer?.id || `off_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        category: 'outros',
+        category: offerCategory,
         subcategoryId: offerSubcategoryId || undefined,
         crmProductId: offerCrmProductId,
         description: desc,
+        specs: offerSpecs.trim() || undefined,
         active: offerActive,
         order: editingOffer?.order ?? currentList.length,
-        price: priceVal,
+        price: unitVal,
+        ...(effectiveUnit === 'm²' ? { priceSqm: unitVal } : {}),
       };
     }
 
     const updatedOffersList = editingOffer
       ? currentList.map((o) => (o.id === newOffer.id ? newOffer : o))
       : [...currentList, newOffer];
-
-    let nextTQs = { ...selectedCampaign.tierQuantitiesByModality };
-    if ((offerCategory === 'rodapes' || offerCategory === 'ripados') && newOffer.tiers) {
-      const qTuple: [number, number, number] = [
-        newOffer.tiers[0].minQty,
-        newOffer.tiers[1].minQty,
-        newOffer.tiers[2].minQty,
-      ];
-      nextTQs = {
-        ...nextTQs,
-        [activeModality]: {
-          ...nextTQs[activeModality],
-          [offerCategory]: qTuple,
-        },
-      };
-    }
 
     const baseSheet = selectedCampaign.sheetSettings || getDefaultSheetSettings(true);
     const shouldAutoShowSub =
@@ -999,7 +1266,6 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       {
         ...selectedCampaign,
         lots: updatedLots,
-        tierQuantitiesByModality: nextTQs,
         showSubcategoriesOnSheet: shouldAutoShowSub
           ? true
           : selectedCampaign.showSubcategoriesOnSheet,
@@ -1078,47 +1344,6 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       },
       'Produto removido deste público.'
     );
-  };
-
-  const handleSaveTierQuantities = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedCampaign || !tierHeaderEditCat) return;
-    const q1 = Math.max(1, Math.floor(parseNumberFlexible(tierHeaderQ1) || 30));
-    const q2 = Math.max(1, Math.floor(parseNumberFlexible(tierHeaderQ2) || 50));
-    const q3 = Math.max(1, Math.floor(parseNumberFlexible(tierHeaderQ3) || 100));
-    const nextTuple: [number, number, number] = [q1, q2, q3];
-
-    const updatedOffers = (selectedCampaign.offersByModality?.[activeModality] || []).map((o) => {
-      if (o.category !== tierHeaderEditCat) return o;
-      const oldTiers = o.tiers || [];
-      return {
-        ...o,
-        tiers: [
-          { minQty: q1, price: oldTiers[0]?.price ?? o.priceNormal ?? 0 },
-          { minQty: q2, price: oldTiers[1]?.price ?? o.priceNormal ?? 0 },
-          { minQty: q3, price: oldTiers[2]?.price ?? o.priceNormal ?? 0 },
-        ],
-      };
-    });
-
-    const ok = await persistCampaign(
-      {
-        ...selectedCampaign,
-        tierQuantitiesByModality: {
-          ...selectedCampaign.tierQuantitiesByModality,
-          [activeModality]: {
-            ...selectedCampaign.tierQuantitiesByModality[activeModality],
-            [tierHeaderEditCat]: nextTuple,
-          },
-        },
-        offersByModality: {
-          ...selectedCampaign.offersByModality,
-          [activeModality]: updatedOffers,
-        },
-      },
-      'Faixas progressivas atualizadas.'
-    );
-    if (ok) setTierHeaderEditCat(null);
   };
 
   const handleOpenReplicateOffer = (offer: PromoOfferItem) => {
@@ -1733,15 +1958,47 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
 
   const activeModalityLabel =
     PROMO_MODALITIES.find((m) => m.id === activeModality)?.shortLabel || 'Revenda';
-  const activeCategoryMeta =
-    FIXED_CATEGORIES.find((c) => c.id === activeCategory) || FIXED_CATEGORIES[0];
+  const activeCategoryMeta: SidebarCategoryItem = sidebarCategories.find(
+    (c) => c.id === activeCategory
+  ) ||
+    sidebarCategories[0] || {
+      id: SEM_CATEGORIA_ID,
+      label: 'Sem Categoria',
+      unit: 'unidade',
+      pricingType: 'unitario',
+      order: 99999,
+      isVirtualPreserved: true,
+    };
 
-  const tqActive =
-    activeCategory === 'rodapes'
-      ? selectedCampaign?.tierQuantitiesByModality?.[activeModality]?.rodapes || [30, 50, 100]
-      : activeCategory === 'ripados'
-      ? selectedCampaign?.tierQuantitiesByModality?.[activeModality]?.ripados || [30, 50, 100]
-      : null;
+  const activeCategoryTierCols = useMemo(() => {
+    if (activeCategoryMeta.pricingType !== 'escalonado') return [];
+    const rangeMap = new Map<string, { sig: string; minQty: number; maxQty?: number | null }>();
+    (activeCategoryMeta.defaultRanges || []).forEach((r) => {
+      const sig = getTierRangeSignature(r);
+      if (!rangeMap.has(sig)) {
+        rangeMap.set(sig, { sig, minQty: r.minQty, maxQty: r.maxQty ?? null });
+      }
+    });
+    activeCategoryOffers.forEach((offer) => {
+      (offer.tiers || []).forEach((t) => {
+        const sig = getTierRangeSignature(t);
+        if (!rangeMap.has(sig)) {
+          rangeMap.set(sig, { sig, minQty: t.minQty, maxQty: t.maxQty ?? null });
+        }
+      });
+    });
+    return Array.from(rangeMap.values()).sort((a, b) => {
+      if (a.minQty !== b.minQty) return a.minQty - b.minQty;
+      return (a.maxQty ?? Infinity) - (b.maxQty ?? Infinity);
+    });
+  }, [activeCategoryMeta, activeCategoryOffers]);
+
+  const activeCategoryShowBaseCol = useMemo(
+    () =>
+      activeCategoryMeta.pricingType === 'escalonado' &&
+      activeCategoryOffers.some((o) => Number(o.priceNormal) > 0),
+    [activeCategoryMeta.pricingType, activeCategoryOffers]
+  );
 
   return (
     <div className="w-full max-w-[1760px] mx-auto px-3 sm:px-6 lg:px-8 pt-5 pb-12 space-y-5">
@@ -1840,14 +2097,25 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
             </button>
 
             {selectedCampaign && (
-              <button
-                type="button"
-                onClick={() => openEditCampaignModal(selectedCampaign)}
-                className="h-10 px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs sm:text-sm font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-              >
-                <Pencil className="w-3.5 h-3.5" />
-                <span>Editar Campanha</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => openEditCampaignModal(selectedCampaign)}
+                  className="h-10 px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs sm:text-sm font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Editar Campanha</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCampaignToDelete(selectedCampaign)}
+                  className="h-10 px-3.5 rounded-xl border border-rose-200 bg-white hover:bg-rose-50 text-rose-600 text-xs sm:text-sm font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  title="Excluir campanha selecionada"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Excluir</span>
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -1974,51 +2242,102 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
 
               {/* Layout em 2 colunas: Coluna lateral de Categorias + Área principal da categoria */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-                {/* Coluna Lateral: As 5 Categorias Oficiais */}
-                <aside className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-3 space-y-1">
-                  <div className="px-3 py-1.5 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
-                    Categorias
+                {/* Coluna Lateral: Categorias */}
+                <aside className="lg:col-span-3 xl:col-span-2 bg-white rounded-2xl border border-slate-200 p-3 space-y-1.5">
+                  <div className="px-2 py-1 flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                      Categorias
+                    </span>
+                    <button
+                      type="button"
+                      onClick={openNewCategoryModal}
+                      className="inline-flex items-center gap-1 text-[11px] font-bold text-[#0052cc] hover:text-blue-700 cursor-pointer"
+                      title="Adicionar nova categoria"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Adicionar</span>
+                    </button>
                   </div>
-                  <div className="grid grid-cols-2 lg:grid-cols-1 gap-1">
-                    {FIXED_CATEGORIES.map((cat) => {
-                      const catCount = activeModalityOffers.filter(
-                        (o) => o.category === cat.id
-                      ).length;
-                      const isCatActive = activeCategory === cat.id;
-                      return (
-                        <button
-                          key={cat.id}
-                          type="button"
-                          onClick={() => setActiveCategory(cat.id)}
-                          className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold cursor-pointer transition-colors ${
-                            isCatActive
-                              ? 'bg-[#0B2046] text-white'
-                              : 'text-slate-700 hover:bg-slate-100'
-                          }`}
-                        >
-                          <span>{cat.sidebarLabel}</span>
-                          <span
-                            className={`text-xs tabular-nums ${
-                              isCatActive ? 'text-blue-200' : 'text-slate-400'
-                            }`}
-                          >
-                            {catCount}
-                          </span>
-                        </button>
-                      );
-                    })}
+
+                  <div className="grid grid-cols-1 gap-1">
+                    {sidebarCategories.length === 0 ? (
+                      <div className="p-3 rounded-xl border border-dashed border-slate-200 text-center text-xs text-slate-400">
+                        Nenhuma categoria cadastrada.
+                      </div>
+                    ) : (
+                      sidebarCategories.map((cat) => {
+                        const catCount = activeModalityOffers.filter((o) =>
+                          cat.id === SEM_CATEGORIA_ID
+                            ? o.category === SEM_CATEGORIA_ID || !configuredCatIdSet.has(o.category)
+                            : o.category === cat.id
+                        ).length;
+                        const isCatActive = activeCategory === cat.id;
+                        return (
+                          <div key={cat.id} className="group flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => setActiveCategory(cat.id)}
+                              className={`flex-1 min-w-0 flex items-center justify-between px-3 py-2 rounded-xl text-xs sm:text-sm font-bold cursor-pointer transition-colors ${
+                                isCatActive
+                                  ? 'bg-[#0B2046] text-white'
+                                  : 'text-slate-700 hover:bg-slate-100'
+                              }`}
+                            >
+                              <span className="truncate">{cat.label}</span>
+                              <span
+                                className={`text-xs tabular-nums ml-1.5 shrink-0 ${
+                                  isCatActive ? 'text-blue-200' : 'text-slate-400'
+                                }`}
+                              >
+                                {catCount}
+                              </span>
+                            </button>
+                            {!cat.isVirtualPreserved && (
+                              <div className="flex items-center shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => openEditCategoryModal(cat)}
+                                  title={`Editar categoria ${cat.label}`}
+                                  className="p-1.5 rounded-lg text-slate-400 hover:text-[#0052cc] hover:bg-blue-50 cursor-pointer"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setCategoryToDelete(cat)}
+                                  title={`Excluir categoria ${cat.label}`}
+                                  className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
                   </div>
                 </aside>
 
                 {/* Área Principal: Tabela da Categoria Selecionada */}
-                <div className="lg:col-span-10 space-y-4 min-w-0">
+                <div className="lg:col-span-9 xl:col-span-10 space-y-4 min-w-0">
                   <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
                     {/* Cabeçalho da Categoria Selecionada */}
                     <div className="px-4 sm:px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                       <div>
-                        <h2 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
-                          {activeCategoryMeta.tableTitle}
-                        </h2>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h2 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
+                            {activeCategoryMeta.label}
+                          </h2>
+                          {!activeCategoryMeta.isVirtualPreserved && (
+                            <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600">
+                              {activeCategoryMeta.unit} ·{' '}
+                              {activeCategoryMeta.pricingType === 'escalonado'
+                                ? 'Preço Escalonado'
+                                : 'Preço Unitário'}
+                            </span>
+                          )}
+                        </div>
                         <p className="text-xs text-slate-500">
                           Público: <strong className="text-[#0052cc]">{activeModalityLabel}</strong>{' '}
                           <span aria-hidden="true">·</span> {activeCategoryOffers.length}{' '}
@@ -2038,44 +2357,46 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                           </button>
                         )}
 
-                        {(activeCategory === 'rodapes' || activeCategory === 'ripados') &&
-                          tqActive && (
+                        {!activeCategoryMeta.isVirtualPreserved && (
+                          <button
+                            type="button"
+                            onClick={() => openEditCategoryModal(activeCategoryMeta)}
+                            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <SlidersHorizontal className="w-3.5 h-3.5" />
+                            <span>Configurar Categoria</span>
+                          </button>
+                        )}
+
+                        {!activeCategoryMeta.isVirtualPreserved && (
+                          <>
                             <button
                               type="button"
-                              onClick={() => {
-                                setTierHeaderEditCat(activeCategory);
-                                setTierHeaderQ1(String(tqActive[0]));
-                                setTierHeaderQ2(String(tqActive[1]));
-                                setTierHeaderQ3(String(tqActive[2]));
-                              }}
-                              className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                              onClick={() => setIsCrmPickerOpen(true)}
+                              className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                             >
-                              <SlidersHorizontal className="w-3.5 h-3.5" />
-                              <span>
-                                Faixas (+{tqActive[0]}/+{tqActive[1]}/+{tqActive[2]})
-                              </span>
+                              <Search className="w-3.5 h-3.5" />
+                              <span>Selecionar do CRM</span>
                             </button>
-                          )}
 
-                        <button
-                          type="button"
-                          onClick={() => setIsCrmPickerOpen(true)}
-                          className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-[#0B2046] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Search className="w-3.5 h-3.5" />
-                          <span>Selecionar do CRM</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => openNewOfferModal(activeCategory)}
-                          className="px-3.5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                          <span>Adicionar Produto</span>
-                        </button>
+                            <button
+                              type="button"
+                              onClick={() => openNewOfferModal(activeCategory)}
+                              className="px-3.5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>Adicionar Produto</span>
+                            </button>
+                          </>
+                        )}
                       </div>
                     </div>
+
+                    {activeCategoryMeta.isVirtualPreserved && (
+                      <div className="px-4 sm:px-5 py-2.5 bg-amber-50 border-b border-amber-200 text-xs text-amber-800">
+                        Produtos preservados após exclusão de categoria. Clique no lápis de cada item para movê-lo para outra categoria ou ajustar seu valor.
+                      </div>
+                    )}
 
                     {/* Busca rápida dentro da categoria */}
                     <div className="px-4 sm:px-5 py-2.5 bg-slate-50/70 border-b border-slate-200">
@@ -2085,7 +2406,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                           type="text"
                           value={productSearch}
                           onChange={(e) => setProductSearch(e.target.value)}
-                          placeholder={`Filtrar em ${activeCategoryMeta.tableTitle}...`}
+                          placeholder={`Filtrar em ${activeCategoryMeta.label}...`}
                           className="w-full h-9 pl-8 pr-3 rounded-lg border border-slate-200 bg-white text-xs text-slate-800 outline-none focus:border-[#0052cc]"
                         />
                       </div>
@@ -2095,13 +2416,15 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                     {activeCategoryOffers.length === 0 ? (
                       <div className="p-10 text-center space-y-2">
                         <p className="text-sm font-semibold text-slate-600">
-                          Nenhum produto cadastrado em {activeCategoryMeta.tableTitle} para{' '}
+                          Nenhum produto cadastrado em {activeCategoryMeta.label} para{' '}
                           {activeModalityLabel}.
                         </p>
-                        <p className="text-xs text-slate-400">
-                          Use <strong>Adicionar Produto</strong> ou{' '}
-                          <strong>Selecionar do CRM</strong> acima.
-                        </p>
+                        {!activeCategoryMeta.isVirtualPreserved && (
+                          <p className="text-xs text-slate-400">
+                            Use <strong>Adicionar Produto</strong> ou{' '}
+                            <strong>Selecionar do CRM</strong> acima.
+                          </p>
+                        )}
                       </div>
                     ) : (
                       <div className="overflow-x-auto">
@@ -2110,7 +2433,8 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                             <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-600 uppercase tracking-wider">
                               <th
                                 className={`py-2.5 px-4 ${
-                                  activeCategory === 'teto_vinilico' || activeCategory === 'outros'
+                                  activeCategoryMeta.pricingType === 'unitario' &&
+                                  activeCategory !== 'piso_vinilico'
                                     ? 'w-full min-w-[280px]'
                                     : ''
                                 }`}
@@ -2118,49 +2442,45 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                                 Descrição
                               </th>
 
-                              {activeCategory === 'piso_vinilico' && (
-                                <>
-                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                    Caixas
-                                  </th>
-                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                    Total (m²)
-                                  </th>
-                                  <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                    Preço (m²)
-                                  </th>
-                                </>
-                              )}
-
-                              {(activeCategory === 'rodapes' || activeCategory === 'ripados') &&
-                                tqActive && (
+                              {activeCategory === 'piso_vinilico' &&
+                                activeCategoryMeta.pricingType === 'unitario' && (
                                   <>
                                     <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                      Preço
+                                      Caixas
                                     </th>
                                     <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                      +{tqActive[0]} barras
+                                      Total (m²)
                                     </th>
                                     <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                      +{tqActive[1]} barras
-                                    </th>
-                                    <th className="py-2.5 px-3 text-center whitespace-nowrap">
-                                      +{tqActive[2]} barras
+                                      Preço ({activeCategoryMeta.unit})
                                     </th>
                                   </>
                                 )}
 
-                              {activeCategory === 'teto_vinilico' && (
-                                <th className="py-2.5 px-4 text-center whitespace-nowrap">
-                                  Preço (m²)
-                                </th>
+                              {activeCategoryMeta.pricingType === 'escalonado' && (
+                                <>
+                                  {activeCategoryShowBaseCol && (
+                                    <th className="py-2.5 px-3 text-center whitespace-nowrap">
+                                      Preço ({activeCategoryMeta.unit})
+                                    </th>
+                                  )}
+                                  {activeCategoryTierCols.map((col) => (
+                                    <th
+                                      key={col.sig}
+                                      className="py-2.5 px-3 text-center whitespace-nowrap"
+                                    >
+                                      {formatTierRangeLabel(col, activeCategoryMeta.unit)}
+                                    </th>
+                                  ))}
+                                </>
                               )}
 
-                              {activeCategory === 'outros' && (
-                                <th className="py-2.5 px-4 text-center whitespace-nowrap">
-                                  Preço
-                                </th>
-                              )}
+                              {activeCategoryMeta.pricingType === 'unitario' &&
+                                activeCategory !== 'piso_vinilico' && (
+                                  <th className="py-2.5 px-4 text-center whitespace-nowrap">
+                                    Preço ({activeCategoryMeta.unit})
+                                  </th>
+                                )}
 
                               <th className="py-2.5 px-3 text-center whitespace-nowrap">Status</th>
                               <th className="py-2.5 px-4 text-right whitespace-nowrap">Ações</th>
@@ -2198,49 +2518,56 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                                     )}
                                   </td>
 
-                                  {activeCategory === 'piso_vinilico' && (
-                                    <>
-                                      <td className="py-2.5 px-3 text-center font-bold text-[#0B2046]">
-                                        {lotMetrics ? lotMetrics.availableBoxes : '—'}
-                                      </td>
-                                      <td className="py-2.5 px-3 text-center font-semibold text-slate-700 whitespace-nowrap">
-                                        {lotMetrics ? formatSqmBR(lotMetrics.availableSqm) : '—'}
-                                      </td>
-                                      <td className="py-2.5 px-3 text-center font-extrabold text-[#0052cc] whitespace-nowrap">
-                                        {formatCurrencyBRL(offer.priceSqm)}
-                                      </td>
-                                    </>
-                                  )}
-
-                                  {(activeCategory === 'rodapes' || activeCategory === 'ripados') && (
-                                    <>
-                                      <td className="py-2.5 px-3 text-center font-extrabold text-[#0B2046] whitespace-nowrap">
-                                        {formatCurrencyBRL(offer.priceNormal)}
-                                      </td>
-                                      {[0, 1, 2].map((tIdx) => (
-                                        <td
-                                          key={tIdx}
-                                          className="py-2.5 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap"
-                                        >
+                                  {activeCategory === 'piso_vinilico' &&
+                                    activeCategoryMeta.pricingType === 'unitario' && (
+                                      <>
+                                        <td className="py-2.5 px-3 text-center font-bold text-[#0B2046]">
+                                          {lotMetrics ? lotMetrics.availableBoxes : '—'}
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center font-semibold text-slate-700 whitespace-nowrap">
+                                          {lotMetrics ? formatSqmBR(lotMetrics.availableSqm) : '—'}
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center font-extrabold text-[#0052cc] whitespace-nowrap">
                                           {formatCurrencyBRL(
-                                            offer.tiers?.[tIdx]?.price ?? offer.priceNormal
+                                            getOfferUnitPrice(offer, activeCategoryMeta)
                                           )}
                                         </td>
-                                      ))}
+                                      </>
+                                    )}
+
+                                  {activeCategoryMeta.pricingType === 'escalonado' && (
+                                    <>
+                                      {activeCategoryShowBaseCol && (
+                                        <td className="py-2.5 px-3 text-center font-extrabold text-[#0B2046] whitespace-nowrap">
+                                          {Number(offer.priceNormal) > 0
+                                            ? formatCurrencyBRL(offer.priceNormal)
+                                            : '—'}
+                                        </td>
+                                      )}
+                                      {activeCategoryTierCols.map((col) => {
+                                        const matched = (offer.tiers || []).find(
+                                          (t) => getTierRangeSignature(t) === col.sig
+                                        );
+                                        return (
+                                          <td
+                                            key={col.sig}
+                                            className="py-2.5 px-3 text-center font-bold text-[#0052cc] whitespace-nowrap"
+                                          >
+                                            {matched ? formatCurrencyBRL(matched.price) : '—'}
+                                          </td>
+                                        );
+                                      })}
                                     </>
                                   )}
 
-                                  {activeCategory === 'teto_vinilico' && (
-                                    <td className="py-2.5 px-4 text-center font-extrabold text-[#0052cc] whitespace-nowrap">
-                                      {formatCurrencyBRL(offer.priceSqm)}
-                                    </td>
-                                  )}
-
-                                  {activeCategory === 'outros' && (
-                                    <td className="py-2.5 px-4 text-center font-extrabold text-[#0052cc] whitespace-nowrap">
-                                      {formatCurrencyBRL(offer.price)}
-                                    </td>
-                                  )}
+                                  {activeCategoryMeta.pricingType === 'unitario' &&
+                                    activeCategory !== 'piso_vinilico' && (
+                                      <td className="py-2.5 px-4 text-center font-extrabold text-[#0052cc] whitespace-nowrap">
+                                        {formatCurrencyBRL(
+                                          getOfferUnitPrice(offer, activeCategoryMeta)
+                                        )}
+                                      </td>
+                                    )}
 
                                   <td className="py-2.5 px-3 text-center whitespace-nowrap">
                                     <button
@@ -2414,8 +2741,11 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                       Categorias na Folha
                     </span>
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-h-10 py-1.5 px-3 rounded-xl border border-slate-200 bg-slate-50/70">
-                      {FIXED_CATEGORIES.map((cat) => {
-                        const checked = sheetSettings.includedCategories[cat.id] !== false;
+                      {sidebarCategories.map((cat) => {
+                        const checked =
+                          cat.id === SEM_CATEGORIA_ID
+                            ? sheetSettings.includedCategories[cat.id] === true
+                            : sheetSettings.includedCategories[cat.id] !== false;
                         return (
                           <label
                             key={cat.id}
@@ -2434,7 +2764,7 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
                               }
                               className="w-3.5 h-3.5 rounded border-slate-300 text-[#0052cc]"
                             />
-                            <span>{cat.sidebarLabel}</span>
+                            <span>{cat.label}</span>
                           </label>
                         );
                       })}
@@ -3408,6 +3738,282 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
         </div>
       )}
 
+      {/* =================================================================== */}
+      {/* MODAL: ADICIONAR / EDITAR CATEGORIA (UNIDADE + UNITÁRIO/ESCALONADO) */}
+      {/* =================================================================== */}
+      {isCategoryModalOpen && selectedCampaign && (
+        <div
+          className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
+          onClick={() => setIsCategoryModalOpen(false)}
+        >
+          <div
+            className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-5 sm:p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
+                  {editingCategory ? 'Editar Categoria' : 'Nova Categoria'}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Configure o nome, a unidade de comercialização e a regra de preço.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCategoryModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCategoryModal} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                  Nome da Categoria *
+                </label>
+                <input
+                  type="text"
+                  autoFocus
+                  value={catFormName}
+                  onChange={(e) => setCatFormName(e.target.value)}
+                  placeholder="Ex: Rodapés, Piso Vinílico, Acessórios..."
+                  className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-semibold text-slate-900 outline-none focus:border-[#0052cc]"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                    Unidade de Comercialização *
+                  </label>
+                  <select
+                    value={catFormUnit}
+                    onChange={(e) => setCatFormUnit(e.target.value as PromoCategoryUnit)}
+                    className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-800 outline-none focus:border-[#0052cc] cursor-pointer"
+                  >
+                    {PROMO_CATEGORY_UNITS.map((unitOpt) => (
+                      <option key={unitOpt} value={unitOpt}>
+                        {unitOpt}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                    Tipo de Preço *
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5 h-10 p-1 rounded-xl bg-slate-100">
+                    <button
+                      type="button"
+                      onClick={() => setCatFormPricingType('unitario')}
+                      className={`rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                        catFormPricingType === 'unitario'
+                          ? 'bg-[#0052cc] text-white'
+                          : 'text-slate-600 hover:text-[#0B2046]'
+                      }`}
+                    >
+                      Unitário
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCatFormPricingType('escalonado');
+                        if (catFormRanges.length === 0) {
+                          setCatFormRanges([
+                            { id: `rng_${Date.now()}_1`, minQty: '1', maxQty: '29' },
+                            { id: `rng_${Date.now()}_2`, minQty: '30', maxQty: '49' },
+                            { id: `rng_${Date.now()}_3`, minQty: '50', maxQty: '99' },
+                          ]);
+                        }
+                      }}
+                      className={`rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                        catFormPricingType === 'escalonado'
+                          ? 'bg-[#0052cc] text-white'
+                          : 'text-slate-600 hover:text-[#0B2046]'
+                      }`}
+                    >
+                      Escalonado
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {catFormPricingType === 'unitario' ? (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-600">
+                  Os produtos desta categoria serão exibidos com preço único por{' '}
+                  <strong className="text-[#0B2046]">{catFormUnit}</strong>.
+                </div>
+              ) : (
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-bold text-[#0B2046]">
+                        Faixas de Quantidade ({pluralizePromoUnit(catFormUnit)})
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Crie quantas faixas desejar. O preço da faixa se aplica à quantidade total da compra.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const last = catFormRanges[catFormRanges.length - 1];
+                        const nextMin = last?.maxQty
+                          ? String(Math.max(1, Number(last.maxQty) + 1))
+                          : last?.minQty
+                          ? String(Math.max(1, Number(last.minQty) + 20))
+                          : '1';
+                        setCatFormRanges((prev) => [
+                          ...prev,
+                          { id: `rng_${Date.now()}`, minQty: nextMin, maxQty: '' },
+                        ]);
+                      }}
+                      className="px-2.5 py-1.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-[11px] font-bold flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Adicionar Faixa</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                    {catFormRanges.map((row, idx) => (
+                      <div
+                        key={row.id || idx}
+                        className="grid grid-cols-12 gap-2 items-center p-2 rounded-xl bg-white border border-slate-200"
+                      >
+                        <div className="col-span-5">
+                          <label className="block text-[10px] font-semibold text-slate-400">
+                            Qtd Mín ({catFormUnit}) *
+                          </label>
+                          <input
+                            type="number"
+                            min={1}
+                            value={row.minQty}
+                            onChange={(e) =>
+                              setCatFormRanges((prev) =>
+                                prev.map((r, rIdx) =>
+                                  rIdx === idx ? { ...r, minQty: e.target.value } : r
+                                )
+                              )
+                            }
+                            className="w-full h-8 px-2.5 rounded-lg border border-slate-200 text-xs font-bold tabular-nums outline-none focus:border-[#0052cc]"
+                          />
+                        </div>
+                        <div className="col-span-5">
+                          <label className="block text-[10px] font-semibold text-slate-400">
+                            Qtd Máx (vazio = +)
+                          </label>
+                          <input
+                            type="number"
+                            min={1}
+                            value={row.maxQty}
+                            placeholder="Sem limite"
+                            onChange={(e) =>
+                              setCatFormRanges((prev) =>
+                                prev.map((r, rIdx) =>
+                                  rIdx === idx ? { ...r, maxQty: e.target.value } : r
+                                )
+                              )
+                            }
+                            className="w-full h-8 px-2.5 rounded-lg border border-slate-200 text-xs font-bold tabular-nums outline-none focus:border-[#0052cc]"
+                          />
+                        </div>
+                        <div className="col-span-2 flex justify-end pt-3">
+                          <button
+                            type="button"
+                            disabled={catFormRanges.length <= 1}
+                            onClick={() =>
+                              setCatFormRanges((prev) => prev.filter((_, rIdx) => rIdx !== idx))
+                            }
+                            title="Remover faixa"
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 disabled:opacity-30 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {catFormError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
+                  {catFormError}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setIsCategoryModalOpen(false)}
+                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSaving}
+                  className="px-5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs sm:text-sm font-bold cursor-pointer disabled:opacity-50"
+                >
+                  {isSaving ? 'Salvando...' : editingCategory ? 'Salvar Alterações' : 'Criar Categoria'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CONFIRMAR EXCLUSÃO DE CATEGORIA (PRESERVANDO PRODUTOS) */}
+      {categoryToDelete && selectedCampaign && (
+        <div
+          className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setCategoryToDelete(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1.5">
+                <h3 className="text-base font-extrabold text-[#0B2046]">Excluir Categoria</h3>
+                <p className="text-sm text-slate-600 leading-relaxed">
+                  Tem certeza que deseja excluir a categoria{' '}
+                  <strong>{categoryToDelete.label}</strong>?
+                </p>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Os produtos vinculados a esta categoria serão preservados e permanecerão
+                  disponíveis em <strong>Sem Categoria</strong> para edição ou realocação.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setCategoryToDelete(null)}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={handleConfirmDeleteCategory}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
+              >
+                Confirmar Exclusão
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL: CONFIRMAR EXCLUSÃO DE CAMPANHA */}
       {campaignToDelete && (
         <div
@@ -3762,428 +4368,437 @@ export const PromocoesAtivasScreen: React.FC<PromocoesAtivasScreenProps> = ({
       {/* =================================================================== */}
       {/* MODAL: CADASTRAR / EDITAR PRODUTO NA CAMPANHA                       */}
       {/* =================================================================== */}
-      {isOfferModalOpen && selectedCampaign && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
-          onClick={() => setIsOfferModalOpen(false)}
-        >
+      {isOfferModalOpen && selectedCampaign && (() => {
+        const modalCatConfig = campaignCategories.find((c) => c.id === offerCategory);
+        const modalPricingType: PromoCategoryPricingType =
+          modalCatConfig?.pricingType || 'unitario';
+        const modalUnit: PromoCategoryUnit = modalCatConfig?.unit || 'unidade';
+        const isModalSpecialPiso =
+          offerCategory === 'piso_vinilico' && modalPricingType === 'unitario';
+
+        return (
           <div
-            className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-xl max-h-[92vh] overflow-y-auto p-5 sm:p-6 space-y-4"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
+            onClick={() => setIsOfferModalOpen(false)}
           >
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <div>
-                <h3 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
-                  {editingOffer ? 'Editar Produto' : 'Adicionar Produto'}
-                </h3>
-                <p className="text-xs text-slate-500">
-                  Categoria:{' '}
-                  <strong>{PROMO_CATEGORIES.find((c) => c.id === offerCategory)?.label}</strong> ·
-                  Público: <strong className="text-[#0052cc]">{activeModalityLabel}</strong>
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsOfferModalOpen(false)}
-                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSaveOfferModal} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                  Descrição do Produto *
-                </label>
-                <input
-                  type="text"
-                  value={offerDescription}
-                  onChange={(e) => setOfferDescription(e.target.value)}
-                  placeholder={
-                    offerCategory === 'piso_vinilico'
-                      ? 'Ex: Lobato – 2 mm'
-                      : offerCategory === 'rodapes'
-                      ? 'Ex: Rodapé Branco – 7 cm'
-                      : offerCategory === 'ripados'
-                      ? 'Ex: Ripado PVC (0,16 x 2,90 m)'
-                      : offerCategory === 'teto_vinilico'
-                      ? 'Ex: Teto Vinílico Amadeirado – 8 mm'
-                      : 'Ex: Cola de Contato – Balde 5 kg'
-                  }
-                  className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-semibold text-slate-900 outline-none focus:border-[#0052cc]"
-                />
-              </div>
-
-              {offerCategory === 'piso_vinilico' &&
-                selectedCampaign.subcategories.some((s) => s.category === 'piso_vinilico') && (
-                  <div>
-                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                      Subcategoria (Opcional)
-                    </label>
-                    <select
-                      value={offerSubcategoryId}
-                      onChange={(e) => setOfferSubcategoryId(e.target.value)}
-                      className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm text-slate-800 bg-white outline-none focus:border-[#0052cc]"
-                    >
-                      <option value="">Sem subcategoria</option>
-                      {selectedCampaign.subcategories
-                        .filter((s) => s.category === 'piso_vinilico')
-                        .map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                    </select>
-                  </div>
-                )}
-
-              {offerCategory === 'piso_vinilico' && (
-                <div className="space-y-3 p-4 rounded-2xl bg-slate-50 border border-slate-200">
-                  {selectedCampaign.lots.length > 0 && !editingOffer && (
-                    <div className="flex items-center gap-2 text-xs font-bold">
-                      <button
-                        type="button"
-                        onClick={() => setOfferLotMode('new')}
-                        className={`px-3 py-1.5 rounded-lg cursor-pointer ${
-                          offerLotMode === 'new'
-                            ? 'bg-[#0052cc] text-white'
-                            : 'bg-white border border-slate-200 text-slate-600'
-                        }`}
-                      >
-                        Novo Lote Compartilhado
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setOfferLotMode('existing');
-                          const firstLot = selectedCampaign.lots[0];
-                          if (firstLot && !offerExistingLotId) {
-                            setOfferExistingLotId(firstLot.id);
-                          }
-                        }}
-                        className={`px-3 py-1.5 rounded-lg cursor-pointer ${
-                          offerLotMode === 'existing'
-                            ? 'bg-[#0052cc] text-white'
-                            : 'bg-white border border-slate-200 text-slate-600'
-                        }`}
-                      >
-                        Usar Lote Já Cadastrado
-                      </button>
-                    </div>
-                  )}
-
-                  {offerLotMode === 'existing' && !editingOffer ? (
-                    <div>
-                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                        Selecionar Lote *
-                      </label>
-                      <select
-                        value={offerExistingLotId}
-                        onChange={(e) => {
-                          const lot = selectedCampaign.lots.find((l) => l.id === e.target.value);
-                          setOfferExistingLotId(e.target.value);
-                          if (lot && !offerDescription.trim()) {
-                            setOfferDescription(lot.description);
-                          }
-                        }}
-                        className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-semibold bg-white outline-none"
-                      >
-                        {selectedCampaign.lots.map((l) => {
-                          const m = computeLotMetrics(l);
-                          return (
-                            <option key={l.id} value={l.id}>
-                              {l.description} — {m.availableBoxes} cx ({formatSqmBR(m.availableSqm)})
-                            </option>
-                          );
-                        })}
-                      </select>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                            Metragem por Caixa (m²) *
-                          </label>
-                          <input
-                            type="text"
-                            value={offerLotSqmPerBox}
-                            onChange={(e) => setOfferLotSqmPerBox(e.target.value)}
-                            placeholder="Ex: 4,72"
-                            className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white text-sm font-bold outline-none tabular-nums"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                            Quantidade de Caixas *
-                          </label>
-                          <input
-                            type="number"
-                            min={1}
-                            value={offerLotInitialBoxes}
-                            onChange={(e) => setOfferLotInitialBoxes(e.target.value)}
-                            placeholder="Ex: 6"
-                            className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white text-sm font-bold outline-none tabular-nums"
-                          />
-                        </div>
-                      </div>
-
-                      {parseNumberFlexible(offerLotSqmPerBox) > 0 &&
-                        parseNumberFlexible(offerLotInitialBoxes) > 0 && (
-                          <div className="text-xs font-semibold text-[#0052cc] tabular-nums">
-                            Total calculado:{' '}
-                            {formatSqmBR(
-                              parseNumberFlexible(offerLotSqmPerBox) *
-                                Math.floor(parseNumberFlexible(offerLotInitialBoxes))
-                            )}
-                          </div>
-                        )}
-                    </>
-                  )}
-
-                  <div>
-                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                      Preço (m²) para {activeModalityLabel} (R$) *
-                    </label>
-                    <input
-                      type="text"
-                      value={offerPriceSqm}
-                      onChange={(e) => setOfferPriceSqm(e.target.value)}
-                      placeholder="Ex: 39,90"
-                      className="w-full h-10 px-3.5 rounded-xl border border-slate-200 bg-white text-sm font-extrabold text-[#0052cc] outline-none tabular-nums"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {(offerCategory === 'rodapes' || offerCategory === 'ripados') && (
-                <div className="space-y-3 p-4 rounded-2xl bg-slate-50 border border-slate-200">
-                  {offerCategory === 'ripados' && (
-                    <div>
-                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                        Dimensões / Especificação (Opcional)
-                      </label>
-                      <input
-                        type="text"
-                        value={offerSpecs}
-                        onChange={(e) => setOfferSpecs(e.target.value)}
-                        placeholder="Ex: 0,16 x 2,90 m"
-                        className="w-full h-9 px-3 rounded-xl border border-slate-200 bg-white text-sm outline-none"
-                      />
-                    </div>
-                  )}
-
-                  <div>
-                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                      Preço ({activeModalityLabel}) (R$) *
-                    </label>
-                    <input
-                      type="text"
-                      value={offerPriceNormal}
-                      onChange={(e) => setOfferPriceNormal(e.target.value)}
-                      placeholder="Ex: 15,90"
-                      className="w-full h-10 px-3.5 rounded-xl border border-slate-200 bg-white text-sm font-extrabold text-[#0B2046] outline-none tabular-nums"
-                    />
-                  </div>
-
-                  <div className="text-xs font-bold text-[#0B2046] pt-1">
-                    Descontos Progressivos por Quantidade de Barras
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                    {[
-                      {
-                        label: 'Faixa 1',
-                        qty: offerTier1Qty,
-                        setQty: setOfferTier1Qty,
-                        price: offerTier1Price,
-                        setPrice: setOfferTier1Price,
-                      },
-                      {
-                        label: 'Faixa 2',
-                        qty: offerTier2Qty,
-                        setQty: setOfferTier2Qty,
-                        price: offerTier2Price,
-                        setPrice: setOfferTier2Price,
-                      },
-                      {
-                        label: 'Faixa 3',
-                        qty: offerTier3Qty,
-                        setQty: setOfferTier3Qty,
-                        price: offerTier3Price,
-                        setPrice: setOfferTier3Price,
-                      },
-                    ].map((tier, i) => (
-                      <div
-                        key={i}
-                        className="p-2.5 rounded-xl bg-white border border-slate-200 space-y-2"
-                      >
-                        <div className="text-[11px] font-bold text-slate-500 uppercase">
-                          {tier.label}
-                        </div>
-                        <div>
-                          <label className="block text-[10px] font-semibold text-slate-400">
-                            + Barras
-                          </label>
-                          <input
-                            type="number"
-                            min={1}
-                            value={tier.qty}
-                            onChange={(e) => tier.setQty(e.target.value)}
-                            className="w-full h-8 px-2 rounded-lg border border-slate-200 text-xs font-bold tabular-nums"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[10px] font-semibold text-slate-400">
-                            Preço (R$)
-                          </label>
-                          <input
-                            type="text"
-                            value={tier.price}
-                            onChange={(e) => tier.setPrice(e.target.value)}
-                            placeholder="0,00"
-                            className="w-full h-8 px-2 rounded-lg border border-slate-200 text-xs font-extrabold text-[#0052cc] tabular-nums"
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {offerCategory === 'teto_vinilico' && (
+            <div
+              className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-xl max-h-[92vh] overflow-y-auto p-5 sm:p-6 space-y-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
                 <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                    Preço (m²) para {activeModalityLabel} (R$) *
-                  </label>
-                  <input
-                    type="text"
-                    value={offerPriceSqm}
-                    onChange={(e) => setOfferPriceSqm(e.target.value)}
-                    placeholder="Ex: 89,90"
-                    className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-extrabold text-[#0052cc] outline-none tabular-nums"
-                  />
+                  <h3 className="text-base sm:text-lg font-extrabold text-[#0B2046]">
+                    {editingOffer ? 'Editar Produto' : 'Adicionar Produto'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Categoria:{' '}
+                    <strong>
+                      {modalCatConfig?.label ||
+                        (offerCategory === SEM_CATEGORIA_ID
+                          ? 'Sem Categoria'
+                          : PROMO_CATEGORIES.find((c) => c.id === offerCategory)?.label ||
+                            'Produtos')}
+                    </strong>{' '}
+                    · Unidade: <strong>{modalUnit}</strong> · Público:{' '}
+                    <strong className="text-[#0052cc]">{activeModalityLabel}</strong>
+                  </p>
                 </div>
-              )}
-
-              {offerCategory === 'outros' && (
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
-                    Preço ({activeModalityLabel}) (R$) *
-                  </label>
-                  <input
-                    type="text"
-                    value={offerSimplePrice}
-                    onChange={(e) => setOfferSimplePrice(e.target.value)}
-                    placeholder="Ex: 189,90"
-                    className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-extrabold text-[#0052cc] outline-none tabular-nums"
-                  />
-                </div>
-              )}
-
-              <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={offerActive}
-                  onChange={(e) => setOfferActive(e.target.checked)}
-                  className="w-4 h-4 rounded border-slate-300 text-[#0052cc]"
-                />
-                <span>Oferta ativa</span>
-              </label>
-
-              {offerFormError && (
-                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
-                  {offerFormError}
-                </div>
-              )}
-
-              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   type="button"
                   onClick={() => setIsOfferModalOpen(false)}
-                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+                  className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 cursor-pointer"
                 >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSaving}
-                  className="px-5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs sm:text-sm font-bold cursor-pointer disabled:opacity-50"
-                >
-                  {isSaving ? 'Salvando...' : 'Salvar Produto'}
+                  <X className="w-4 h-4" />
                 </button>
               </div>
-            </form>
-          </div>
-        </div>
-      )}
 
-      {/* MODAL: CONFIGURAR FAIXAS PROGRESSIVAS */}
-      {tierHeaderEditCat && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
-          onClick={() => setTierHeaderEditCat(null)}
-        >
-          <div
-            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-base font-extrabold text-[#0B2046]">
-              Configurar Faixas ({tierHeaderEditCat === 'rodapes' ? 'Rodapés' : 'Ripados'})
-            </h3>
-            <form onSubmit={handleSaveTierQuantities} className="space-y-4">
-              <div className="grid grid-cols-3 gap-3">
+              <form onSubmit={handleSaveOfferModal} className="space-y-4">
                 <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">Faixa 1 (+)</label>
+                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                    Categoria *
+                  </label>
+                  <select
+                    value={offerCategory}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      setOfferCategory(nextId);
+                      const nextCat = campaignCategories.find((c) => c.id === nextId);
+                      if (nextCat?.pricingType === 'escalonado' && offerTiersForm.length === 0) {
+                        setOfferTiersForm(buildInitialTiersForm(nextCat, undefined, offerUnitPrice));
+                      }
+                    }}
+                    className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-semibold text-slate-800 bg-white outline-none focus:border-[#0052cc] cursor-pointer"
+                  >
+                    {offerCategory === SEM_CATEGORIA_ID && (
+                      <option value={SEM_CATEGORIA_ID}>Sem Categoria (Preservado)</option>
+                    )}
+                    {campaignCategories.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label} ({c.unit} ·{' '}
+                        {c.pricingType === 'escalonado' ? 'Escalonado' : 'Unitário'})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                    Descrição do Produto *
+                  </label>
                   <input
-                    type="number"
-                    min={1}
-                    value={tierHeaderQ1}
-                    onChange={(e) => setTierHeaderQ1(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums"
+                    type="text"
+                    value={offerDescription}
+                    onChange={(e) => setOfferDescription(e.target.value)}
+                    placeholder={
+                      offerCategory === 'piso_vinilico'
+                        ? 'Ex: Lobato – 2 mm'
+                        : offerCategory === 'rodapes'
+                        ? 'Ex: Rodapé Branco – 7 cm'
+                        : offerCategory === 'ripados'
+                        ? 'Ex: Ripado PVC (0,16 x 2,90 m)'
+                        : offerCategory === 'teto_vinilico'
+                        ? 'Ex: Teto Vinílico Amadeirado – 8 mm'
+                        : 'Ex: Cola de Contato – Balde 5 kg'
+                    }
+                    className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-semibold text-slate-900 outline-none focus:border-[#0052cc]"
                   />
                 </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">Faixa 2 (+)</label>
+
+                {!isModalSpecialPiso && (
+                  <div>
+                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                      Dimensões / Especificação (Opcional)
+                    </label>
+                    <input
+                      type="text"
+                      value={offerSpecs}
+                      onChange={(e) => setOfferSpecs(e.target.value)}
+                      placeholder="Ex: 0,16 x 2,90 m"
+                      className="w-full h-9 px-3 rounded-xl border border-slate-200 bg-white text-sm outline-none focus:border-[#0052cc]"
+                    />
+                  </div>
+                )}
+
+                {offerCategory === 'piso_vinilico' &&
+                  selectedCampaign.subcategories.some((s) => s.category === 'piso_vinilico') && (
+                    <div>
+                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                        Subcategoria (Opcional)
+                      </label>
+                      <select
+                        value={offerSubcategoryId}
+                        onChange={(e) => setOfferSubcategoryId(e.target.value)}
+                        className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm text-slate-800 bg-white outline-none focus:border-[#0052cc]"
+                      >
+                        <option value="">Sem subcategoria</option>
+                        {selectedCampaign.subcategories
+                          .filter((s) => s.category === 'piso_vinilico')
+                          .map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.name}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  )}
+
+                {isModalSpecialPiso && (
+                  <div className="space-y-3 p-4 rounded-2xl bg-slate-50 border border-slate-200">
+                    {selectedCampaign.lots.length > 0 && !editingOffer && (
+                      <div className="flex items-center gap-2 text-xs font-bold">
+                        <button
+                          type="button"
+                          onClick={() => setOfferLotMode('new')}
+                          className={`px-3 py-1.5 rounded-lg cursor-pointer ${
+                            offerLotMode === 'new'
+                              ? 'bg-[#0052cc] text-white'
+                              : 'bg-white border border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          Novo Lote Compartilhado
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOfferLotMode('existing');
+                            const firstLot = selectedCampaign.lots[0];
+                            if (firstLot && !offerExistingLotId) {
+                              setOfferExistingLotId(firstLot.id);
+                            }
+                          }}
+                          className={`px-3 py-1.5 rounded-lg cursor-pointer ${
+                            offerLotMode === 'existing'
+                              ? 'bg-[#0052cc] text-white'
+                              : 'bg-white border border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          Usar Lote Já Cadastrado
+                        </button>
+                      </div>
+                    )}
+
+                    {offerLotMode === 'existing' && !editingOffer ? (
+                      <div>
+                        <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                          Selecionar Lote *
+                        </label>
+                        <select
+                          value={offerExistingLotId}
+                          onChange={(e) => {
+                            const lot = selectedCampaign.lots.find((l) => l.id === e.target.value);
+                            setOfferExistingLotId(e.target.value);
+                            if (lot && !offerDescription.trim()) {
+                              setOfferDescription(lot.description);
+                            }
+                          }}
+                          className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-semibold bg-white outline-none"
+                        >
+                          {selectedCampaign.lots.map((l) => {
+                            const m = computeLotMetrics(l);
+                            return (
+                              <option key={l.id} value={l.id}>
+                                {l.description} — {m.availableBoxes} cx (
+                                {formatSqmBR(m.availableSqm)})
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                              Metragem por Caixa (m²) *
+                            </label>
+                            <input
+                              type="text"
+                              value={offerLotSqmPerBox}
+                              onChange={(e) => setOfferLotSqmPerBox(e.target.value)}
+                              placeholder="Ex: 4,72"
+                              className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white text-sm font-bold outline-none tabular-nums"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                              Quantidade de Caixas *
+                            </label>
+                            <input
+                              type="number"
+                              min={1}
+                              value={offerLotInitialBoxes}
+                              onChange={(e) => setOfferLotInitialBoxes(e.target.value)}
+                              placeholder="Ex: 6"
+                              className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white text-sm font-bold outline-none tabular-nums"
+                            />
+                          </div>
+                        </div>
+
+                        {parseNumberFlexible(offerLotSqmPerBox) > 0 &&
+                          parseNumberFlexible(offerLotInitialBoxes) > 0 && (
+                            <div className="text-xs font-semibold text-[#0052cc] tabular-nums">
+                              Total calculado:{' '}
+                              {formatSqmBR(
+                                parseNumberFlexible(offerLotSqmPerBox) *
+                                  Math.floor(parseNumberFlexible(offerLotInitialBoxes))
+                              )}
+                            </div>
+                          )}
+                      </>
+                    )}
+
+                    <div>
+                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                        Preço ({modalUnit}) para {activeModalityLabel} (R$) *
+                      </label>
+                      <input
+                        type="text"
+                        value={offerUnitPrice}
+                        onChange={(e) => setOfferUnitPrice(e.target.value)}
+                        placeholder="Ex: 39,90"
+                        className="w-full h-10 px-3.5 rounded-xl border border-slate-200 bg-white text-sm font-extrabold text-[#0052cc] outline-none tabular-nums"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {!isModalSpecialPiso && modalPricingType === 'unitario' && (
+                  <div>
+                    <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                      Preço ({modalUnit}) para {activeModalityLabel} (R$) *
+                    </label>
+                    <input
+                      type="text"
+                      value={offerUnitPrice}
+                      onChange={(e) => setOfferUnitPrice(e.target.value)}
+                      placeholder="Ex: 89,90"
+                      className="w-full h-10 px-3.5 rounded-xl border border-slate-200 text-sm font-extrabold text-[#0052cc] outline-none tabular-nums"
+                    />
+                  </div>
+                )}
+
+                {modalPricingType === 'escalonado' && (
+                  <div className="space-y-3 p-4 rounded-2xl bg-slate-50 border border-slate-200">
+                    <div>
+                      <label className="block text-xs font-bold text-[#0B2046] mb-1">
+                        Preço Unitário Base ({modalUnit}) (Opcional)
+                      </label>
+                      <input
+                        type="text"
+                        value={offerPriceNormal}
+                        onChange={(e) => setOfferPriceNormal(e.target.value)}
+                        placeholder="Opcional — usado fora das faixas configuradas"
+                        className="w-full h-10 px-3.5 rounded-xl border border-slate-200 bg-white text-sm font-extrabold text-[#0B2046] outline-none tabular-nums"
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 pt-1">
+                      <div>
+                        <div className="text-xs font-bold text-[#0B2046]">
+                          Faixas de Preço Escalonado ({pluralizePromoUnit(modalUnit)})
+                        </div>
+                        <p className="text-[11px] text-slate-500">
+                          O preço da faixa se aplica à quantidade total da compra.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const last = offerTiersForm[offerTiersForm.length - 1];
+                          const nextMin = last?.maxQty
+                            ? String(Math.max(1, Number(last.maxQty) + 1))
+                            : last?.minQty
+                            ? String(Math.max(1, Number(last.minQty) + 20))
+                            : '1';
+                          setOfferTiersForm((prev) => [
+                            ...prev,
+                            { id: `tier_${Date.now()}`, minQty: nextMin, maxQty: '', price: '' },
+                          ]);
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-[11px] font-bold flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Adicionar Faixa</span>
+                      </button>
+                    </div>
+
+                    <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                      {offerTiersForm.map((tier, idx) => (
+                        <div
+                          key={tier.id || idx}
+                          className="grid grid-cols-12 gap-2 items-center p-2.5 rounded-xl bg-white border border-slate-200"
+                        >
+                          <div className="col-span-3">
+                            <label className="block text-[10px] font-semibold text-slate-400">
+                              Qtd Mín *
+                            </label>
+                            <input
+                              type="number"
+                              min={1}
+                              value={tier.minQty}
+                              onChange={(e) =>
+                                setOfferTiersForm((prev) =>
+                                  prev.map((row, rIdx) =>
+                                    rIdx === idx ? { ...row, minQty: e.target.value } : row
+                                  )
+                                )
+                              }
+                              className="w-full h-8 px-2 rounded-lg border border-slate-200 text-xs font-bold tabular-nums outline-none focus:border-[#0052cc]"
+                            />
+                          </div>
+                          <div className="col-span-4">
+                            <label className="block text-[10px] font-semibold text-slate-400">
+                              Qtd Máx (vazio = +)
+                            </label>
+                            <input
+                              type="number"
+                              min={1}
+                              value={tier.maxQty}
+                              placeholder="Sem limite"
+                              onChange={(e) =>
+                                setOfferTiersForm((prev) =>
+                                  prev.map((row, rIdx) =>
+                                    rIdx === idx ? { ...row, maxQty: e.target.value } : row
+                                  )
+                                )
+                              }
+                              className="w-full h-8 px-2 rounded-lg border border-slate-200 text-xs font-bold tabular-nums outline-none focus:border-[#0052cc]"
+                            />
+                          </div>
+                          <div className="col-span-4">
+                            <label className="block text-[10px] font-semibold text-slate-400">
+                              Preço (R$/{modalUnit}) *
+                            </label>
+                            <input
+                              type="text"
+                              value={tier.price}
+                              onChange={(e) =>
+                                setOfferTiersForm((prev) =>
+                                  prev.map((row, rIdx) =>
+                                    rIdx === idx ? { ...row, price: e.target.value } : row
+                                  )
+                                )
+                              }
+                              placeholder="0,00"
+                              className="w-full h-8 px-2 rounded-lg border border-slate-200 text-xs font-extrabold text-[#0052cc] tabular-nums outline-none focus:border-[#0052cc]"
+                            />
+                          </div>
+                          <div className="col-span-1 flex justify-end pt-3">
+                            <button
+                              type="button"
+                              disabled={offerTiersForm.length <= 1}
+                              onClick={() =>
+                                setOfferTiersForm((prev) => prev.filter((_, rIdx) => rIdx !== idx))
+                              }
+                              title="Remover faixa"
+                              className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 disabled:opacity-30 cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
                   <input
-                    type="number"
-                    min={1}
-                    value={tierHeaderQ2}
-                    onChange={(e) => setTierHeaderQ2(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums"
+                    type="checkbox"
+                    checked={offerActive}
+                    onChange={(e) => setOfferActive(e.target.checked)}
+                    className="w-4 h-4 rounded border-slate-300 text-[#0052cc]"
                   />
+                  <span>Oferta ativa</span>
+                </label>
+
+                {offerFormError && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
+                    {offerFormError}
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => setIsOfferModalOpen(false)}
+                    className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSaving}
+                    className="px-5 py-2 rounded-xl bg-[#0052cc] hover:bg-blue-700 text-white text-xs sm:text-sm font-bold cursor-pointer disabled:opacity-50"
+                  >
+                    {isSaving ? 'Salvando...' : 'Salvar Produto'}
+                  </button>
                 </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">Faixa 3 (+)</label>
-                  <input
-                    type="number"
-                    min={1}
-                    value={tierHeaderQ3}
-                    onChange={(e) => setTierHeaderQ3(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-slate-200 text-sm font-bold tabular-nums"
-                  />
-                </div>
-              </div>
-              <div className="flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setTierHeaderEditCat(null)}
-                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-xl bg-[#0052cc] text-white text-xs font-bold cursor-pointer"
-                >
-                  Aplicar
-                </button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* MODAL: COPIAR ITEM PARA OUTROS PÚBLICOS */}
       {offerToReplicate && (

@@ -428,9 +428,15 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   // Clients database for accurate clientType lookup
   const [clients, setClients] = useState<ClientRecord[]>([]);
 
-  // Requirement 6: Visualização por Dia e Mês
-  const todayStr = useMemo(() => new Date().toISOString().slice(0, 10), []);
-  const currentMonthStr = useMemo(() => new Date().toISOString().slice(0, 7), []);
+  // Requirement 6: Visualização por Dia e Mês (fuso local)
+  const formatLocalISO = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+  const todayStr = useMemo(() => formatLocalISO(new Date()), []);
+  const currentMonthStr = useMemo(() => todayStr.slice(0, 7), [todayStr]);
   const [periodMode, setPeriodMode] = useState<'dia' | 'mes' | 'todos'>('mes');
   const [selectedDate, setSelectedDate] = useState<string>(todayStr);
   const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
@@ -2321,6 +2327,17 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
               clients={clients}
               currentUserName={currentUserName}
               isDirector={isDirector}
+              periodMode={periodMode}
+              onChangePeriodMode={setPeriodMode}
+              selectedMonth={selectedMonth}
+              onChangeSelectedMonth={setSelectedMonth}
+              selectedDate={selectedDate}
+              onChangeSelectedDate={(nextDate) => {
+                setSelectedDate(nextDate);
+                if (nextDate && nextDate.length >= 7) {
+                  setSelectedMonth(nextDate.slice(0, 7));
+                }
+              }}
               onViewOrcamento={handleViewTrackingOrcamento}
               onUpdateTrackingStatus={handleTrackingStatusUpdate}
               onSaveTrackingEdit={handleSaveTrackingEdit}
@@ -2388,7 +2405,9 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                 onClick={() => {
                   const d = new Date(selectedDate + 'T12:00:00');
                   d.setDate(d.getDate() - 1);
-                  setSelectedDate(d.toISOString().slice(0, 10));
+                  const next = formatLocalISO(d);
+                  setSelectedDate(next);
+                  setSelectedMonth(next.slice(0, 7));
                 }}
                 className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shadow-2xs cursor-pointer"
                 title="Dia anterior"
@@ -2398,7 +2417,11 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
               <input
                 type="date"
                 value={selectedDate}
-                onChange={(e) => setSelectedDate(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setSelectedDate(next);
+                  if (next && next.length >= 7) setSelectedMonth(next.slice(0, 7));
+                }}
                 className="h-9 px-3 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none shadow-2xs cursor-pointer"
               />
               <button
@@ -2406,7 +2429,9 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                 onClick={() => {
                   const d = new Date(selectedDate + 'T12:00:00');
                   d.setDate(d.getDate() + 1);
-                  setSelectedDate(d.toISOString().slice(0, 10));
+                  const next = formatLocalISO(d);
+                  setSelectedDate(next);
+                  setSelectedMonth(next.slice(0, 7));
                 }}
                 className="p-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shadow-2xs cursor-pointer"
                 title="Próximo dia"
@@ -2415,7 +2440,10 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => setSelectedDate(todayStr)}
+                onClick={() => {
+                  setSelectedDate(todayStr);
+                  setSelectedMonth(todayStr.slice(0, 7));
+                }}
                 className="px-3 py-1.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold transition-colors cursor-pointer"
               >
                 Hoje

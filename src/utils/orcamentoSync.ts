@@ -10,6 +10,7 @@ import {
   isPisoVinilicoColado,
   isPisoVinilicoProduct,
   isSquareMeterUnit,
+  isTarkettColado,
   parsePtBrNumeric,
 } from './pisoInsumosCalculator';
 import { RendimentoItem } from './rendimentosService';
@@ -124,7 +125,8 @@ export function classifyPisoInsumoGroup(
 
   if (
     (catNorm.includes('cola para piso') ||
-      (norm.includes('cola') && norm.includes('piso'))) &&
+      (norm.includes('cola') && norm.includes('piso')) ||
+      norm.includes('globalfix')) &&
     !norm.includes('rodape')
   ) {
     return 'cola';
@@ -378,6 +380,9 @@ export function ensurePisoLinkForExistingBudget(params: {
 
   const presentGroups = new Set<PisoInsumoGroup>();
   for (const it of itemsList) {
+    if (it.autoTag === 'toggle_area_terrea' || it.autoTag === 'quick_manta_insumo') {
+      continue;
+    }
     const grp = classifyPisoInsumoGroup(it.descricao, catalogOverride);
     if (grp) presentGroups.add(grp);
   }
@@ -497,21 +502,35 @@ export function syncPisoInsumosInItemsList(params: {
   }
 
   let totalRequestedSqmAll = 0;
-  let totalRequestedSqmCola = 0;
+  let totalRequestedSqmStandardCola = 0;
+  let totalRequestedSqmTarkettCola = 0;
   let totalRequestedSqmAntiumidade = 0;
-  let referencePisoName = activeLinkedItems[0].item.descricao;
+  const referencePisoName = activeLinkedItems[0].item.descricao;
+  let standardColaRefName = '';
+  let tarkettColaRefName = '';
 
   for (const { item, link } of activeLinkedItems) {
     const req = Math.max(0, link.requestedSqm);
     totalRequestedSqmAll = Math.round((totalRequestedSqmAll + req) * 1000) / 1000;
     if (!link.skipCola && req > 0) {
-      totalRequestedSqmCola = Math.round((totalRequestedSqmCola + req) * 1000) / 1000;
+      if (isTarkettColado(item.descricao)) {
+        totalRequestedSqmTarkettCola =
+          Math.round((totalRequestedSqmTarkettCola + req) * 1000) / 1000;
+        if (!tarkettColaRefName) tarkettColaRefName = item.descricao;
+      } else {
+        totalRequestedSqmStandardCola =
+          Math.round((totalRequestedSqmStandardCola + req) * 1000) / 1000;
+        if (!standardColaRefName) standardColaRefName = item.descricao;
+      }
     }
     if (link.includePrimerAntiumidade && req > 0) {
       totalRequestedSqmAntiumidade =
         Math.round((totalRequestedSqmAntiumidade + req) * 1000) / 1000;
     }
   }
+
+  const totalRequestedSqmCola =
+    Math.round((totalRequestedSqmStandardCola + totalRequestedSqmTarkettCola) * 1000) / 1000;
 
   // Se o usuário apagou o campo temporariamente (0) antes de digitar o novo valor,
   // zera os insumos não-travados sem destruir os vínculos.
@@ -541,10 +560,10 @@ export function syncPisoInsumosInItemsList(params: {
 
   const desiredLines: CalculatedInsumoLine[] = [...basePlan.insumos];
 
-  if (totalRequestedSqmCola > 0) {
+  if (totalRequestedSqmStandardCola > 0) {
     const colaPlan = calculatePisoInsumosForOrcamento({
-      productName: referencePisoName,
-      requestedSqm: totalRequestedSqmCola,
+      productName: standardColaRefName || referencePisoName,
+      requestedSqm: totalRequestedSqmStandardCola,
       priceTable,
       includePrimerAntiumidade: false,
       skipCola: false,
@@ -553,6 +572,23 @@ export function syncPisoInsumosInItemsList(params: {
     });
     for (const line of colaPlan.insumos) {
       if (line.kind === 'cola_18' || line.kind === 'cola_4') {
+        desiredLines.push(line);
+      }
+    }
+  }
+
+  if (totalRequestedSqmTarkettCola > 0) {
+    const tarkettColaPlan = calculatePisoInsumosForOrcamento({
+      productName: tarkettColaRefName || 'Tarkett',
+      requestedSqm: totalRequestedSqmTarkettCola,
+      priceTable,
+      includePrimerAntiumidade: false,
+      skipCola: false,
+      catalogOverride,
+      rendimentosOverride,
+    });
+    for (const line of tarkettColaPlan.insumos) {
+      if (line.kind === 'globalfix_20' || line.kind === 'globalfix_36') {
         desiredLines.push(line);
       }
     }
@@ -618,6 +654,9 @@ export function syncPisoInsumosInItemsList(params: {
 
   for (let i = next.length - 1; i >= 0; i--) {
     const it = next[i];
+    if (it.autoTag === 'toggle_area_terrea' || it.autoTag === 'quick_manta_insumo') {
+      continue;
+    }
     const grp = classifyPisoInsumoGroup(it.descricao, catalogOverride);
     if (!grp) continue;
 
@@ -653,6 +692,9 @@ export function syncPisoInsumosInItemsList(params: {
 
   const ts = Date.now();
   let idxCounter = 0;
+  const allLinkedAreQuick = activeLinkedItems.every(
+    ({ item }) => item.autoTag === 'quick_piso'
+  );
 
   for (const [normKey, { line, group }] of desiredByName.entries()) {
     if (seenNames.has(normKey)) continue;
@@ -664,6 +706,7 @@ export function syncPisoInsumosInItemsList(params: {
       unidade: line.catalogUnit,
       precoUnitario: line.catalogPrice,
       total: Math.round(line.quantity * line.catalogPrice * 100) / 100,
+      ...(allLinkedAreQuick ? { autoTag: 'quick_piso_insumo' } : {}),
     };
 
     const insertPos = firstIndexByGroup.get(group);
@@ -806,6 +849,7 @@ export function syncRodapeInsumosInItemsList(params: {
 
   for (let i = next.length - 1; i >= 0; i--) {
     const it = next[i];
+    if (it.autoTag && it.autoTag !== 'quick_rodape_insumo') continue;
     const normName = normalizeStr(it.descricao);
     const grp = classifyRodapeInsumoGroup(it.descricao, it.unidade, catalogOverride);
     if (!grp) continue;
@@ -865,6 +909,9 @@ export function syncRodapeInsumosInItemsList(params: {
 
   const ts = Date.now();
   let idxCounter = 0;
+  const allRodapeLinkedAreQuick = currentItems
+    .filter((it) => rodapeLinks.has(it.id))
+    .every((it) => it.autoTag === 'quick_rodape');
 
   for (const [key, target] of desiredColarByName.entries()) {
     if (seenColarNames.has(key)) continue;
@@ -876,6 +923,7 @@ export function syncRodapeInsumosInItemsList(params: {
       unidade: target.unit,
       precoUnitario: target.unitPrice,
       total: Math.round(target.quantity * target.unitPrice * 100) / 100,
+      ...(allRodapeLinkedAreQuick ? { autoTag: 'quick_rodape_insumo' } : {}),
     };
     if (firstColarPos !== undefined && firstColarPos >= 0 && firstColarPos <= next.length) {
       next.splice(firstColarPos, 0, newItem);
@@ -894,6 +942,7 @@ export function syncRodapeInsumosInItemsList(params: {
       unidade: target.unit,
       precoUnitario: target.unitPrice,
       total: Math.round(target.quantity * target.unitPrice * 100) / 100,
+      ...(allRodapeLinkedAreQuick ? { autoTag: 'quick_rodape_insumo' } : {}),
     };
     if (
       firstCalafetarPos !== undefined &&

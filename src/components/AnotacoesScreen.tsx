@@ -18,7 +18,6 @@ import {
   List,
   ListOrdered,
   Loader2,
-  Lock,
   NotebookPen,
   Pencil,
   Plus,
@@ -47,7 +46,6 @@ import {
   AnotacaoSheetConfig,
   AnotacaoUserKey,
   DEFAULT_SHEET_CONFIG,
-  createDefaultCategories,
   createNewAnotacaoDraft,
   deleteAnotacaoInDb,
   fetchAnotacoesDbFromSupabase,
@@ -71,7 +69,13 @@ import {
   HEADER_STYLE_OPTIONS,
   renderHeaderIcon,
 } from './AnotacaoFolhaDocument';
-import { AnotacaoRichEditor, AnotacaoRichEditorHandle } from './AnotacaoRichEditor';
+import {
+  ActiveFormatsState,
+  AnotacaoRichEditor,
+  AnotacaoRichEditorHandle,
+  DEFAULT_FONT_SIZE,
+  FONT_SIZE_STEPS,
+} from './AnotacaoRichEditor';
 
 interface AnotacoesScreenProps {
   currentUserName: string;
@@ -89,6 +93,17 @@ const HIGHLIGHT_COLORS = [
   { id: 'pink', label: 'Rosa Suave', value: '#FBCFE8', border: '#F472B6' },
   { id: 'orange', label: 'Pêssego', value: '#FED7AA', border: '#FB923C' },
   { id: 'purple', label: 'Lavanda', value: '#E9D5FF', border: '#C084FC' },
+];
+
+const TEXT_COLORS = [
+  { id: 'ink-black', label: 'Preto Padrão', value: '#0F172A' },
+  { id: 'fenix-navy', label: 'Azul Fênix', value: '#0B3F7D' },
+  { id: 'royal-blue', label: 'Azul Royal', value: '#1D4ED8' },
+  { id: 'crimson', label: 'Vermelho', value: '#DC2626' },
+  { id: 'emerald', label: 'Verde', value: '#15803D' },
+  { id: 'violet', label: 'Roxo', value: '#7E22CE' },
+  { id: 'amber-dark', label: 'Laranja Escuro', value: '#C2410C' },
+  { id: 'slate', label: 'Cinza Escuro', value: '#475569' },
 ];
 
 const SHARED_SECTION_ID = '__shared_with_me__';
@@ -128,8 +143,8 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   const [categoriesByUser, setCategoriesByUser] = useState<
     Record<AnotacaoUserKey, AnotacaoCategory[]>
   >({
-    vanessa: createDefaultCategories(),
-    jhessica: createDefaultCategories(),
+    vanessa: [],
+    jhessica: [],
   });
   const [sheetConfigByUser, setSheetConfigByUser] = useState<
     Record<AnotacaoUserKey, AnotacaoSheetConfig>
@@ -139,7 +154,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   });
 
   // Navegação & seleção
-  const [selectedFolderId, setSelectedFolderId] = useState<string>('cat_negociacoes');
+  const [selectedFolderId, setSelectedFolderId] = useState<string>('');
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [draftNote, setDraftNote] = useState<AnotacaoItem | null>(null);
   const [isNewDraft, setIsNewDraft] = useState(false);
@@ -179,17 +194,20 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   const [isSavingPersonalize, setIsSavingPersonalize] = useState(false);
 
   const [isHighlightMenuOpen, setIsHighlightMenuOpen] = useState(false);
+  const [isTextColorMenuOpen, setIsTextColorMenuOpen] = useState(false);
   const [isPrintMenuOpen, setIsPrintMenuOpen] = useState(false);
   const [printMode, setPrintMode] = useState<'print-filled' | 'print-blank'>('print-filled');
   const [printMeasureKey, setPrintMeasureKey] = useState(0);
   const [pdfRenderMode, setPdfRenderMode] = useState<'print-filled' | 'print-blank' | null>(null);
 
-  const [activeFormats, setActiveFormats] = useState({
+  const [activeFormats, setActiveFormats] = useState<ActiveFormatsState>({
     bold: false,
     italic: false,
     underline: false,
     unorderedList: false,
     orderedList: false,
+    fontSize: DEFAULT_FONT_SIZE,
+    textColor: null,
   });
 
   // Undo / Redo por nota
@@ -206,6 +224,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   const hasUnsavedRef = useRef(false);
   const isEditingRef = useRef(false);
   const highlightMenuRef = useRef<HTMLDivElement | null>(null);
+  const textColorMenuRef = useRef<HTMLDivElement | null>(null);
   const printMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -233,6 +252,9 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
       if (highlightMenuRef.current && !highlightMenuRef.current.contains(target)) {
         setIsHighlightMenuOpen(false);
       }
+      if (textColorMenuRef.current && !textColorMenuRef.current.contains(target)) {
+        setIsTextColorMenuOpen(false);
+      }
       if (printMenuRef.current && !printMenuRef.current.contains(target)) {
         setIsPrintMenuOpen(false);
       }
@@ -242,7 +264,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   }, []);
 
   const userCategories = useMemo(
-    () => categoriesByUser[currentUserKey] || createDefaultCategories(),
+    () => categoriesByUser[currentUserKey] || [],
     [categoriesByUser, currentUserKey]
   );
 
@@ -264,8 +286,9 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
   // Mantém folder selecionado válido
   useEffect(() => {
     if (selectedFolderId === SHARED_SECTION_ID) return;
+    if (userCategories.length === 0) return;
     if (!userCategories.some((c) => c.id === selectedFolderId)) {
-      setSelectedFolderId(userCategories[0]?.id || 'cat_negociacoes');
+      setSelectedFolderId(userCategories[0].id);
     }
   }, [userCategories, selectedFolderId]);
 
@@ -314,13 +337,28 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
       setSheetConfigByUser(db.sheetConfigByUser);
       setIsLoading(false);
 
+      const loadedCats = db.categoriesByUser[currentUserKey] || [];
+      setSelectedFolderId((prevFolder) => {
+        if (prevFolder === SHARED_SECTION_ID) return prevFolder;
+        if (prevFolder && loadedCats.some((c) => c.id === prevFolder)) return prevFolder;
+        return loadedCats[0]?.id || '';
+      });
+
+      setDraftNote((prevDraft) => {
+        if (!prevDraft) return null;
+        const ownerCats = db.categoriesByUser[prevDraft.ownerKey] || [];
+        if (ownerCats.length > 0 && !ownerCats.some((c) => c.id === prevDraft.categoryId)) {
+          return { ...prevDraft, categoryId: ownerCats[0].id };
+        }
+        return prevDraft;
+      });
+
       const { owned, sharedWithMe } = getVisibleNotesForUser(db.notes, currentUserKey);
       const allVisible = [...owned, ...sharedWithMe];
 
       setSelectedNoteId((prevId) => {
         if (prevId && allVisible.some((n) => n.id === prevId)) return prevId;
-        const cats = db.categoriesByUser[currentUserKey] || [];
-        const firstOwned = owned.find((n) => n.categoryId === cats[0]?.id) || owned[0];
+        const firstOwned = owned.find((n) => n.categoryId === loadedCats[0]?.id) || owned[0];
         if (firstOwned) {
           setSelectedFolderId(firstOwned.categoryId);
           return firstOwned.id;
@@ -339,7 +377,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     loadDatabase(false);
   }, [loadDatabase]);
 
-  // Realtime sync via Supabase (fenix_anotacoes_realtime_updated) e retorno de foco
+  // Realtime sync via Supabase (fenix_anotacoes_realtime_updated) e retorno de foco / polling silencioso
   useEffect(() => {
     const handleRealtimePayload = (e: Event) => {
       const detail = (e as CustomEvent)?.detail;
@@ -349,12 +387,25 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
       setCategoriesByUser(incomingDb.categoriesByUser);
       setSheetConfigByUser(incomingDb.sheetConfigByUser);
 
+      const incomingCats = incomingDb.categoriesByUser[currentUserKey] || [];
+      setSelectedFolderId((prevFolder) => {
+        if (prevFolder === SHARED_SECTION_ID) return prevFolder;
+        if (prevFolder && incomingCats.some((c) => c.id === prevFolder)) return prevFolder;
+        return incomingCats[0]?.id || '';
+      });
+
       const { owned, sharedWithMe } = getVisibleNotesForUser(incomingDb.notes, currentUserKey);
       const visibleAll = [...owned, ...sharedWithMe];
 
       setDraftNote((prevDraft) => {
         if (!prevDraft) return null;
-        if (hasUnsavedRef.current) return prevDraft;
+        if (hasUnsavedRef.current) {
+          const ownerCats = incomingDb.categoriesByUser[prevDraft.ownerKey] || [];
+          if (ownerCats.length > 0 && !ownerCats.some((c) => c.id === prevDraft.categoryId)) {
+            return { ...prevDraft, categoryId: ownerCats[0].id };
+          }
+          return prevDraft;
+        }
         const match = visibleAll.find((n) => n.id === prevDraft.id);
         return match ? cloneNote(match) : null;
       });
@@ -368,15 +419,22 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
     };
 
     const handleWindowFocus = () => {
-      if (document.visibilityState === 'visible' && !isEditingRef.current && !hasUnsavedRef.current) {
+      if (document.visibilityState === 'visible' && !hasUnsavedRef.current) {
         loadDatabase(true);
       }
     };
+
+    const syncInterval = setInterval(() => {
+      if (document.visibilityState === 'visible' && !hasUnsavedRef.current) {
+        loadDatabase(true);
+      }
+    }, 20000);
 
     window.addEventListener('fenix_anotacoes_realtime_updated', handleRealtimePayload);
     window.addEventListener('focus', handleWindowFocus);
     document.addEventListener('visibilitychange', handleWindowFocus);
     return () => {
+      clearInterval(syncInterval);
       window.removeEventListener('fenix_anotacoes_realtime_updated', handleRealtimePayload);
       window.removeEventListener('focus', handleWindowFocus);
       document.removeEventListener('visibilitychange', handleWindowFocus);
@@ -1187,10 +1245,6 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                 <h2 className="text-lg sm:text-xl font-bold text-slate-900">
                   Caderno Digital — Anotações Fênix World
                 </h2>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold bg-blue-50 text-[#0B3F7D] border border-blue-200 rounded-md">
-                  <Lock className="w-3 h-3" />
-                  Caderno de {getAnotacaoUserFirstName(currentUserKey)}
-                </span>
               </div>
               <p className="text-xs text-slate-500">
                 Pastas independentes, editor contínuo com destaques e checklists, folha A4 e compartilhamento seletivo com {otherFirstName}.
@@ -1365,7 +1419,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
             <div className="px-3.5 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-600">
-                Pastas de {getAnotacaoUserFirstName(currentUserKey)}
+                Pastas
               </span>
               <button
                 type="button"
@@ -1708,7 +1762,11 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                     <div className="inline-flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5">
                       <FolderInput className="w-3.5 h-3.5 text-[#0B3F7D]" />
                       <select
-                        value={draftNote.categoryId}
+                        value={
+                          userCategories.some((c) => c.id === draftNote.categoryId)
+                            ? draftNote.categoryId
+                            : userCategories[0]?.id || ''
+                        }
                         onChange={(e) => handleMoveNoteToCategory(draftNote, e.target.value)}
                         className="bg-transparent text-xs font-semibold text-slate-700 focus:outline-none cursor-pointer"
                         title="Mover anotação para outra categoria"
@@ -1903,6 +1961,103 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
 
                   <div className="w-px h-5 bg-slate-200 mx-0.5" />
 
+                  {/* Aumentar e Diminuir Fonte */}
+                  <div className="flex items-center gap-0.5">
+                    <button
+                      type="button"
+                      disabled={(activeFormats.fontSize ?? DEFAULT_FONT_SIZE) <= FONT_SIZE_STEPS[0]}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        editorRef.current?.changeFontSize('decrease');
+                      }}
+                      title="Diminuir fonte"
+                      className="px-2 py-1 rounded-lg border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-40 text-xs font-bold cursor-pointer"
+                    >
+                      A-
+                    </button>
+                    <span className="px-1.5 text-[11px] font-semibold text-slate-500 min-w-[30px] text-center select-none">
+                      {activeFormats.fontSize ?? DEFAULT_FONT_SIZE}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={(activeFormats.fontSize ?? DEFAULT_FONT_SIZE) >= FONT_SIZE_STEPS[FONT_SIZE_STEPS.length - 1]}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        editorRef.current?.changeFontSize('increase');
+                      }}
+                      title="Aumentar fonte"
+                      className="px-2 py-1 rounded-lg border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-40 text-xs font-bold cursor-pointer"
+                    >
+                      A+
+                    </button>
+                  </div>
+
+                  <div className="w-px h-5 bg-slate-200 mx-0.5" />
+
+                  {/* Cor do Texto (Paleta independente do Destaque) */}
+                  <div className="relative flex items-center" ref={textColorMenuRef}>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        editorRef.current?.saveSelection();
+                        setIsHighlightMenuOpen(false);
+                        setIsTextColorMenuOpen((v) => !v);
+                      }}
+                      title="Escolher cor do texto"
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-200 bg-slate-50 text-slate-800 hover:bg-slate-100 text-xs font-bold cursor-pointer"
+                    >
+                      <span className="flex flex-col items-center leading-none">
+                        <span className="text-xs font-extrabold">A</span>
+                        <span
+                          className="w-3.5 h-1 rounded-xs mt-0.5"
+                          style={{
+                            backgroundColor: activeFormats.textColor || '#0F172A',
+                          }}
+                        />
+                      </span>
+                      <ChevronDown className="w-3 h-3 text-slate-500" />
+                    </button>
+
+                    {isTextColorMenuOpen && (
+                      <div className="absolute left-0 top-full mt-1.5 bg-white rounded-xl border border-slate-200 shadow-xl p-2.5 z-40 w-52">
+                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                          Cor do Texto
+                        </div>
+                        <div className="grid grid-cols-4 gap-1.5 mb-2">
+                          {TEXT_COLORS.map((color) => (
+                            <button
+                              key={color.id}
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                editorRef.current?.applyTextColor(color.value);
+                                setIsTextColorMenuOpen(false);
+                              }}
+                              title={color.label}
+                              style={{ backgroundColor: color.value }}
+                              className="w-8 h-7 rounded-md border border-slate-300 hover:scale-105 transition-transform cursor-pointer"
+                            />
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            editorRef.current?.applyTextColor(null);
+                            setIsTextColorMenuOpen(false);
+                          }}
+                          className="w-full py-1.5 px-2 text-xs font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 rounded-md flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Eraser className="w-3.5 h-3.5" />
+                          <span>Cor padrão</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="w-px h-5 bg-slate-200 mx-0.5" />
+
                   {/* Destaque de Texto + Paleta de Cores */}
                   <div className="relative flex items-center gap-1" ref={highlightMenuRef}>
                     <button
@@ -1924,6 +2079,7 @@ export const AnotacoesScreen: React.FC<AnotacoesScreenProps> = ({ currentUserNam
                       onMouseDown={(e) => {
                         e.preventDefault();
                         editorRef.current?.saveSelection();
+                        setIsTextColorMenuOpen(false);
                         setIsHighlightMenuOpen((v) => !v);
                       }}
                       title="Escolher cor de destaque"

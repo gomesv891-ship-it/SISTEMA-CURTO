@@ -22,6 +22,9 @@ import {
   Check,
   AlertCircle,
   Trash2,
+  Calculator,
+  FileText,
+  CheckSquare,
 } from 'lucide-react';
 import { ClientRecord, ClientType } from '../types';
 import { ClientePerfilModal } from './ClientePerfilModal';
@@ -44,7 +47,7 @@ interface ClientesScreenProps {
   onSelectClientAction: (
     action: 'Calculadora' | 'Orçamentos' | 'Tarefas',
     client: ClientRecord,
-    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean }
+    options?: { createOrcamento?: boolean; openNewTaskModal?: boolean; scrollToProducts?: boolean }
   ) => void;
   onOpenCadastro?: () => void;
 }
@@ -118,6 +121,10 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
   const [isNewClientModalOpen, setIsNewClientModalOpen] = useState(false);
   const [viewingClient, setViewingClient] = useState<ClientRecord | null>(initialClient || null);
   const [editingClient, setEditingClient] = useState<ClientRecord | null>(null);
+  const [postSaveConfirmClient, setPostSaveConfirmClient] = useState<{
+    client: ClientRecord;
+    mode: 'created' | 'updated';
+  } | null>(null);
 
   useEffect(() => {
     if (initialClient) {
@@ -366,6 +373,7 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
 
     if (action === 'save_only') {
       showToast(`✓ Cliente "${savedClient.name}" cadastrado com sucesso.`);
+      setPostSaveConfirmClient({ client: savedClient, mode: 'created' });
     } else if (action === 'go_calculadora') {
       onSelectClientAction('Calculadora', savedClient);
     } else if (action === 'go_orcamento') {
@@ -487,6 +495,7 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
 
       setEditingClient(null);
       showToast(`✓ Cliente "${updatedClient.name}" atualizado e sincronizado em todos os módulos.`);
+      setPostSaveConfirmClient({ client: updatedClient, mode: 'updated' });
     } catch (err: any) {
       showToast(err?.message || 'Não foi possível salvar as alterações. Seus dados foram preservados.');
     } finally {
@@ -1328,6 +1337,131 @@ export const ClientesScreen: React.FC<ClientesScreenProps> = ({
           </div>
         </div>
       )}
+      {/* MODAL DE CONFIRMAÇÃO APÓS SALVAR CLIENTE (CRIAÇÃO OU EDIÇÃO) */}
+      {postSaveConfirmClient && (() => {
+        const { client, mode } = postSaveConfirmClient;
+        const typeInfo = getClientTypeIconInfo(client.clientType);
+        const TypeIcon = typeInfo.Icon;
+
+        const handleConfirmAction = (action: 'Calculadora' | 'Orçamentos' | 'Tarefas') => {
+          try {
+            localStorage.setItem('fenix_active_client', JSON.stringify(client));
+          } catch {}
+          setPostSaveConfirmClient(null);
+          if (action === 'Tarefas') {
+            onSelectClientAction('Tarefas', client, { openNewTaskModal: true });
+          } else if (action === 'Orçamentos') {
+            onSelectClientAction('Orçamentos', client, { createOrcamento: true, scrollToProducts: true });
+          } else {
+            onSelectClientAction('Calculadora', client);
+          }
+        };
+
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150"
+            onClick={() => setPostSaveConfirmClient(null)}
+          >
+            <div
+              className="bg-white rounded-3xl border border-slate-200/90 shadow-2xl max-w-lg w-full overflow-hidden animate-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/60">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-200">
+                    <CheckCircle2 className="w-5 h-5 stroke-[2.3]" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm sm:text-base font-extrabold text-[#091122]">
+                      {mode === 'created' ? 'Cliente Cadastrado' : 'Cliente Atualizado'}
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Dados salvos com sucesso no sistema
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPostSaveConfirmClient(null)}
+                  className="w-8 h-8 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 flex items-center justify-center transition-colors cursor-pointer"
+                  aria-label="Fechar"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-6 flex flex-col items-center text-center space-y-5">
+                <div className="space-y-1.5">
+                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-[#0052cc] text-xs font-bold border border-blue-100">
+                    <TypeIcon className="w-3.5 h-3.5" />
+                    <span>{client.clientType || 'Cliente Final'}</span>
+                  </div>
+                  <h4 className="text-lg sm:text-xl font-black text-[#091122] tracking-tight">
+                    {client.name}
+                  </h4>
+                  <p className="text-xs sm:text-sm text-slate-600 font-medium">
+                    O que você deseja fazer agora com este cliente?
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full">
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmAction('Tarefas')}
+                    className="p-4 rounded-2xl bg-white hover:bg-slate-50 border-2 border-slate-200 text-slate-800 flex flex-col items-center justify-center text-center gap-2 shadow-sm transition-all cursor-pointer group active:scale-[0.98]"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center group-hover:scale-110 transition-transform">
+                      <CheckSquare className="w-5 h-5 text-slate-700 stroke-[2.2]" />
+                    </div>
+                    <span className="text-sm font-bold text-slate-900">Tarefas</span>
+                    <span className="text-[11px] text-slate-500 font-medium leading-tight">
+                      Agendar tarefa, contato ou retorno
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmAction('Orçamentos')}
+                    className="p-4 rounded-2xl bg-[#0052cc] hover:bg-[#0047b3] text-white flex flex-col items-center justify-center text-center gap-2 shadow-lg shadow-blue-600/20 transition-all cursor-pointer group active:scale-[0.98]"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center group-hover:scale-110 transition-transform">
+                      <FileText className="w-5 h-5 text-white stroke-[2.2]" />
+                    </div>
+                    <span className="text-sm font-bold">Orçamento</span>
+                    <span className="text-[11px] text-blue-100 font-medium leading-tight">
+                      Abrir criação com cliente preenchido
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmAction('Calculadora')}
+                    className="p-4 rounded-2xl bg-[#091122] hover:bg-black text-white flex flex-col items-center justify-center text-center gap-2 shadow-lg shadow-slate-900/20 transition-all cursor-pointer group active:scale-[0.98]"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center group-hover:scale-110 transition-transform">
+                      <Calculator className="w-5 h-5 text-white stroke-[2.2]" />
+                    </div>
+                    <span className="text-sm font-bold">Calculadora</span>
+                    <span className="text-[11px] text-slate-300 font-medium leading-tight">
+                      Abrir calculadora técnica
+                    </span>
+                  </button>
+                </div>
+
+                <div className="pt-2 border-t border-slate-100 w-full flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setPostSaveConfirmClient(null)}
+                    className="px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    Permanecer na Lista de Clientes
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

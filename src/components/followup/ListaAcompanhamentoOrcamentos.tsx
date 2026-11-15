@@ -21,6 +21,9 @@ import {
   ArrowUpDown,
   Hash,
   Sparkles,
+  Calendar,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import {
   ClientRecord,
@@ -47,29 +50,7 @@ import { ResponsibleFilterTabs } from '../ResponsibleFilterTabs';
 
 export type TrackingListStatus = OfficialFollowUpStatus;
 export type TrackingStatusFilter = 'Todos' | OfficialFollowUpStatus;
-export type TrackingPeriodMode =
-  | 'todos'
-  | 'hoje'
-  | '7dias'
-  | '30dias'
-  | 'mes_atual'
-  | 'dia'
-  | 'mes'
-  | 'personalizado';
-export type TrackingValueRangeFilter =
-  | 'todos'
-  | 'ate_2k'
-  | '2k_5k'
-  | '5k_15k'
-  | '15k_30k'
-  | 'acima_30k';
-export type TrackingSqmRangeFilter =
-  | 'todos'
-  | 'ate_20'
-  | '20_50'
-  | '50_100'
-  | 'acima_100'
-  | 'sem_metragem';
+export type TrackingPeriodMode = 'dia' | 'mes' | 'todos';
 export type TrackingSortOrder =
   | 'recentes'
   | 'antigos'
@@ -481,6 +462,12 @@ interface ListaAcompanhamentoOrcamentosProps {
   clients: ClientRecord[];
   currentUserName: string;
   isDirector: boolean;
+  periodMode?: TrackingPeriodMode;
+  onChangePeriodMode?: (mode: TrackingPeriodMode) => void;
+  selectedMonth?: string;
+  onChangeSelectedMonth?: (month: string) => void;
+  selectedDate?: string;
+  onChangeSelectedDate?: (date: string) => void;
   onViewOrcamento: (row: TrackingOrcamentoRow) => void;
   onUpdateTrackingStatus: (row: TrackingOrcamentoRow, newStatus: OfficialFollowUpStatus) => Promise<void> | void;
   onSaveTrackingEdit: (
@@ -506,6 +493,12 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
   clients,
   currentUserName,
   isDirector,
+  periodMode: controlledPeriodMode,
+  onChangePeriodMode,
+  selectedMonth: controlledSelectedMonth,
+  onChangeSelectedMonth,
+  selectedDate: controlledSelectedDate,
+  onChangeSelectedDate,
   onViewOrcamento,
   onUpdateTrackingStatus,
   onSaveTrackingEdit,
@@ -517,13 +510,26 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
   // Filtros combinados
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<TrackingStatusFilter>('Todos');
-  const [periodMode, setPeriodMode] = useState<TrackingPeriodMode>('todos');
-  const [selectedDate, setSelectedDate] = useState<string>(todayStr);
-  const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
-  const [customStartDate, setCustomStartDate] = useState<string>('');
-  const [customEndDate, setCustomEndDate] = useState<string>('');
-  const [valueRangeFilter, setValueRangeFilter] = useState<TrackingValueRangeFilter>('todos');
-  const [sqmRangeFilter, setSqmRangeFilter] = useState<TrackingSqmRangeFilter>('todos');
+  const [internalPeriodMode, setInternalPeriodMode] = useState<TrackingPeriodMode>('mes');
+  const [internalSelectedDate, setInternalSelectedDate] = useState<string>(todayStr);
+  const [internalSelectedMonth, setInternalSelectedMonth] = useState<string>(currentMonthStr);
+  const periodMode = controlledPeriodMode ?? internalPeriodMode;
+  const selectedDate = controlledSelectedDate ?? internalSelectedDate;
+  const selectedMonth = controlledSelectedMonth ?? internalSelectedMonth;
+
+  const setPeriodMode = (nextMode: TrackingPeriodMode) => {
+    setInternalPeriodMode(nextMode);
+    onChangePeriodMode?.(nextMode);
+  };
+  const setSelectedDate = (nextDate: string) => {
+    setInternalSelectedDate(nextDate);
+    onChangeSelectedDate?.(nextDate);
+  };
+  const setSelectedMonth = (nextMonth: string) => {
+    setInternalSelectedMonth(nextMonth);
+    onChangeSelectedMonth?.(nextMonth);
+  };
+
   const [sortOrder, setSortOrder] = useState<TrackingSortOrder>('recentes');
   const [responsibleTab, setResponsibleTab] = useState<string>('Todos');
 
@@ -587,93 +593,34 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
     return allRows.filter((r) => isRecordOfResponsible(r, currentUserName || ''));
   }, [allRows, isDirector, responsibleTab, currentUserName]);
 
-  // Datas auxiliares para filtros de período relativo
-  const sevenDaysAgoStr = useMemo(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 6);
-    return getLocalISODate(d);
-  }, []);
-
-  const thirtyDaysAgoStr = useMemo(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 29);
-    return getLocalISODate(d);
-  }, []);
-
-  // Contadores de status sobre a base do usuário (combinando pesquisa, período, faixa de valor e metragem)
+  // Contadores de status sobre a base do usuário (combinando pesquisa por cliente/telefone e período dia/mês)
   const preStatusRows = useMemo(() => {
     const q = normalizeSearchText(searchTerm);
-    const qCleanHash = q.replace(/^#+/, '');
     const qDigits = q.replace(/\D/g, '');
 
     return userScopedRows.filter((row) => {
-      // Período de criação
-      if (periodMode === 'hoje') {
-        if (row.creationDateStr !== todayStr) return false;
-      } else if (periodMode === '7dias') {
-        if (!row.creationDateStr || row.creationDateStr < sevenDaysAgoStr) return false;
-      } else if (periodMode === '30dias') {
-        if (!row.creationDateStr || row.creationDateStr < thirtyDaysAgoStr) return false;
-      } else if (periodMode === 'mes_atual') {
-        if (row.creationMonthStr !== currentMonthStr) return false;
-      } else if (periodMode === 'dia') {
+      // Período de criação compartilhado (dia ou mês; 'todos' caso selecionado na Visão Geral)
+      if (periodMode === 'dia') {
         if (row.creationDateStr !== selectedDate) return false;
       } else if (periodMode === 'mes') {
         if (row.creationMonthStr !== selectedMonth) return false;
-      } else if (periodMode === 'personalizado') {
-        if (customStartDate && (!row.creationDateStr || row.creationDateStr < customStartDate)) return false;
-        if (customEndDate && (!row.creationDateStr || row.creationDateStr > customEndDate)) return false;
       }
 
-      // Faixa de valor
-      if (valueRangeFilter === 'ate_2k' && row.valor > 2000) return false;
-      if (valueRangeFilter === '2k_5k' && (row.valor <= 2000 || row.valor > 5000)) return false;
-      if (valueRangeFilter === '5k_15k' && (row.valor <= 5000 || row.valor > 15000)) return false;
-      if (valueRangeFilter === '15k_30k' && (row.valor <= 15000 || row.valor > 30000)) return false;
-      if (valueRangeFilter === 'acima_30k' && row.valor <= 30000) return false;
-
-      // Faixa de metragem
-      if (sqmRangeFilter === 'ate_20' && (row.sqm <= 0 || row.sqm > 20)) return false;
-      if (sqmRangeFilter === '20_50' && (row.sqm <= 20 || row.sqm > 50)) return false;
-      if (sqmRangeFilter === '50_100' && (row.sqm <= 50 || row.sqm > 100)) return false;
-      if (sqmRangeFilter === 'acima_100' && row.sqm <= 100) return false;
-      if (sqmRangeFilter === 'sem_metragem' && row.sqm > 0) return false;
-
-      // Busca por cliente, telefone ou número do orçamento
+      // Busca exclusivamente por nome do cliente ou telefone
       if (!q) return true;
 
       const inClient = normalizeSearchText(row.cliente).includes(q);
-      const inBudgetName = normalizeSearchText(row.nomeOrcamento).includes(q);
-      const inPedido = normalizeSearchText(row.pedido).replace(/^#+/, '').includes(qCleanHash);
-      const inNumeroOrc = normalizeSearchText(row.numeroOrcamento).includes(qCleanHash);
-      const inOrcId = normalizeSearchText(row.orcamentoId).includes(qCleanHash);
       const inPhone = normalizeSearchText(row.telefone).includes(q);
       const phoneDigits = row.telefone.replace(/\D/g, '');
       const inPhoneDigits = qDigits.length >= 3 && phoneDigits.includes(qDigits);
 
-      return (
-        inClient ||
-        inBudgetName ||
-        inPedido ||
-        inNumeroOrc ||
-        inOrcId ||
-        inPhone ||
-        inPhoneDigits
-      );
+      return inClient || inPhone || inPhoneDigits;
     });
   }, [
     userScopedRows,
     periodMode,
-    todayStr,
-    sevenDaysAgoStr,
-    thirtyDaysAgoStr,
-    currentMonthStr,
     selectedDate,
     selectedMonth,
-    customStartDate,
-    customEndDate,
-    valueRangeFilter,
-    sqmRangeFilter,
     searchTerm,
   ]);
 
@@ -725,22 +672,17 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
   const hasActiveFilters =
     searchTerm.trim() !== '' ||
     statusFilter !== 'Todos' ||
-    periodMode !== 'todos' ||
-    valueRangeFilter !== 'todos' ||
-    sqmRangeFilter !== 'todos' ||
+    periodMode !== 'mes' ||
+    selectedMonth !== currentMonthStr ||
     sortOrder !== 'recentes' ||
     (isDirector && responsibleTab !== 'Todos');
 
   const handleClearFilters = () => {
     setSearchTerm('');
     setStatusFilter('Todos');
-    setPeriodMode('todos');
+    setPeriodMode('mes');
     setSelectedDate(todayStr);
     setSelectedMonth(currentMonthStr);
-    setCustomStartDate('');
-    setCustomEndDate('');
-    setValueRangeFilter('todos');
-    setSqmRangeFilter('todos');
     setSortOrder('recentes');
     if (isDirector) setResponsibleTab('Todos');
   };
@@ -846,18 +788,18 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
         />
       )}
 
-      {/* Barra Compacta de Filtros e Ordenação acima da tabela */}
+      {/* Barra de Filtros em exatamente duas linhas */}
       <div className="bg-white rounded-[22px] border border-slate-200/90 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.04)] p-3.5 sm:p-4 space-y-2.5">
-        {/* Grade compacta de filtros combináveis */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-2 items-center">
-          {/* 1. Busca por cliente, telefone ou número do orçamento */}
-          <div className="relative lg:col-span-4">
+        {/* Linha 1: Busca (cliente ou telefone) + Seletor de dia + Seletor de mês + Ordenação */}
+        <div className="flex flex-wrap xl:flex-nowrap items-center gap-2">
+          {/* Busca por nome do cliente ou telefone */}
+          <div className="relative flex-1 min-w-[210px]">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               type="text"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Buscar cliente, telefone ou nº orçamento..."
+              placeholder="Buscar por nome do cliente ou telefone..."
               className="w-full h-9 pl-8.5 pr-8 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs text-slate-800 placeholder:text-slate-400 outline-none transition-all"
             />
             {searchTerm && (
@@ -872,81 +814,118 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
             )}
           </div>
 
-          {/* 2. Status (somente os 5 oficiais + Todos) */}
-          <div className="lg:col-span-2">
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as TrackingStatusFilter)}
-              aria-label="Filtrar por Status"
-              className="w-full h-9 px-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+          {/* Seletor de dia com navegação anterior e seguinte */}
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                const base = selectedDate || todayStr;
+                const d = new Date(`${base}T12:00:00`);
+                d.setDate(d.getDate() - 1);
+                setSelectedDate(getLocalISODate(d));
+                setPeriodMode('dia');
+              }}
+              className="h-9 w-8 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 flex items-center justify-center cursor-pointer transition-colors"
+              title="Dia anterior"
+              aria-label="Dia anterior"
             >
-              <option value="Todos">Status: Todos ({statusCounts.Todos})</option>
-              {OFFICIAL_TRACKING_STATUSES.map((st) => (
-                <option key={st.value} value={st.value}>
-                  {st.label} ({statusCounts[st.value]})
-                </option>
-              ))}
-            </select>
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <input
+              type="date"
+              value={selectedDate}
+              onClick={() => {
+                if (periodMode !== 'dia') setPeriodMode('dia');
+              }}
+              onChange={(e) => {
+                const next = e.target.value;
+                if (next) {
+                  setSelectedDate(next);
+                  setPeriodMode('dia');
+                }
+              }}
+              aria-label="Selecionar dia"
+              title="Filtrar pelo dia selecionado"
+              className={`h-9 px-2.5 rounded-xl border text-xs font-bold outline-none cursor-pointer transition-colors ${
+                periodMode === 'dia'
+                  ? 'border-[#0052cc] bg-blue-50/70 text-[#0052cc]'
+                  : 'border-slate-200 bg-slate-50/80 text-slate-700 hover:bg-slate-50 focus:border-[#0052cc]'
+              }`}
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const base = selectedDate || todayStr;
+                const d = new Date(`${base}T12:00:00`);
+                d.setDate(d.getDate() + 1);
+                setSelectedDate(getLocalISODate(d));
+                setPeriodMode('dia');
+              }}
+              className="h-9 w-8 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 flex items-center justify-center cursor-pointer transition-colors"
+              title="Próximo dia"
+              aria-label="Próximo dia"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
           </div>
 
-          {/* 3. Período de criação */}
-          <div className="lg:col-span-2">
-            <select
-              value={periodMode}
-              onChange={(e) => setPeriodMode(e.target.value as TrackingPeriodMode)}
-              aria-label="Filtrar por Período de Criação"
-              className="w-full h-9 px-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+          {/* Seletor de mês com navegação anterior e seguinte */}
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                const [y, m] = (selectedMonth || currentMonthStr).split('-').map(Number);
+                const prevM = m === 1 ? 12 : m - 1;
+                const prevY = m === 1 ? y - 1 : y;
+                setSelectedMonth(`${prevY}-${String(prevM).padStart(2, '0')}`);
+                setPeriodMode('mes');
+              }}
+              className="h-9 w-8 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 flex items-center justify-center cursor-pointer transition-colors"
+              title="Mês anterior"
+              aria-label="Mês anterior"
             >
-              <option value="todos">Período: Todos</option>
-              <option value="hoje">Hoje</option>
-              <option value="7dias">Últimos 7 dias</option>
-              <option value="30dias">Últimos 30 dias</option>
-              <option value="mes_atual">Este mês</option>
-              <option value="dia">Dia específico...</option>
-              <option value="mes">Mês específico...</option>
-              <option value="personalizado">Intervalo de datas...</option>
-            </select>
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <input
+              type="month"
+              value={selectedMonth}
+              onClick={() => {
+                if (periodMode !== 'mes') setPeriodMode('mes');
+              }}
+              onChange={(e) => {
+                if (e.target.value) {
+                  setSelectedMonth(e.target.value);
+                  setPeriodMode('mes');
+                }
+              }}
+              aria-label="Selecionar mês"
+              title="Filtrar pelo mês selecionado"
+              className={`h-9 px-2.5 rounded-xl border text-xs font-bold outline-none cursor-pointer transition-colors ${
+                periodMode === 'mes'
+                  ? 'border-[#0052cc] bg-blue-50/70 text-[#0052cc]'
+                  : 'border-slate-200 bg-slate-50/80 text-slate-700 hover:bg-slate-50 focus:border-[#0052cc]'
+              }`}
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const [y, m] = (selectedMonth || currentMonthStr).split('-').map(Number);
+                const nextM = m === 12 ? 1 : m + 1;
+                const nextY = m === 12 ? y + 1 : y;
+                setSelectedMonth(`${nextY}-${String(nextM).padStart(2, '0')}`);
+                setPeriodMode('mes');
+              }}
+              className="h-9 w-8 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 flex items-center justify-center cursor-pointer transition-colors"
+              title="Próximo mês"
+              aria-label="Próximo mês"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
           </div>
 
-          {/* 4. Faixa de valor */}
-          <div className="lg:col-span-1">
-            <select
-              value={valueRangeFilter}
-              onChange={(e) => setValueRangeFilter(e.target.value as TrackingValueRangeFilter)}
-              aria-label="Filtrar por Faixa de Valor"
-              title="Faixa de valor"
-              className="w-full h-9 px-2 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
-            >
-              <option value="todos">Valor: Todos</option>
-              <option value="ate_2k">Até R$ 2 mil</option>
-              <option value="2k_5k">R$ 2 mil – 5 mil</option>
-              <option value="5k_15k">R$ 5 mil – 15 mil</option>
-              <option value="15k_30k">R$ 15 mil – 30 mil</option>
-              <option value="acima_30k">Acima R$ 30 mil</option>
-            </select>
-          </div>
-
-          {/* 5. Metragem */}
-          <div className="lg:col-span-1">
-            <select
-              value={sqmRangeFilter}
-              onChange={(e) => setSqmRangeFilter(e.target.value as TrackingSqmRangeFilter)}
-              aria-label="Filtrar por Metragem"
-              title="Metragem"
-              className="w-full h-9 px-2 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-[#0052cc] rounded-xl text-xs font-semibold text-slate-700 outline-none cursor-pointer"
-            >
-              <option value="todos">m²: Todos</option>
-              <option value="ate_20">Até 20 m²</option>
-              <option value="20_50">20 a 50 m²</option>
-              <option value="50_100">50 a 100 m²</option>
-              <option value="acima_100">+ de 100 m²</option>
-              <option value="sem_metragem">Sem m²</option>
-            </select>
-          </div>
-
-          {/* 6. Ordenação */}
-          <div className="lg:col-span-2 flex items-center gap-1.5">
-            <div className="relative flex-1">
+          {/* Ordenação */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <div className="relative w-44 sm:w-48">
               <ArrowUpDown className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <select
                 value={sortOrder}
@@ -972,75 +951,13 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                 className="h-9 px-2.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-[#0052cc] text-xs font-bold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer flex-shrink-0 transition-colors"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Limpar filtros</span>
+                <span>Limpar</span>
               </button>
             )}
           </div>
         </div>
 
-        {/* Inputs condicionais de Período (Dia / Mês / Intervalo Personalizado) */}
-        {(periodMode === 'dia' || periodMode === 'mes' || periodMode === 'personalizado') && (
-          <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100 text-xs">
-            {periodMode === 'dia' && (
-              <div className="flex items-center gap-2">
-                <span className="text-slate-500 font-semibold">Data de criação:</span>
-                <input
-                  type="date"
-                  value={selectedDate}
-                  onChange={(e) => setSelectedDate(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => setSelectedDate(todayStr)}
-                  className="px-2 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-[#0052cc] font-bold cursor-pointer"
-                >
-                  Hoje
-                </button>
-              </div>
-            )}
-
-            {periodMode === 'mes' && (
-              <div className="flex items-center gap-2">
-                <span className="text-slate-500 font-semibold">Mês de criação:</span>
-                <input
-                  type="month"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => setSelectedMonth(currentMonthStr)}
-                  className="px-2 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-[#0052cc] font-bold cursor-pointer"
-                >
-                  Mês atual
-                </button>
-              </div>
-            )}
-
-            {periodMode === 'personalizado' && (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-slate-500 font-semibold">De:</span>
-                <input
-                  type="date"
-                  value={customStartDate}
-                  onChange={(e) => setCustomStartDate(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-                <span className="text-slate-500 font-semibold">Até:</span>
-                <input
-                  type="date"
-                  value={customEndDate}
-                  onChange={(e) => setCustomEndDate(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:border-[#0052cc] outline-none cursor-pointer"
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Linha de resumo compacto por status oficial + total exibido */}
+        {/* Linha 2: Status (Todos, Orçamento Enviado, Aguardando Retorno, Negociando, Vendido, Perdido) */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-[11px]">
           <div className="flex flex-wrap items-center gap-1.5">
             <button
@@ -1131,8 +1048,8 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                       onClick={() => onViewOrcamento(row)}
                       className="hover:bg-slate-50/80 transition-colors cursor-pointer group"
                     >
-                      {/* 1. Cliente & Número do Orçamento / Pedido */}
-                      <td className="py-3.5 px-4 sm:px-6 min-w-[220px]">
+                      {/* 1. Cliente (somente nome e data do orçamento) */}
+                      <td className="py-3.5 px-4 sm:px-6 min-w-[200px]">
                         <div className="flex items-center gap-3">
                           <div
                             className={`w-8 h-8 rounded-xl border flex items-center justify-center flex-shrink-0 ${bgClass}`}
@@ -1144,19 +1061,8 @@ export const ListaAcompanhamentoOrcamentos: React.FC<ListaAcompanhamentoOrcament
                             <div className="font-bold text-[#091122] group-hover:text-[#0052cc] transition-colors truncate">
                               {row.cliente}
                             </div>
-                            <div className="text-[11px] text-slate-400 truncate mt-0.5 flex items-center gap-1.5 flex-wrap">
-                              {row.numeroOrcamento && (
-                                <span className="font-semibold text-slate-600 flex-shrink-0">
-                                  Orç. #{row.numeroOrcamento}
-                                </span>
-                              )}
-                              <span className="truncate">• {row.nomeOrcamento}</span>
-                              {row.pedido && (
-                                <span className="font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded flex-shrink-0">
-                                  Pedido #{String(row.pedido).replace(/^#+/, '')}
-                                </span>
-                              )}
-                              <span className="flex-shrink-0">• {row.creationDisplayDate}</span>
+                            <div className="text-[11px] text-slate-400 mt-0.5">
+                              {row.creationDisplayDate}
                             </div>
                           </div>
                         </div>

@@ -90,6 +90,7 @@ import {
   ModalIncluirInsumosRodape,
   RodapeInsumosConfirmSelection,
 } from './ModalIncluirInsumosRodape';
+import { ModalConfiguracaoOrcamentoRapido } from './ModalConfiguracaoOrcamentoRapido';
 import {
   calculatePisoInsumosForOrcamento,
   convertBoxesToPisoSqm,
@@ -97,16 +98,24 @@ import {
   extractPisoBoxYield,
   formatBoxesDetail,
   formatSqmPtBr,
-  getQuickBudgetPisoCandidates,
-  getQuickBudgetRodapeCandidates,
   isPisoVinilicoColado,
   isPisoVinilicoProduct,
   isSquareMeterUnit,
   parseBoxesFromDetail,
   parsePtBrNumeric,
   PisoInsumosPlan,
-  QuickBudgetRodapeHeight,
 } from '../utils/pisoInsumosCalculator';
+import {
+  buildQuickCategoryItems,
+  calculateAreaTerreaPrimerQty,
+  findLimpaPiso1LProduct,
+  findPrimerAntiumidadeProduct,
+  getQuickAutoTagsForCategory,
+  QuickCategoryKey,
+  QuickWizardConfigState,
+  QuickWizardMeasurements,
+  RipadoCalcMode,
+} from '../utils/orcamentoRapidoCalculator';
 import {
   applyPisoTableQuantityChange,
   applyRodapeTableQuantityChange,
@@ -132,6 +141,8 @@ interface OrcamentoScreenProps {
   initialOrcamento?: SavedOrcamento | null;
   onSaveSuccess?: (saved: SavedOrcamento) => void;
   onStatusChangeInProgress?: (inProgress: boolean) => void;
+  scrollToProductsOnMount?: boolean;
+  onConsumeScrollToProducts?: () => void;
 }
 
 // Helpers seguros para conversão e formatação monetária (prevenindo TypeErrors)
@@ -176,8 +187,30 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   initialOrcamento,
   onSaveSuccess,
   onStatusChangeInProgress,
+  scrollToProductsOnMount = false,
+  onConsumeScrollToProducts,
 }) => {
   const ACTIVE_DRAFT_KEY = `fenix_orcamento_in_progress_draft_${currentUserName || 'default'}`;
+  const adicionarProdutosRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!scrollToProductsOnMount) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      const target =
+        adicionarProdutosRef.current ||
+        document.getElementById('adicionar-produtos-container');
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      onConsumeScrollToProducts?.();
+    }, 120);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [scrollToProductsOnMount, onConsumeScrollToProducts]);
 
   // Recupera o rascunho de orçamento em preenchimento de forma síncrona para evitar qualquer perda ao alternar abas
   const initialDraft = useMemo(() => {
@@ -848,254 +881,192 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
   const [categoryFilterQuery, setCategoryFilterQuery] = useState('');
 
-  // Estados do Orçamento Rápido
+  // Estados do Orçamento Rápido (5 campos independentes + wizard sequencial)
   const [quickPisoSqm, setQuickPisoSqm] = useState<string>('');
   const [quickRodapeMl, setQuickRodapeMl] = useState<string>('');
-  const quickRodapeRequestedMlRef = useRef<number | null>(null);
-  const quickRodapeLastBarrasRef = useRef<number | null>(null);
-  const quickRodapeDebounceRef = useRef<any>(null);
-  const [quickPisoType, setQuickPisoType] = useState<'colado' | 'clicado'>('colado');
-  const [quickRodapeHeight, setQuickRodapeHeight] = useState<QuickBudgetRodapeHeight>('07cm');
-  const [quickIncluirInsumosPiso, setQuickIncluirInsumosPiso] = useState<'sim' | 'nao'>('sim');
-  const [quickIncluirInsumosRodape, setQuickIncluirInsumosRodape] = useState<'sim' | 'nao'>('sim');
-  // Padrão obrigatório: "Não" sempre selecionado em "O ambiente é térreo?"
-  const [quickIsGroundFloor, setQuickIsGroundFloor] = useState<'sim' | 'nao'>('nao');
+  const [quickRipadoMode, setQuickRipadoMode] = useState<RipadoCalcMode>('m2');
+  const [quickRipadoSqm, setQuickRipadoSqm] = useState<string>('');
+  const [quickRipadoWidth, setQuickRipadoWidth] = useState<string>('');
+  const [quickRipadoHeight, setQuickRipadoHeight] = useState<string>('');
+  const [quickTetoSqm, setQuickTetoSqm] = useState<string>('');
+  const [quickMantaSqm, setQuickMantaSqm] = useState<string>('');
 
-  const resetQuickRodapeConversionRefs = () => {
-    if (quickRodapeDebounceRef.current) {
-      clearTimeout(quickRodapeDebounceRef.current);
-      quickRodapeDebounceRef.current = null;
+  const [quickWizardOpen, setQuickWizardOpen] = useState(false);
+  const [quickWizardSteps, setQuickWizardSteps] = useState<QuickCategoryKey[]>([]);
+  const [quickWizardMeasurements, setQuickWizardMeasurements] =
+    useState<QuickWizardMeasurements | null>(null);
+  const [quickWizardConfig, setQuickWizardConfig] =
+    useState<QuickWizardConfigState>({
+      piso: {
+        pisoType: 'colado',
+        productId: '',
+        includeInsumos: true,
+      },
+      rodape: {
+        height: '07cm',
+        productId: '',
+        includeInsumos: true,
+        includeColar: true,
+        includeCalafetar: true,
+        calafetarProductId: '',
+      },
+      ripado: {
+        productId: '',
+        includeInsumos: true,
+        includeAcabamento: false,
+        acabamentoProductId: '',
+        acabamentoQty: '1',
+      },
+      teto: {
+        productId: '',
+        includeAcabamento: false,
+        acabamentoProductId: '',
+        acabamentoQty: '1',
+      },
+      manta: {
+        productId: '',
+        includeInsumos: true,
+        includeAcabamentos: false,
+        acabamentoMl: '',
+        suporteProductId: '',
+      },
+    });
+
+  // Chaves no cabeçalho de Itens do Orçamento: LIMPA PISO e ÁREA TÉRREA (desligadas por padrão)
+  const [limpaPisoEnabled, setLimpaPisoEnabled] = useState<boolean>(() => {
+    if (initialOrcamento) {
+      return Boolean(
+        initialOrcamento.limpaPisoAtivo ??
+          initialOrcamento.items?.some((it) => it.autoTag === 'toggle_limpa_piso')
+      );
     }
-    quickRodapeRequestedMlRef.current = null;
-    quickRodapeLastBarrasRef.current = null;
-  };
-
-  const [quickSelectedPisoByType, setQuickSelectedPisoByType] = useState<
-    Record<'colado' | 'clicado', string>
-  >(() => {
-    try {
-      const saved = localStorage.getItem('fenix_quick_budget_piso_cfg_v1');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return {
-          colado: typeof parsed?.colado === 'string' ? parsed.colado : '',
-          clicado: typeof parsed?.clicado === 'string' ? parsed.clicado : '',
-        };
-      }
-    } catch {}
-    return { colado: '', clicado: '' };
+    if (initialDraft?.limpaPisoEnabled !== undefined) {
+      return Boolean(initialDraft.limpaPisoEnabled);
+    }
+    return false;
   });
 
-  const [quickSelectedRodapeByHeight, setQuickSelectedRodapeByHeight] = useState<
-    Record<QuickBudgetRodapeHeight, string>
-  >(() => {
-    try {
-      const saved = localStorage.getItem('fenix_quick_budget_rodape_cfg_v1');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return {
-          '07cm': typeof parsed?.['07cm'] === 'string' ? parsed['07cm'] : '',
-          '10cm': typeof parsed?.['10cm'] === 'string' ? parsed['10cm'] : '',
-          '12cm': typeof parsed?.['12cm'] === 'string' ? parsed['12cm'] : '',
-          '15cm': typeof parsed?.['15cm'] === 'string' ? parsed['15cm'] : '',
-        };
-      }
-    } catch {}
-    return { '07cm': '', '10cm': '', '12cm': '', '15cm': '' };
+  const [areaTerreaEnabled, setAreaTerreaEnabled] = useState<boolean>(() => {
+    if (initialOrcamento) {
+      return Boolean(
+        initialOrcamento.areaTerreaAtiva ??
+          initialOrcamento.items?.some((it) => it.autoTag === 'toggle_area_terrea')
+      );
+    }
+    if (initialDraft?.areaTerreaEnabled !== undefined) {
+      return Boolean(initialDraft.areaTerreaEnabled);
+    }
+    return false;
   });
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        'fenix_quick_budget_piso_cfg_v1',
-        JSON.stringify(quickSelectedPisoByType)
-      );
-    } catch {}
-  }, [quickSelectedPisoByType]);
+  const [areaTerreaSqm, setAreaTerreaSqm] = useState<string>(() => {
+    if (initialOrcamento?.areaTerreaSqm !== undefined) {
+      return initialOrcamento.areaTerreaSqm;
+    }
+    if (initialDraft?.areaTerreaSqm !== undefined) {
+      return initialDraft.areaTerreaSqm;
+    }
+    return '';
+  });
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        'fenix_quick_budget_rodape_cfg_v1',
-        JSON.stringify(quickSelectedRodapeByHeight)
-      );
-    } catch {}
-  }, [quickSelectedRodapeByHeight]);
-
-  const quickPisoCandidates = useMemo(
-    () => getQuickBudgetPisoCandidates(quickPisoType, dynamicCatalog),
-    [quickPisoType, dynamicCatalog]
-  );
-
-  const quickRodapeCandidates = useMemo(
-    () => getQuickBudgetRodapeCandidates(quickRodapeHeight, dynamicCatalog),
-    [quickRodapeHeight, dynamicCatalog]
-  );
-
-  const activeQuickPisoProduct = useMemo(() => {
-    if (quickPisoCandidates.length === 0) return null;
-    const configuredId = quickSelectedPisoByType[quickPisoType];
-    return (
-      quickPisoCandidates.find((p) => p.id === configuredId) ||
-      quickPisoCandidates[0]
-    );
-  }, [quickPisoCandidates, quickSelectedPisoByType, quickPisoType]);
-
-  const activeQuickRodapeProduct = useMemo(() => {
-    if (quickRodapeCandidates.length === 0) return null;
-    const configuredId = quickSelectedRodapeByHeight[quickRodapeHeight];
-    return (
-      quickRodapeCandidates.find((p) => p.id === configuredId) ||
-      quickRodapeCandidates[0]
-    );
-  }, [quickRodapeCandidates, quickSelectedRodapeByHeight, quickRodapeHeight]);
-
-  const resolveQuickRodapeConversion = (
-    rawVal: string,
-    updateField: boolean,
-    prodOverride?: CatalogProduct | null
-  ): {
-    requestedMl: number;
-    barras: number;
-    barLen: number;
-    effectiveMl: number;
-  } => {
-    const prod = prodOverride !== undefined ? prodOverride : activeQuickRodapeProduct;
-    const barLen = prod ? extractBarLengthFromProductName(prod.name, 2.4) : 2.4;
-    const trimmed = (rawVal || '').trim();
-    if (!trimmed) {
-      return { requestedMl: 0, barras: 0, barLen, effectiveMl: 0 };
+  const handleToggleLimpaPiso = (nextEnabled: boolean) => {
+    if (!nextEnabled) {
+      setLimpaPisoEnabled(false);
+      setItems((prev) => prev.filter((it) => it.autoTag !== 'toggle_limpa_piso'));
+      return;
     }
 
-    const explicitBars = parseBarCountFromInput(trimmed);
-    if (explicitBars && explicitBars > 0) {
-      const effectiveMl = Math.round(explicitBars * barLen * 100) / 100;
-      if (updateField) {
-        quickRodapeRequestedMlRef.current = effectiveMl;
-        quickRodapeLastBarrasRef.current = explicitBars;
-        setQuickRodapeMl(String(explicitBars));
-      }
-      return { requestedMl: effectiveMl, barras: explicitBars, barLen, effectiveMl };
+    const prod = findLimpaPiso1LProduct(dynamicCatalog);
+    if (!prod) {
+      setLimpaPisoEnabled(false);
+      showToast('Limpa Piso 1L não encontrado no catálogo.');
+      return;
     }
 
-    const parsedNum = parsePtBrNumeric(trimmed);
-    if (parsedNum <= 0) {
-      return { requestedMl: 0, barras: 0, barLen, effectiveMl: 0 };
-    }
-
-    // Evita reinterpretar quantidade de barras já convertida como metros lineares
-    if (
-      quickRodapeLastBarrasRef.current !== null &&
-      Math.abs(parsedNum - quickRodapeLastBarrasRef.current) <= 0.005
-    ) {
-      const bars = quickRodapeLastBarrasRef.current;
-      const requestedMl =
-        quickRodapeRequestedMlRef.current && quickRodapeRequestedMlRef.current > 0
-          ? quickRodapeRequestedMlRef.current
-          : Math.round(bars * barLen * 100) / 100;
-      const effectiveMl = Math.round(bars * barLen * 100) / 100;
-      if (updateField) {
-        setQuickRodapeMl(String(bars));
-      }
-      return { requestedMl, barras: bars, barLen, effectiveMl };
-    }
-
-    const calc = calculateRodapeBarras(parsedNum, barLen, 0);
-    if (updateField && calc.barrasNecessarias > 0) {
-      quickRodapeRequestedMlRef.current = parsedNum;
-      quickRodapeLastBarrasRef.current = calc.barrasNecessarias;
-      setQuickRodapeMl(String(calc.barrasNecessarias));
-    }
-    return {
-      requestedMl: parsedNum,
-      barras: calc.barrasNecessarias,
-      barLen,
-      effectiveMl: calc.metragemTotalFornecida,
-    };
+    const tierPrice = getProductTierPrice(prod, priceTable);
+    setLimpaPisoEnabled(true);
+    setItems((prev) => {
+      const withoutPrev = prev.filter((it) => it.autoTag !== 'toggle_limpa_piso');
+      const newItem: EspelhoItem = {
+        id: `item_${Date.now()}_limpapiso`,
+        qtd: '1',
+        descricao: prod.name,
+        unidade: prod.unit || 'un',
+        precoUnitario: tierPrice,
+        total: Math.round(tierPrice * 100) / 100,
+        autoTag: 'toggle_limpa_piso',
+      };
+      return [...withoutPrev, newItem];
+    });
   };
 
-  // Se o usuário trocar a altura/produto do rodapé após já ter convertido para barras, recalcula a partir do ML solicitado original
-  useEffect(() => {
-    if (
-      quickRodapeRequestedMlRef.current &&
-      quickRodapeRequestedMlRef.current > 0 &&
-      quickRodapeLastBarrasRef.current !== null &&
-      activeQuickRodapeProduct
-    ) {
-      const barLen = extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4);
-      const calc = calculateRodapeBarras(quickRodapeRequestedMlRef.current, barLen, 0);
-      if (calc.barrasNecessarias > 0) {
-        quickRodapeLastBarrasRef.current = calc.barrasNecessarias;
-        setQuickRodapeMl(String(calc.barrasNecessarias));
-      }
+  const syncAreaTerreaItem = (rawArea: string) => {
+    const areaNum = parsePtBrNumeric(rawArea);
+    if (areaNum <= 0) {
+      setItems((prev) => prev.filter((it) => it.autoTag !== 'toggle_area_terrea'));
+      return;
     }
-  }, [activeQuickRodapeProduct?.id]);
 
-  const quickBudgetPreview = useMemo(() => {
-    const reqPiso = parsePtBrNumeric(quickPisoSqm);
-    const parsedRodapeInput = parsePtBrNumeric(quickRodapeMl);
-    const isUsingConvertedQuickBarras =
-      parsedRodapeInput > 0 &&
-      quickRodapeLastBarrasRef.current !== null &&
-      Math.abs(parsedRodapeInput - quickRodapeLastBarrasRef.current) <= 0.005;
-    const reqRodape =
-      isUsingConvertedQuickBarras && quickRodapeRequestedMlRef.current
-        ? quickRodapeRequestedMlRef.current
-        : parsedRodapeInput;
+    const prod = findPrimerAntiumidadeProduct(dynamicCatalog);
+    if (!prod) {
+      showToast('Primer Antiumidade não encontrado no catálogo.');
+      return;
+    }
 
-    const pisoYield = activeQuickPisoProduct
-      ? extractPisoBoxYield(activeQuickPisoProduct.name)
-      : null;
-    const pisoUnitPrice = activeQuickPisoProduct
-      ? getProductTierPrice(activeQuickPisoProduct, priceTable)
-      : 0;
-    const pisoConv =
-      reqPiso > 0 && pisoYield
-        ? convertSqmToPisoBoxes(reqPiso, pisoYield)
-        : null;
-    const pisoEffectiveSqm =
-      reqPiso > 0
-        ? pisoConv
-          ? pisoConv.realSqm
-          : Math.round(reqPiso * 100) / 100
-        : 0;
-    const pisoTotal = Math.round(pisoEffectiveSqm * pisoUnitPrice * 100) / 100;
+    const qty = calculateAreaTerreaPrimerQty(areaNum);
+    const catalogPrice = getProductTierPrice(prod, priceTable);
 
-    const rodapeBarLen = activeQuickRodapeProduct
-      ? extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4)
-      : 2.4;
-    const rodapeUnitPrice = activeQuickRodapeProduct
-      ? getProductTierPrice(activeQuickRodapeProduct, priceTable)
-      : 0;
-    const rodapeCalc =
-      reqRodape > 0
-        ? calculateRodapeBarras(reqRodape, rodapeBarLen, rodapeUnitPrice)
-        : null;
+    setItems((prev) => {
+      const existing = prev.find((it) => it.autoTag === 'toggle_area_terrea');
+      const resolvedPrice =
+        existing && existing.precoUnitario > 0 ? existing.precoUnitario : catalogPrice;
+      const newTotal = Math.round(qty * resolvedPrice * 100) / 100;
 
-    return {
-      reqPiso,
-      reqRodape,
-      reqRodapeDisplay: formatMlPtBr(reqRodape),
-      pisoYield,
-      pisoUnitPrice,
-      pisoBoxes: pisoConv?.boxes || null,
-      pisoEffectiveSqm,
-      pisoEffectiveDisplay: formatSqmPtBr(pisoEffectiveSqm),
-      pisoTotal,
-      rodapeBarLen,
-      rodapeUnitPrice,
-      rodapeBarras: rodapeCalc?.barrasNecessarias || 0,
-      rodapeEffectiveMl: rodapeCalc?.metragemTotalFornecida || 0,
-      rodapeEffectiveMlDisplay: formatMlPtBr(rodapeCalc?.metragemTotalFornecida || 0),
-      rodapeTotal: rodapeCalc?.valorTotal || 0,
-    };
-  }, [
-    quickPisoSqm,
-    quickRodapeMl,
-    activeQuickPisoProduct,
-    activeQuickRodapeProduct,
-    priceTable,
-  ]);
+      if (existing) {
+        return prev.map((it) =>
+          it.autoTag === 'toggle_area_terrea'
+            ? {
+                ...it,
+                qtd: String(qty),
+                total: newTotal,
+              }
+            : it
+        );
+      }
+
+      const newItem: EspelhoItem = {
+        id: `item_${Date.now()}_areaterrea`,
+        qtd: String(qty),
+        descricao: prod.name,
+        unidade: prod.unit || 'balde',
+        precoUnitario: resolvedPrice,
+        total: newTotal,
+        autoTag: 'toggle_area_terrea',
+      };
+      return [...prev, newItem];
+    });
+  };
+
+  const handleToggleAreaTerrea = (nextEnabled: boolean) => {
+    if (!nextEnabled) {
+      setAreaTerreaEnabled(false);
+      setAreaTerreaSqm('');
+      setItems((prev) => prev.filter((it) => it.autoTag !== 'toggle_area_terrea'));
+      return;
+    }
+
+    setAreaTerreaEnabled(true);
+    if (parsePtBrNumeric(areaTerreaSqm) > 0) {
+      syncAreaTerreaItem(areaTerreaSqm);
+    }
+  };
+
+  const handleAreaTerreaSqmChange = (val: string) => {
+    setAreaTerreaSqm(val);
+    if (areaTerreaEnabled) {
+      syncAreaTerreaItem(val);
+    }
+  };
 
   // Categorias oficiais da base
   const categoriesList = useMemo(() => getOfficialCategories(), [isProductModalOpen, catalogRevision]);
@@ -1142,9 +1113,6 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   // Drafts para edição direta do preço unitário e quantidade na tabela do orçamento
   const [itemPrecoDrafts, setItemPrecoDrafts] = useState<Record<string, string>>({});
   const [itemQtdDrafts, setItemQtdDrafts] = useState<Record<string, string>>({});
-  const [rodapeMlModalItem, setRodapeMlModalItem] = useState<EspelhoItem | null>(null);
-  const [rodapeMlModalInput, setRodapeMlModalInput] = useState('');
-  const [rodapeMlModalError, setRodapeMlModalError] = useState<string | null>(null);
 
   // Objeto da categoria ativa
   const activeCategoryObj = useMemo(() => {
@@ -2083,184 +2051,177 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
   const handleGenerateQuickBudget = (e: React.FormEvent) => {
     e.preventDefault();
-    if (quickRodapeDebounceRef.current) {
-      clearTimeout(quickRodapeDebounceRef.current);
-      quickRodapeDebounceRef.current = null;
-    }
 
-    const reqPiso = parsePtBrNumeric(quickPisoSqm);
-    const rodapeConv = resolveQuickRodapeConversion(quickRodapeMl, true);
-    const reqRodape = rodapeConv.requestedMl;
+    const pisoSqm = parsePtBrNumeric(quickPisoSqm);
+    const rodapeMl = parsePtBrNumeric(quickRodapeMl);
+    const ripadoArea =
+      quickRipadoMode === 'm2' ? parsePtBrNumeric(quickRipadoSqm) : 0;
+    const ripadoW =
+      quickRipadoMode === 'lxA' ? parsePtBrNumeric(quickRipadoWidth) : 0;
+    const ripadoH =
+      quickRipadoMode === 'lxA' ? parsePtBrNumeric(quickRipadoHeight) : 0;
+    const tetoSqm = parsePtBrNumeric(quickTetoSqm);
+    const mantaSqm = parsePtBrNumeric(quickMantaSqm);
 
-    if (reqPiso <= 0 && reqRodape <= 0) {
-      showToast('Informe a metragem do piso (m²) ou a metragem do rodapé (ml).');
+    if (
+      quickRipadoMode === 'lxA' &&
+      ((ripadoW > 0 && ripadoH <= 0) || (ripadoH > 0 && ripadoW <= 0))
+    ) {
+      showToast('Para Ripado em L × A, informe Largura e Altura.');
       return;
     }
 
-    if (reqPiso > 0 && !activeQuickPisoProduct) {
-      showToast('Nenhum piso cadastrado encontrado no catálogo para o tipo selecionado.');
+    const hasRipado =
+      quickRipadoMode === 'm2' ? ripadoArea > 0 : ripadoW > 0 && ripadoH > 0;
+
+    const steps: QuickCategoryKey[] = [];
+    if (pisoSqm > 0) steps.push('piso');
+    if (rodapeMl > 0) steps.push('rodape');
+    if (hasRipado) steps.push('ripado');
+    if (tetoSqm > 0) steps.push('teto');
+    if (mantaSqm > 0) steps.push('manta');
+
+    if (steps.length === 0) {
+      showToast('Preencha ao menos um produto para gerar o orçamento.');
       return;
     }
 
-    if (reqRodape > 0 && !activeQuickRodapeProduct) {
-      showToast('Nenhum rodapé cadastrado encontrado no catálogo para a altura selecionada.');
-      return;
+    setQuickWizardMeasurements({
+      pisoSqm,
+      rodapeMl,
+      ripado: {
+        mode: quickRipadoMode,
+        areaM2: ripadoArea,
+        widthMeters: ripadoW,
+        heightMeters: ripadoH,
+      },
+      tetoSqm,
+      mantaSqm,
+    });
+    setQuickWizardSteps(steps);
+    setQuickWizardOpen(true);
+  };
+
+  const handleConfirmQuickWizard = (finalConfig: QuickWizardConfigState) => {
+    setQuickWizardConfig(finalConfig);
+    setQuickWizardOpen(false);
+
+    if (!quickWizardMeasurements || quickWizardSteps.length === 0) return;
+
+    const tagsToReplace = new Set<string>(
+      quickWizardSteps.flatMap((step) => getQuickAutoTagsForCategory(step))
+    );
+
+    if (quickWizardSteps.includes('piso')) {
+      lockedPisoInsumoGroupsRef.current.clear();
+      removedPisoInsumoGroupsRef.current.clear();
+    }
+    if (quickWizardSteps.includes('rodape')) {
+      lockedRodapeInsumoGroupsRef.current.clear();
+      removedRodapeInsumoGroupsRef.current.clear();
     }
 
-    let pisoPlan: PisoInsumosPlan | null = null;
-    let pisoUnitPrice = 0;
-    let pisoSubtitulo: string | undefined;
+    const allGeneratedItems: EspelhoItem[] = [];
+    const allWarnings: string[] = [];
 
-    if (reqPiso > 0 && activeQuickPisoProduct) {
-      const boxYield = extractPisoBoxYield(activeQuickPisoProduct.name);
-      const pisoConv = boxYield ? convertSqmToPisoBoxes(reqPiso, boxYield) : null;
-      const effectiveSqm = pisoConv
-        ? pisoConv.realSqm
-        : Math.round(reqPiso * 100) / 100;
-      const boxes = pisoConv ? pisoConv.boxes : null;
-      pisoSubtitulo = pisoConv ? pisoConv.detailText : undefined;
-      pisoUnitPrice = getProductTierPrice(activeQuickPisoProduct, priceTable);
-      pisoPlan = calculatePisoInsumosForOrcamento({
-        productName: activeQuickPisoProduct.name,
-        requestedSqm: reqPiso,
-        effectiveSqm,
-        boxes,
+    for (const step of quickWizardSteps) {
+      const res = buildQuickCategoryItems({
+        category: step,
+        measurements: quickWizardMeasurements,
+        config: finalConfig,
         priceTable,
-        includePrimerAntiumidade: quickIsGroundFloor === 'sim',
-        skipCola: quickPisoType === 'clicado',
-        catalogOverride: dynamicCatalog,
+        catalog: dynamicCatalog,
+        parseNumeric: parsePtBrNumeric,
       });
-    }
 
-    let rodapePlan: RodapeInsumosPlan | null = null;
-    let rodapeUnitPrice = 0;
-    let rodapeSubtitulo: string | undefined;
+      allGeneratedItems.push(...res.items);
+      allWarnings.push(...res.warnings);
 
-    if (reqRodape > 0 && activeQuickRodapeProduct) {
-      const barLen = extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4);
-      rodapeUnitPrice = getProductTierPrice(activeQuickRodapeProduct, priceTable);
-      const rodapeCalc = calculateRodapeBarras(reqRodape, barLen, rodapeUnitPrice);
-      rodapeSubtitulo = formatRodapeDetailText({
-        requestedMl: reqRodape,
-        barCount: rodapeCalc.barrasNecessarias,
-        barLengthMeters: barLen,
-      });
-      rodapePlan = calculateRodapeInsumosForOrcamento({
-        rodapeName: activeQuickRodapeProduct.name,
-        barCount: rodapeCalc.barrasNecessarias,
-        barLengthMeters: barLen,
-        requestedMl: reqRodape,
-        priceTable,
-        catalogOverride: dynamicCatalog,
-      });
-    }
-
-    const appendQuickPisoDirect = () => {
-      if (!pisoPlan || !activeQuickPisoProduct) return;
-      const pisoTotal = Math.round(pisoPlan.realSqm * pisoUnitPrice * 100) / 100;
-      const pisoItem: EspelhoItem = {
-        id: `item_${Date.now()}_qp_${Math.random().toString(36).substring(2, 6)}`,
-        qtd: pisoPlan.realSqmDisplay,
-        descricao: pisoPlan.productName,
-        subtitulo: pisoSubtitulo,
-        unidade: activeQuickPisoProduct.unit || 'm²',
-        precoUnitario: pisoUnitPrice,
-        total: pisoTotal,
-      };
-      pisoInsumoLinksRef.current.set(pisoItem.id, {
-        hasInsumos: false,
-        requestedSqm: pisoPlan.requestedSqm,
-        lastEffectiveSqm: pisoPlan.realSqm,
-        skipCola: !isPisoVinilicoColado(pisoPlan.productName, activeQuickPisoProduct.category),
-        includePrimerAntiumidade: false,
-      });
-      setItems((prev) => [...prev, pisoItem]);
-      recordProductUsage(currentUserName, {
-        name: pisoPlan.productName,
-        category: activeQuickPisoProduct.category,
-      });
-      setShortcutsRefreshCounter((c) => c + 1);
-    };
-
-    const appendQuickRodapeDirect = () => {
-      if (!rodapePlan || !activeQuickRodapeProduct) return;
-      const rodapeTotal = Math.round(rodapePlan.barCount * rodapeUnitPrice * 100) / 100;
-      const rodapeItem: EspelhoItem = {
-        id: `item_${Date.now()}_qr_${Math.random().toString(36).substring(2, 6)}`,
-        qtd: String(rodapePlan.barCount),
-        descricao: rodapePlan.rodapeName,
-        subtitulo: rodapeSubtitulo,
-        unidade: activeQuickRodapeProduct.unit || 'barras',
-        precoUnitario: rodapeUnitPrice,
-        total: rodapeTotal,
-        requestedMl: rodapePlan.insumoMl > 0 ? rodapePlan.insumoMl : undefined,
-        barLengthMeters: rodapePlan.barLengthMeters,
-      };
-      rodapeInsumoLinksRef.current.set(rodapeItem.id, {
-        barLengthMeters: rodapePlan.barLengthMeters,
-        requestedMl: rodapePlan.insumoMl > 0 ? rodapePlan.insumoMl : undefined,
-        lastBarras: rodapePlan.barCount,
-        includeColar: false,
-        includeCalafetar: false,
-        calafetarProductId: '',
-      });
-      setItems((prev) => [...prev, rodapeItem]);
-      recordProductUsage(currentUserName, {
-        name: rodapePlan.rodapeName,
-        category: activeQuickRodapeProduct.category,
-      });
-      setShortcutsRefreshCounter((c) => c + 1);
-    };
-
-    const runRodapeStep = () => {
-      if (!rodapePlan || !activeQuickRodapeProduct || rodapePlan.barCount <= 0) return;
-      if (quickIncluirInsumosRodape === 'sim') {
-        setPendingRodapePrompt({
-          plan: rodapePlan,
-          category: activeQuickRodapeProduct.category,
-          unit: activeQuickRodapeProduct.unit || 'barras',
-          unitPrice: rodapeUnitPrice,
-          subtitulo: rodapeSubtitulo,
-          preserveQuickTab: true,
+      if (res.pisoLink) {
+        pisoInsumoLinksRef.current.set(res.pisoLink.itemId, {
+          hasInsumos: res.pisoLink.hasInsumos,
+          requestedSqm: res.pisoLink.requestedSqm,
+          lastEffectiveSqm: res.pisoLink.lastEffectiveSqm,
+          skipCola: res.pisoLink.skipCola,
+          includePrimerAntiumidade: false,
         });
-      } else {
-        appendQuickRodapeDirect();
-        showToast(
-          `"${rodapePlan.rodapeName}" (${rodapePlan.barCount} ${rodapePlan.barCount === 1 ? 'barra' : 'barras'}) adicionado ao orçamento.`
-        );
       }
-    };
 
-    if (pisoPlan && activeQuickPisoProduct) {
-      if (quickIncluirInsumosPiso === 'sim' && pisoPlan.insumos.length > 0) {
-        setPendingPisoPrompt({
-          plan: pisoPlan,
-          category: activeQuickPisoProduct.category,
-          unit: activeQuickPisoProduct.unit || 'm²',
-          unitPrice: pisoUnitPrice,
-          subtitulo: pisoSubtitulo,
-          preserveQuickTab: true,
-          onAfterCommit:
-            rodapePlan && rodapePlan.barCount > 0 ? runRodapeStep : undefined,
+      if (res.rodapeLink) {
+        rodapeInsumoLinksRef.current.set(res.rodapeLink.itemId, {
+          barLengthMeters: res.rodapeLink.barLengthMeters,
+          requestedMl: res.rodapeLink.requestedMl,
+          lastBarras: res.rodapeLink.lastBarras,
+          includeColar: res.rodapeLink.includeColar,
+          includeCalafetar: res.rodapeLink.includeCalafetar,
+          calafetarProductId: res.rodapeLink.calafetarProductId,
         });
-      } else {
-        appendQuickPisoDirect();
-        if (rodapePlan && rodapePlan.barCount > 0) {
-          if (quickIncluirInsumosRodape === 'sim') {
-            runRodapeStep();
-          } else {
-            appendQuickRodapeDirect();
-            showToast('Orçamento rápido gerado com piso e rodapé!');
-          }
-        } else {
-          showToast(
-            `"${pisoPlan.productName}" (${pisoPlan.realSqmDisplay} m²) adicionado ao orçamento.`
-          );
+      }
+    }
+
+    setItems((prev) => {
+      prev.forEach((it) => {
+        if (it.autoTag && tagsToReplace.has(it.autoTag)) {
+          pisoInsumoLinksRef.current.delete(it.id);
+          rodapeInsumoLinksRef.current.delete(it.id);
         }
+      });
+      const preserved = prev.filter(
+        (it) => !it.autoTag || !tagsToReplace.has(it.autoTag)
+      );
+      return [...preserved, ...allGeneratedItems];
+    });
+
+    allGeneratedItems.forEach((it) => {
+      const prodObj = dynamicCatalog.find((p) => p.name === it.descricao);
+      if (prodObj) {
+        recordProductUsage(currentUserName, {
+          name: prodObj.name,
+          category: prodObj.category,
+        });
       }
-    } else if (rodapePlan && rodapePlan.barCount > 0) {
-      runRodapeStep();
+    });
+    setShortcutsRefreshCounter((c) => c + 1);
+
+    if (allWarnings.length > 0) {
+      showToast(allWarnings[0]);
+    } else {
+      showToast('Orçamento rápido aplicado aos itens do orçamento.');
     }
+  };
+
+  const handleConfirmClearAllItems = () => {
+    resetAllInsumoLinks();
+    if (editingItemId) {
+      handleCancelEdit();
+    }
+    setItems([]);
+    setLimpaPisoEnabled(false);
+    setAreaTerreaEnabled(false);
+    setAreaTerreaSqm('');
+    setItemQtdDrafts({});
+    setItemPrecoDrafts({});
+    setHasFreteEnabled(false);
+    setFreteValorInput('0,00');
+    setHasDescontoEnabled(false);
+    setDescontoInput('0,00');
+    setPendingPisoPrompt(null);
+    setPendingRodapePrompt(null);
+
+    if (
+      !initialOrcamento &&
+      !selectedClientId &&
+      !nomeOrcamento.trim() &&
+      !observacoes.trim() &&
+      !observacoesRodape.trim()
+    ) {
+      try {
+        localStorage.removeItem(ACTIVE_DRAFT_KEY);
+        localStorage.removeItem('fenix_orcamento_in_progress_draft');
+      } catch {}
+    }
+
+    showToast('Todos os itens da tabela foram removidos e os totais foram zerados.');
   };
 
   // Salvar Produto (Adiciona novo ou Atualiza item existente sem duplicar)
@@ -2511,6 +2472,19 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       const remaining = prev.filter((i) => i.id !== id);
       if (!removedItem) return remaining;
 
+      if (removedItem.autoTag === 'toggle_limpa_piso') {
+        setLimpaPisoEnabled(false);
+        return remaining;
+      }
+      if (removedItem.autoTag === 'toggle_area_terrea') {
+        setAreaTerreaEnabled(false);
+        setAreaTerreaSqm('');
+        return remaining;
+      }
+      if (removedItem.autoTag === 'quick_manta_insumo') {
+        return remaining;
+      }
+
       const pisoLink = pisoInsumoLinksRef.current.get(id);
       if (pisoLink) {
         pisoInsumoLinksRef.current.delete(id);
@@ -2533,7 +2507,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       );
       if (pisoInsumoGrp) {
         const hasAnotherSameGroup = remaining.some(
-          (it) => classifyPisoInsumoGroup(it.descricao, dynamicCatalog) === pisoInsumoGrp
+          (it) =>
+            it.autoTag !== 'toggle_area_terrea' &&
+            it.autoTag !== 'quick_manta_insumo' &&
+            classifyPisoInsumoGroup(it.descricao, dynamicCatalog) === pisoInsumoGrp
         );
         if (hasAnotherSameGroup) {
           lockedPisoInsumoGroupsRef.current.add(pisoInsumoGrp);
@@ -2696,104 +2673,6 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
           : item
       );
     });
-  };
-
-  // Abrir modal de edição de metragem em metros lineares (ml) pelo ícone de lápis na coluna Ações
-  const openRodapeMlEditModal = (item: EspelhoItem) => {
-    const barLen =
-      item.barLengthMeters || extractBarLengthFromProductName(item.descricao, 2.4);
-    const existingLink = rodapeInsumoLinksRef.current.get(item.id);
-    const parsedDet = parseRodapeDetails(item.subtitulo);
-    const currentBars = Math.max(0, parsePtBrNumeric(item.qtd));
-    const initialMl =
-      (item.requestedMl && item.requestedMl > 0 ? item.requestedMl : undefined) ??
-      (existingLink?.requestedMl && existingLink.requestedMl > 0
-        ? existingLink.requestedMl
-        : undefined) ??
-      (parsedDet?.metrosDesejados && parsedDet.metrosDesejados > 0
-        ? parsedDet.metrosDesejados
-        : undefined) ??
-      (currentBars > 0 ? Math.round(currentBars * barLen * 100) / 100 : 0);
-
-    setRodapeMlModalItem(item);
-    setRodapeMlModalInput(initialMl > 0 ? String(initialMl).replace('.', ',') : '');
-    setRodapeMlModalError(null);
-  };
-
-  const handleConfirmRodapeMlModal = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!rodapeMlModalItem) return;
-
-    const targetId = rodapeMlModalItem.id;
-    const parsedMl = parsePtBrNumeric(rodapeMlModalInput);
-    if (!rodapeMlModalInput.trim() || parsedMl <= 0) {
-      setRodapeMlModalError('Informe uma metragem válida em metros lineares (ml).');
-      return;
-    }
-
-    const barLen =
-      rodapeMlModalItem.barLengthMeters ||
-      extractBarLengthFromProductName(rodapeMlModalItem.descricao, 2.4);
-    const newBars = Math.max(1, Math.ceil(parsedMl / barLen - 1e-9));
-
-    setItems((prev) => {
-      const targetItem = prev.find((it) => it.id === targetId);
-      if (!targetItem) return prev;
-
-      ensureRodapeLinkForExistingBudget(prev, targetItem);
-      const existingLink = rodapeInsumoLinksRef.current.get(targetId);
-      const conv = applyRodapeTableQuantityChange({
-        item: targetItem,
-        rawQtdVal: String(parsedMl),
-        existingLink,
-        barLengthMeters: barLen,
-        forceTreatAsMl: true,
-        inputMode: 'ml',
-      });
-
-      if (existingLink) {
-        existingLink.requestedMl = parsedMl;
-        existingLink.lastBarras = conv.bars;
-        existingLink.barLengthMeters = conv.barLen;
-      } else {
-        rodapeInsumoLinksRef.current.set(targetId, {
-          barLengthMeters: conv.barLen,
-          requestedMl: parsedMl,
-          lastBarras: conv.bars,
-          includeColar: false,
-          includeCalafetar: false,
-          calafetarProductId: '',
-        });
-      }
-
-      const updated = prev.map((it) => (it.id === targetId ? conv.updatedItem : it));
-      const activeLink = rodapeInsumoLinksRef.current.get(targetId);
-      return activeLink && (activeLink.includeColar || activeLink.includeCalafetar)
-        ? syncRodapeInsumosInList(updated, targetItem.descricao)
-        : updated;
-    });
-
-    setItemQtdDrafts((prev) => {
-      if (prev[targetId] === undefined) return prev;
-      const next = { ...prev };
-      delete next[targetId];
-      return next;
-    });
-
-    if (editingItemId === targetId) {
-      rodapeRequestedMlRef.current = parsedMl;
-      rodapeLastBarrasRef.current = newBars;
-      setNewQtd(String(parsedMl).replace('.', ','));
-    }
-
-    setRodapeMlModalItem(null);
-    setRodapeMlModalInput('');
-    setRodapeMlModalError(null);
-    showToast(
-      `Metragem atualizada: ${formatMlPtBr(parsedMl)} ml → ${newBars} ${
-        newBars === 1 ? 'barra' : 'barras'
-      }.`
-    );
   };
 
   // Edit item unit price directly in the budget
@@ -3051,6 +2930,19 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       if (initialOrcamento.descontoTexto !== undefined) {
         setDescontoTexto(initialOrcamento.descontoTexto);
       }
+      setLimpaPisoEnabled(
+        Boolean(
+          initialOrcamento.limpaPisoAtivo ??
+            initialOrcamento.items?.some((it) => it.autoTag === 'toggle_limpa_piso')
+        )
+      );
+      setAreaTerreaEnabled(
+        Boolean(
+          initialOrcamento.areaTerreaAtiva ??
+            initialOrcamento.items?.some((it) => it.autoTag === 'toggle_area_terrea')
+        )
+      );
+      setAreaTerreaSqm(initialOrcamento.areaTerreaSqm || '');
     }
   }, [initialOrcamento]);
 
@@ -3063,6 +2955,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     observacoes,
     observacoesRodape,
     items,
+    limpaPisoEnabled,
+    areaTerreaEnabled,
+    areaTerreaSqm,
     hasFreteEnabled,
     freteValorInput,
     freteCep,
@@ -3087,6 +2982,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     observacoes,
     observacoesRodape,
     items,
+    limpaPisoEnabled,
+    areaTerreaEnabled,
+    areaTerreaSqm,
     hasFreteEnabled,
     freteValorInput,
     freteCep,
@@ -3109,6 +3007,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
     const hasData =
       items.length > 0 ||
+      limpaPisoEnabled ||
+      areaTerreaEnabled ||
       Boolean(nomeOrcamento && nomeOrcamento.trim()) ||
       Boolean(observacoes && observacoes.trim()) ||
       Boolean(selectedClientId) ||
@@ -3128,6 +3028,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         observacoes,
         observacoesRodape,
         items,
+        limpaPisoEnabled,
+        areaTerreaEnabled,
+        areaTerreaSqm,
         hasFreteEnabled,
         freteValorInput,
         freteCep,
@@ -3165,6 +3068,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     observacoes,
     observacoesRodape,
     items,
+    limpaPisoEnabled,
+    areaTerreaEnabled,
+    areaTerreaSqm,
     hasFreteEnabled,
     freteValorInput,
     freteCep,
@@ -3294,6 +3200,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       } catch {}
       resetAllInsumoLinks();
       setItems([]);
+      setLimpaPisoEnabled(false);
+      setAreaTerreaEnabled(false);
+      setAreaTerreaSqm('');
       setNomeOrcamento('');
       setObservacoes('');
       setObservacoesRodape('');
@@ -3398,6 +3307,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       observacoes,
       observacoesRodape,
       items,
+      limpaPisoAtivo: limpaPisoEnabled,
+      areaTerreaAtiva: areaTerreaEnabled,
+      areaTerreaSqm: areaTerreaEnabled ? areaTerreaSqm : '',
       freteAtivo: hasFreteEnabled,
       freteValor: hasFreteEnabled ? freteValor : 0,
       freteEndereco: hasFreteEnabled ? freteEndereco : '',
@@ -4080,7 +3992,11 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       {/* ======================================================== */}
       {/* 3. ADICIONAR PRODUTOS (Fluxo com Busca com Dropdown, Categorias e Aba Produtos) */}
       {/* ======================================================== */}
-      <section id="adicionar-produtos-container" className="no-print bg-white rounded-2xl border border-slate-200/90 shadow-sm p-5 sm:p-7 space-y-4">
+      <section
+        id="adicionar-produtos-container"
+        ref={adicionarProdutosRef}
+        className="no-print bg-white rounded-2xl border border-slate-200/90 shadow-sm p-5 sm:p-7 space-y-4 scroll-mt-4"
+      >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl bg-blue-50 text-[#0057ff] flex items-center justify-center font-bold text-sm">
@@ -4212,14 +4128,14 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         {productSubTab === 'rapido' && (
           <form onSubmit={handleGenerateQuickBudget} className="space-y-4 animate-in fade-in-50 duration-200">
             <div className="bg-blue-50/50 p-4 rounded-2xl border border-blue-100/80 space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-start justify-between gap-3">
                 <div>
                   <h3 className="text-xs sm:text-sm font-bold text-slate-800 flex items-center gap-1.5">
                     <Calculator className="w-4 h-4 text-[#0057ff]" />
-                    Orçamento Rápido de Piso e Rodapé
+                    Orçamento Rápido
                   </h3>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Informe as metragens e selecione os produtos do cadastro. Os valores da tabela {getOfficialPriceTableLabel(priceTable)} são aplicados automaticamente ao inserir no orçamento.
+                    Preencha somente os produtos desejados e clique em Gerar Orçamento para configurar em etapas.
                   </p>
                 </div>
                 <button
@@ -4227,27 +4143,29 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                   onClick={() => {
                     setQuickPisoSqm('');
                     setQuickRodapeMl('');
-                    resetQuickRodapeConversionRefs();
-                    setQuickPisoType('colado');
-                    setQuickRodapeHeight('07cm');
-                    setQuickIncluirInsumosPiso('sim');
-                    setQuickIncluirInsumosRodape('sim');
-                    setQuickIsGroundFloor('nao');
+                    setQuickRipadoSqm('');
+                    setQuickRipadoWidth('');
+                    setQuickRipadoHeight('');
+                    setQuickTetoSqm('');
+                    setQuickMantaSqm('');
                   }}
-                  className="text-xs font-bold text-slate-500 hover:text-[#0057ff] flex items-center gap-1 cursor-pointer self-start sm:self-auto"
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-[#0057ff] transition-colors cursor-pointer px-2 py-1 rounded-lg hover:bg-white/70 shrink-0"
+                  title="Limpar metragens preenchidas"
                 >
-                  <RotateCcw className="w-3.5 h-3.5" />
+                  <RefreshCw className="w-3.5 h-3.5" />
                   <span>Limpar</span>
                 </button>
               </div>
 
-              {/* Linha 1: Metragens e Tipos */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-3.5">
-                {/* Metragem do piso (m²) */}
-                <div className="lg:col-span-3 space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Metragem do piso (m²)
-                  </label>
+              {/* Cinco campos independentes alinhados */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5 items-end">
+                {/* 1. Piso Vinílico (m²) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="h-6 flex items-center">
+                    <label className="text-xs font-bold text-slate-700 leading-none whitespace-nowrap">
+                      Piso Vinílico (m²)
+                    </label>
+                  </div>
                   <input
                     type="text"
                     inputMode="decimal"
@@ -4258,322 +4176,123 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                   />
                 </div>
 
-                {/* Rodapé (ml) */}
-                <div className="lg:col-span-2 space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Rodapé (ml)
-                  </label>
+                {/* 2. Rodapé (ml) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="h-6 flex items-center">
+                    <label className="text-xs font-bold text-slate-700 leading-none whitespace-nowrap">
+                      Rodapé (ml)
+                    </label>
+                  </div>
                   <input
                     type="text"
                     inputMode="decimal"
                     value={quickRodapeMl}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setQuickRodapeMl(val);
-                      if (quickRodapeDebounceRef.current) {
-                        clearTimeout(quickRodapeDebounceRef.current);
-                        quickRodapeDebounceRef.current = null;
-                      }
-                      const parsed = parsePtBrNumeric(val);
-                      if (
-                        quickRodapeLastBarrasRef.current !== null &&
-                        Math.abs(parsed - quickRodapeLastBarrasRef.current) <= 0.005
-                      ) {
-                        return;
-                      }
-                      quickRodapeLastBarrasRef.current = null;
-                      if (!val.trim() || parsed <= 0) {
-                        quickRodapeRequestedMlRef.current = null;
-                        return;
-                      }
-                      quickRodapeRequestedMlRef.current = parsed;
-                      quickRodapeDebounceRef.current = setTimeout(() => {
-                        quickRodapeDebounceRef.current = null;
-                        resolveQuickRodapeConversion(val, true);
-                      }, 650);
-                    }}
-                    onBlur={() => {
-                      if (quickRodapeDebounceRef.current) {
-                        clearTimeout(quickRodapeDebounceRef.current);
-                        quickRodapeDebounceRef.current = null;
-                      }
-                      resolveQuickRodapeConversion(quickRodapeMl, true);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        if (quickRodapeDebounceRef.current) {
-                          clearTimeout(quickRodapeDebounceRef.current);
-                          quickRodapeDebounceRef.current = null;
-                        }
-                        resolveQuickRodapeConversion(quickRodapeMl, true);
-                      }
-                    }}
-                    placeholder="Ex: 80"
+                    onChange={(e) => setQuickRodapeMl(e.target.value)}
+                    placeholder="Ex: 40"
                     className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
                   />
                 </div>
 
-                {/* Tipo de piso: Colado ou Clicado */}
-                <div className="lg:col-span-3 space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Tipo de piso
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
-                    <button
-                      type="button"
-                      onClick={() => setQuickPisoType('colado')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickPisoType === 'colado'
-                          ? 'bg-[#0057ff] text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Colado
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setQuickPisoType('clicado')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickPisoType === 'clicado'
-                          ? 'bg-[#0057ff] text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Clicado
-                    </button>
+                {/* 3. Ripado (m² ou L × A) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="h-6 flex items-center justify-between gap-1.5">
+                    <label className="text-xs font-bold text-slate-700 leading-none whitespace-nowrap">
+                      Ripado
+                    </label>
+                    <div className="h-6 inline-flex items-center rounded-lg border border-slate-300 bg-white p-0.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setQuickRipadoMode('m2')}
+                        className={`h-full px-2 rounded-md text-[10px] font-bold leading-none transition-colors cursor-pointer ${
+                          quickRipadoMode === 'm2'
+                            ? 'bg-[#0057ff] text-white'
+                            : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        m²
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setQuickRipadoMode('lxA')}
+                        className={`h-full px-2 rounded-md text-[10px] font-bold leading-none transition-colors cursor-pointer ${
+                          quickRipadoMode === 'lxA'
+                            ? 'bg-[#0057ff] text-white'
+                            : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        L × A
+                      </button>
+                    </div>
                   </div>
-                </div>
-
-                {/* Rodapé: 07 cm, 10 cm, 12 cm ou 15 cm */}
-                <div className="lg:col-span-4 space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Rodapé
-                  </label>
-                  <div className="grid grid-cols-4 gap-1 bg-white p-1 rounded-xl border border-slate-300 h-11">
-                    {(['07cm', '10cm', '12cm', '15cm'] as QuickBudgetRodapeHeight[]).map(
-                      (heightKey) => {
-                        const label = heightKey.replace('cm', ' cm');
-                        const isActive = quickRodapeHeight === heightKey;
-                        return (
-                          <button
-                            key={heightKey}
-                            type="button"
-                            onClick={() => setQuickRodapeHeight(heightKey)}
-                            className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                              isActive
-                                ? 'bg-[#0057ff] text-white shadow-xs'
-                                : 'text-slate-600 hover:bg-slate-100'
-                            }`}
-                          >
-                            {label}
-                          </button>
-                        );
-                      }
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Linha 2: Perguntas Sim / Não */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
-                {/* Incluir insumos do piso? */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Incluir insumos do piso?
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
-                    <button
-                      type="button"
-                      onClick={() => setQuickIncluirInsumosPiso('sim')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIncluirInsumosPiso === 'sim'
-                          ? 'bg-[#0057ff] text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Sim
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setQuickIncluirInsumosPiso('nao')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIncluirInsumosPiso === 'nao'
-                          ? 'bg-slate-800 text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Não
-                    </button>
-                  </div>
-                </div>
-
-                {/* Incluir insumos do rodapé? */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    Incluir insumos do rodapé?
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
-                    <button
-                      type="button"
-                      onClick={() => setQuickIncluirInsumosRodape('sim')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIncluirInsumosRodape === 'sim'
-                          ? 'bg-[#0057ff] text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Sim
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setQuickIncluirInsumosRodape('nao')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIncluirInsumosRodape === 'nao'
-                          ? 'bg-slate-800 text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Não
-                    </button>
-                  </div>
-                </div>
-
-                {/* O ambiente é térreo? (padrão obrigatório: Não) */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-700 block">
-                    O ambiente é térreo?
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
-                    <button
-                      type="button"
-                      onClick={() => setQuickIsGroundFloor('sim')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIsGroundFloor === 'sim'
-                          ? 'bg-amber-600 text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Sim
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setQuickIsGroundFloor('nao')}
-                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        quickIsGroundFloor === 'nao'
-                          ? 'bg-slate-800 text-white shadow-xs'
-                          : 'text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      Não
-                    </button>
-                  </div>
-                  {quickIsGroundFloor === 'sim' && quickIncluirInsumosPiso === 'sim' && (
-                    <p className="text-[11px] font-semibold text-amber-700">
-                      Primer Antiumidade será incluído (rendimento 5 m²/un).
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              {/* Produtos consultados diretamente do catálogo do CRM (sem exibição de preços na seleção) */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
-                <div className="bg-white rounded-xl border border-slate-200/90 p-3 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                      Piso ({quickPisoType === 'colado' ? 'Colado' : 'Clicado'})
-                    </span>
-                    {activeQuickPisoProduct && (
-                      <span className="text-[10px] font-bold text-slate-400 uppercase">
-                        {activeQuickPisoProduct.category}
-                      </span>
-                    )}
-                  </div>
-                  {quickPisoCandidates.length > 0 ? (
-                    <select
-                      value={activeQuickPisoProduct?.id || ''}
-                      onChange={(e) =>
-                        setQuickSelectedPisoByType((prev) => ({
-                          ...prev,
-                          [quickPisoType]: e.target.value,
-                        }))
-                      }
-                      className="w-full h-9 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-[#0057ff] cursor-pointer"
-                    >
-                      {quickPisoCandidates.map((prod) => (
-                        <option key={prod.id} value={prod.id}>
-                          {prod.name}
-                        </option>
-                      ))}
-                    </select>
+                  {quickRipadoMode === 'm2' ? (
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={quickRipadoSqm}
+                      onChange={(e) => setQuickRipadoSqm(e.target.value)}
+                      placeholder="Ex: 12"
+                      className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                    />
                   ) : (
-                    <p className="text-xs text-rose-600 font-semibold">
-                      Nenhum piso {quickPisoType} da categoria Piso Vinílico encontrado no cadastro.
-                    </p>
-                  )}
-                  {quickBudgetPreview.reqPiso > 0 && activeQuickPisoProduct && (
-                    <p className="text-[11px] font-medium text-slate-600">
-                      Cálculo:{' '}
-                      <strong className="text-slate-900">
-                        {quickBudgetPreview.pisoBoxes
-                          ? `${quickBudgetPreview.pisoBoxes} ${quickBudgetPreview.pisoBoxes === 1 ? 'caixa' : 'caixas'} (${quickBudgetPreview.pisoEffectiveDisplay} m²)`
-                          : `${quickBudgetPreview.pisoEffectiveDisplay} m²`}
-                      </strong>
-                    </p>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={quickRipadoWidth}
+                        onChange={(e) => setQuickRipadoWidth(e.target.value)}
+                        placeholder="Larg. (m)"
+                        className="w-full h-11 rounded-xl border border-slate-300 bg-white px-2.5 text-xs sm:text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                      />
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={quickRipadoHeight}
+                        onChange={(e) => setQuickRipadoHeight(e.target.value)}
+                        placeholder="Alt. (m)"
+                        className="w-full h-11 rounded-xl border border-slate-300 bg-white px-2.5 text-xs sm:text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                      />
+                    </div>
                   )}
                 </div>
 
-                <div className="bg-white rounded-xl border border-slate-200/90 p-3 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                      Rodapé configurado ({quickRodapeHeight.replace('cm', ' cm')})
-                    </span>
-                    {activeQuickRodapeProduct && (
-                      <span className="text-[10px] font-bold text-slate-400 uppercase">
-                        {activeQuickRodapeProduct.category}
-                      </span>
-                    )}
+                {/* 4. Teto Vinílico (m²) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="h-6 flex items-center">
+                    <label className="text-xs font-bold text-slate-700 leading-none whitespace-nowrap">
+                      Teto Vinílico (m²)
+                    </label>
                   </div>
-                  {quickRodapeCandidates.length > 0 ? (
-                    <select
-                      value={activeQuickRodapeProduct?.id || ''}
-                      onChange={(e) =>
-                        setQuickSelectedRodapeByHeight((prev) => ({
-                          ...prev,
-                          [quickRodapeHeight]: e.target.value,
-                        }))
-                      }
-                      className="w-full h-9 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-[#0057ff] cursor-pointer"
-                    >
-                      {quickRodapeCandidates.map((prod) => (
-                        <option key={prod.id} value={prod.id}>
-                          {prod.name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <p className="text-xs text-rose-600 font-semibold">
-                      Nenhum rodapé de {quickRodapeHeight.replace('cm', ' cm')} encontrado no cadastro.
-                    </p>
-                  )}
-                  {quickBudgetPreview.reqRodape > 0 && activeQuickRodapeProduct && (
-                    <p className="text-[11px] font-medium text-slate-600">
-                      Solicitado: <strong className="text-slate-900">{quickBudgetPreview.reqRodapeDisplay} ml</strong> •{' '}
-                      <strong className="text-slate-900">
-                        {quickBudgetPreview.rodapeBarras}{' '}
-                        {quickBudgetPreview.rodapeBarras === 1 ? 'barra' : 'barras'} (
-                        {quickBudgetPreview.rodapeEffectiveMlDisplay} ml)
-                      </strong>
-                    </p>
-                  )}
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={quickTetoSqm}
+                    onChange={(e) => setQuickTetoSqm(e.target.value)}
+                    placeholder="Ex: 25"
+                    className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                  />
+                </div>
+
+                {/* 5. Manta Hospitalar (m²) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="h-6 flex items-center">
+                    <label className="text-xs font-bold text-slate-700 leading-none whitespace-nowrap">
+                      Manta Hospitalar (m²)
+                    </label>
+                  </div>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={quickMantaSqm}
+                    onChange={(e) => setQuickMantaSqm(e.target.value)}
+                    placeholder="Ex: 45"
+                    className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                  />
                 </div>
               </div>
 
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
                 <p className="text-xs text-slate-500">
-                  {quickBudgetPreview.reqPiso > 0 && quickBudgetPreview.pisoYield
-                    ? `Insumos do piso calculados sobre ${formatSqmPtBr(quickBudgetPreview.reqPiso)} m² solicitados.`
-                    : 'Preencha ao menos uma metragem (piso ou rodapé) para gerar.'}
+                  Tabela ativa: <strong className="text-slate-700">{getOfficialPriceTableLabel(priceTable)}</strong>
                 </p>
                 <button
                   type="submit"
@@ -5256,18 +4975,107 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       {/* 4. ITENS DO ORÇAMENTO (Tabela Interativa de Edição) */}
       {/* ======================================================== */}
       <section className="no-print bg-white rounded-2xl border border-slate-200/90 shadow-sm p-5 sm:p-7 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 border-b border-slate-100 pb-3">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl bg-blue-50 text-[#0057ff] flex items-center justify-center font-bold text-sm">
               4
             </div>
-            <h2 className="text-base sm:text-lg font-bold text-[#091122]">
-              Itens do Orçamento ({items.length})
-            </h2>
+            <div>
+              <h2 className="text-base sm:text-lg font-bold text-[#091122]">
+                Itens do Orçamento ({items.length})
+              </h2>
+              <span className="text-xs text-slate-500">
+                Você pode ajustar quantidades ou preços diretamente na tabela
+              </span>
+            </div>
           </div>
-          <span className="text-xs text-slate-500">
-            Você pode ajustar quantidades ou preços diretamente na tabela
-          </span>
+
+          {/* Duas chaves no próprio cabeçalho, nesta ordem: LIMPA PISO e ÁREA TÉRREA */}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* 1. LIMPA PISO */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={limpaPisoEnabled}
+              onClick={() => handleToggleLimpaPiso(!limpaPisoEnabled)}
+              className={`h-9 px-3 rounded-xl border flex items-center gap-2.5 transition-all cursor-pointer ${
+                limpaPisoEnabled
+                  ? 'border-blue-300 bg-blue-50/70 text-[#0B2046]'
+                  : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <span className="text-xs font-extrabold tracking-wide uppercase">
+                LIMPA PISO
+              </span>
+              <span
+                className={`w-9 h-5 rounded-full p-0.5 transition-colors flex items-center ${
+                  limpaPisoEnabled ? 'bg-[#0057ff] justify-end' : 'bg-slate-300 justify-start'
+                }`}
+              >
+                <span className="w-4 h-4 rounded-full bg-white shadow-xs block" />
+              </span>
+            </button>
+
+            {/* 2. ÁREA TÉRREA */}
+            <div
+              className={`min-h-9 px-3 py-1 rounded-xl border flex flex-wrap items-center gap-2.5 transition-all ${
+                areaTerreaEnabled
+                  ? 'border-blue-300 bg-blue-50/70 text-[#0B2046]'
+                  : 'border-slate-200 bg-slate-50 text-slate-600'
+              }`}
+            >
+              <button
+                type="button"
+                role="switch"
+                aria-checked={areaTerreaEnabled}
+                onClick={() => handleToggleAreaTerrea(!areaTerreaEnabled)}
+                className="flex items-center gap-2.5 cursor-pointer"
+              >
+                <span className="text-xs font-extrabold tracking-wide uppercase">
+                  ÁREA TÉRREA
+                </span>
+                <span
+                  className={`w-9 h-5 rounded-full p-0.5 transition-colors flex items-center ${
+                    areaTerreaEnabled ? 'bg-[#0057ff] justify-end' : 'bg-slate-300 justify-start'
+                  }`}
+                >
+                  <span className="w-4 h-4 rounded-full bg-white shadow-xs block" />
+                </span>
+              </button>
+
+              {areaTerreaEnabled && (
+                <div className="flex items-center gap-1.5 pl-1 border-l border-blue-200">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={areaTerreaSqm}
+                    onChange={(e) => handleAreaTerreaSqmChange(e.target.value)}
+                    placeholder="Metragem (m²)"
+                    className="w-28 h-7 rounded-lg border border-slate-300 bg-white px-2 text-xs font-bold text-slate-900 outline-none focus:border-[#0057ff]"
+                  />
+                  <span className="text-[11px] font-bold text-slate-500">m²</span>
+                </div>
+              )}
+            </div>
+
+            <div className="h-5 w-px bg-slate-200 hidden sm:block" aria-hidden="true" />
+
+            <button
+              type="button"
+              onClick={() => {
+                if (items.length === 0 && !limpaPisoEnabled && !areaTerreaEnabled) {
+                  showToast('A tabela de itens já está vazia.');
+                  return;
+                }
+                handleConfirmClearAllItems();
+              }}
+              className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-[#0057ff] transition-colors cursor-pointer px-2 py-1 rounded-lg hover:bg-slate-100 shrink-0"
+              title="Limpar todos os itens do orçamento"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Limpar</span>
+            </button>
+          </div>
         </div>
 
         <div className="overflow-x-auto border border-slate-200 rounded-xl">
@@ -5425,20 +5233,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                         <div className="flex items-center justify-center gap-1">
                           <button
                             type="button"
-                            onClick={() =>
-                              isRodapeItem ? openRodapeMlEditModal(item) : handleEditItem(item)
-                            }
+                            onClick={() => handleEditItem(item)}
                             className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-100 transition-colors cursor-pointer"
-                            title={
-                              isRodapeItem
-                                ? 'Editar metragem em metros lineares (ml)'
-                                : 'Editar este produto no formulário'
-                            }
-                            aria-label={
-                              isRodapeItem
-                                ? 'Editar metragem em metros lineares (ml)'
-                                : 'Editar este produto'
-                            }
+                            title="Editar este produto no formulário"
+                            aria-label="Editar este produto"
                           >
                             <Edit3 className="w-3.5 h-3.5" />
                           </button>
@@ -6087,138 +5885,19 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         onConfirmWithInsumos={(selection) => commitRodapePrompt(selection)}
       />
 
-      {/* Modal de Edição de Metros Lineares (ml) para Rodapé pelo ícone de Lápis */}
-      {rodapeMlModalItem && (() => {
-        const barLen =
-          rodapeMlModalItem.barLengthMeters ||
-          extractBarLengthFromProductName(rodapeMlModalItem.descricao, 2.4);
-        const parsedMl = parsePtBrNumeric(rodapeMlModalInput);
-        const calcBars = parsedMl > 0 ? Math.max(1, Math.ceil(parsedMl / barLen - 1e-9)) : 0;
-        const effectiveMl = Math.round(calcBars * barLen * 100) / 100;
-        const previewTotal = Math.round(calcBars * rodapeMlModalItem.precoUnitario * 100) / 100;
-
-        return (
-          <div
-            className="no-print fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"
-            onClick={() => {
-              setRodapeMlModalItem(null);
-              setRodapeMlModalError(null);
-            }}
-          >
-            <form
-              onSubmit={handleConfirmRodapeMlModal}
-              onClick={(e) => e.stopPropagation()}
-              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md overflow-hidden"
-            >
-              <div className="px-5 py-4 bg-[#0B2046] text-white flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-sm sm:text-base font-extrabold">
-                    Editar Metragem Linear (ml)
-                  </h3>
-                  <p className="text-[11px] text-sky-200 font-medium truncate max-w-[300px]">
-                    {rodapeMlModalItem.descricao}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRodapeMlModalItem(null);
-                    setRodapeMlModalError(null);
-                  }}
-                  className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <div className="p-5 space-y-4">
-                <div className="flex items-center justify-between text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5">
-                  <span>
-                    Comprimento da barra:{' '}
-                    <strong className="text-[#0B2046]">
-                      {barLen.toFixed(2).replace('.', ',')} m
-                    </strong>
-                  </span>
-                  <span>
-                    Valor por barra:{' '}
-                    <strong className="text-[#0B2046]">
-                      R$ {formatPriceToBrl(rodapeMlModalItem.precoUnitario)}
-                    </strong>
-                  </span>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-bold text-[#0B2046]">
-                    Metragem desejada em metros lineares (ml)
-                  </label>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    value={rodapeMlModalInput}
-                    onChange={(e) => {
-                      setRodapeMlModalInput(e.target.value);
-                      setRodapeMlModalError(null);
-                    }}
-                    placeholder="Ex: 20,00"
-                    className="w-full h-11 px-3.5 rounded-xl border border-slate-300 focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/15 text-sm font-extrabold text-[#0B2046] outline-none"
-                    autoFocus
-                  />
-                </div>
-
-                {rodapeMlModalError && (
-                  <p className="text-xs font-semibold text-rose-600">{rodapeMlModalError}</p>
-                )}
-
-                <div className="rounded-xl bg-blue-50/70 border border-blue-200 p-3.5 space-y-2 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-600 font-medium">
-                      Barras necessárias (arredondado para cima):
-                    </span>
-                    <span className="text-sm font-black text-[#0052cc] tabular-nums">
-                      {calcBars} {calcBars === 1 ? 'barra' : 'barras'}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-slate-500">
-                    <span>Metragem efetiva das barras:</span>
-                    <span className="font-semibold tabular-nums">
-                      {formatMlPtBr(effectiveMl)} ml
-                    </span>
-                  </div>
-                  <div className="pt-1.5 border-t border-blue-200/70 flex items-center justify-between">
-                    <span className="font-bold text-[#0B2046]">Novo valor do item:</span>
-                    <span className="text-sm font-black text-[#0B2046] tabular-nums">
-                      {previewTotal.toLocaleString('pt-BR', {
-                        style: 'currency',
-                        currency: 'BRL',
-                      })}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRodapeMlModalItem(null);
-                    setRodapeMlModalError(null);
-                  }}
-                  className="px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-bold text-slate-600 cursor-pointer"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-xl bg-[#0057ff] hover:bg-[#0047db] text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  <span>Atualizar Orçamento</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        );
-      })()}
+      {/* Modal Sequencial de Configuração do Orçamento Rápido */}
+      {quickWizardMeasurements && (
+        <ModalConfiguracaoOrcamentoRapido
+          isOpen={quickWizardOpen}
+          steps={quickWizardSteps}
+          measurements={quickWizardMeasurements}
+          initialConfig={quickWizardConfig}
+          priceTable={priceTable}
+          catalog={dynamicCatalog}
+          onClose={() => setQuickWizardOpen(false)}
+          onConfirm={handleConfirmQuickWizard}
+        />
+      )}
     </div>
   );
 };

@@ -9,6 +9,7 @@ import {
   DollarSign,
 } from 'lucide-react';
 import { FenixOfficialLogo } from './FenixOfficialLogo';
+import { isRodapeProduct, stripRodapeAutoDetail } from '../utils/rodapeCalculator';
 
 export interface EspelhoItem {
   id: string;
@@ -21,6 +22,7 @@ export interface EspelhoItem {
   total: number;
   requestedMl?: number;
   barLengthMeters?: number;
+  autoTag?: string;
 }
 
 export interface EspelhoOrcamentoProps {

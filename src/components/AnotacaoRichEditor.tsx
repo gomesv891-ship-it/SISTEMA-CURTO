@@ -11,10 +11,24 @@ import {
   AnotacaoChecklistItem,
   createChecklistBlock,
   createTextBlock,
+  escapeHtml,
   generateUid,
   sanitizeNoteHtml,
 } from '../utils/anotacoesService';
 import { NOTEBOOK_LINE_HEIGHT } from './AnotacaoFolhaDocument';
+
+export const FONT_SIZE_STEPS = [12, 13, 15, 17, 19, 22, 25] as const;
+export const DEFAULT_FONT_SIZE = 15;
+
+export interface ActiveFormatsState {
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  unorderedList: boolean;
+  orderedList: boolean;
+  fontSize?: number;
+  textColor?: string | null;
+}
 
 export interface AnotacaoRichEditorHandle {
   focusEditor: () => void;
@@ -23,6 +37,8 @@ export interface AnotacaoRichEditorHandle {
     command: 'bold' | 'italic' | 'underline' | 'insertUnorderedList' | 'insertOrderedList'
   ) => void;
   applyHighlight: (color: string | null) => void;
+  applyTextColor: (color: string | null) => void;
+  changeFontSize: (direction: 'increase' | 'decrease') => void;
   insertChecklist: () => void;
   focusLastBlock: () => void;
 }
@@ -32,15 +48,279 @@ interface AnotacaoRichEditorProps {
   blocks: AnotacaoBlock[];
   onChangeBlocks: (nextBlocks: AnotacaoBlock[], flushImmediate?: boolean) => void;
   onActivateEditing?: () => void;
-  onActiveFormatsChange?: (formats: {
-    bold: boolean;
-    italic: boolean;
-    underline: boolean;
-    unorderedList: boolean;
-    orderedList: boolean;
-  }) => void;
+  onActiveFormatsChange?: (formats: ActiveFormatsState) => void;
   isEditing: boolean;
   readOnly?: boolean;
+}
+
+type EditorTarget =
+  | { kind: 'text'; blockId: string }
+  | { kind: 'checklist'; blockId: string; itemId: string };
+
+const BLOCK_TAG_NAMES = new Set(['P', 'DIV', 'LI', 'UL', 'OL', 'H1', 'H2', 'H3']);
+
+function unwrapIfEmptyInlineWrapper(el: HTMLElement) {
+  const tag = el.tagName.toUpperCase();
+  if (tag !== 'SPAN' && tag !== 'FONT') return;
+  const styleAttr = el.getAttribute('style');
+  const hasStyle = Boolean(styleAttr && styleAttr.trim());
+  const hasOtherAttrs = Array.from(el.attributes).some(
+    (attr) => attr.name.toLowerCase() !== 'style'
+  );
+  if (!hasStyle && !hasOtherAttrs) {
+    const parent = el.parentNode;
+    if (!parent) return;
+    while (el.firstChild) {
+      parent.insertBefore(el.firstChild, el);
+    }
+    parent.removeChild(el);
+  }
+}
+
+function stripInlineStyleFromFragment(
+  root: ParentNode,
+  prop: 'color' | 'fontSize'
+) {
+  const elements = Array.from(root.querySelectorAll('span, font, mark, b, strong, i, em, u, s, strike')) as HTMLElement[];
+  for (const el of elements) {
+    if (prop === 'color') {
+      if (el.tagName === 'FONT') el.removeAttribute('color');
+      el.style.color = '';
+    } else if (prop === 'fontSize') {
+      if (el.tagName === 'FONT') el.removeAttribute('size');
+      el.style.fontSize = '';
+      el.style.lineHeight = '';
+    }
+    if (!el.getAttribute('style')?.trim()) {
+      el.removeAttribute('style');
+    }
+    unwrapIfEmptyInlineWrapper(el);
+  }
+}
+
+function getEffectiveFontSizeAtSelection(rootEl: HTMLElement, sel: Selection): number {
+  let node: Node | null = sel.anchorNode || rootEl;
+  while (node && node !== rootEl) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      if (el.style?.fontSize) {
+        const parsed = parseFloat(el.style.fontSize);
+        if (!isNaN(parsed) && parsed > 0) return parsed;
+      }
+    }
+    node = node.parentNode;
+  }
+  try {
+    const anchorEl =
+      sel.anchorNode?.nodeType === Node.ELEMENT_NODE
+        ? (sel.anchorNode as HTMLElement)
+        : sel.anchorNode?.parentElement || rootEl;
+    const computed = parseFloat(window.getComputedStyle(anchorEl).fontSize || '');
+    if (!isNaN(computed) && computed > 0) return computed;
+  } catch {}
+  return DEFAULT_FONT_SIZE;
+}
+
+function getEffectiveTextColorAtSelection(rootEl: HTMLElement, sel: Selection): string | null {
+  let node: Node | null = sel.anchorNode || rootEl;
+  while (node && node !== rootEl) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      if (el.style?.color && el.style.color !== 'inherit') {
+        return el.style.color;
+      }
+      if (el.tagName === 'FONT' && el.getAttribute('color')) {
+        return el.getAttribute('color');
+      }
+    }
+    node = node.parentNode;
+  }
+  return null;
+}
+
+function applyStyledSpanToRange(
+  rootEl: HTMLElement,
+  sel: Selection,
+  prop: 'color' | 'fontSize',
+  value: string | null
+) {
+  if (sel.rangeCount === 0) return;
+  const range = sel.getRangeAt(0);
+
+  if (value === null) {
+    if (range.collapsed) {
+      let node: Node | null = range.startContainer;
+      let targetAncestor: HTMLElement | null = null;
+      while (node && node !== rootEl) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const htmlEl = node as HTMLElement;
+          if (
+            (prop === 'color' && (htmlEl.style?.color || htmlEl.getAttribute('color'))) ||
+            (prop === 'fontSize' && htmlEl.style?.fontSize)
+          ) {
+            targetAncestor = htmlEl;
+            break;
+          }
+        }
+        node = node.parentNode;
+      }
+      if (targetAncestor) {
+        if (!targetAncestor.textContent?.replace(/\u200B/g, '').trim()) {
+          if (prop === 'color') {
+            targetAncestor.style.color = '';
+            targetAncestor.removeAttribute('color');
+          } else {
+            targetAncestor.style.fontSize = '';
+            targetAncestor.style.lineHeight = '';
+          }
+          if (!targetAncestor.getAttribute('style')?.trim()) {
+            targetAncestor.removeAttribute('style');
+          }
+          unwrapIfEmptyInlineWrapper(targetAncestor);
+        } else {
+          const afterRange = document.createRange();
+          afterRange.setStartAfter(targetAncestor);
+          afterRange.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(afterRange);
+        }
+      }
+      return;
+    }
+
+    const candidates = Array.from(rootEl.querySelectorAll('span, font, mark, b, strong, i, em, u')) as HTMLElement[];
+    for (const htmlNode of candidates) {
+      try {
+        if (!range.intersectsNode(htmlNode)) continue;
+      } catch {
+        continue;
+      }
+      if (prop === 'color') {
+        htmlNode.style.color = '';
+        if (htmlNode.tagName === 'FONT') htmlNode.removeAttribute('color');
+      } else {
+        htmlNode.style.fontSize = '';
+        htmlNode.style.lineHeight = '';
+      }
+      if (!htmlNode.getAttribute('style')?.trim()) {
+        htmlNode.removeAttribute('style');
+      }
+      unwrapIfEmptyInlineWrapper(htmlNode);
+    }
+    return;
+  }
+
+  if (range.collapsed) {
+    const startParent =
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as HTMLElement)
+        : range.startContainer.parentElement;
+
+    if (
+      startParent &&
+      rootEl.contains(startParent) &&
+      startParent !== rootEl &&
+      startParent.tagName === 'SPAN' &&
+      (startParent.textContent || '') === '\u200B'
+    ) {
+      if (prop === 'color') {
+        startParent.style.color = value;
+      } else {
+        startParent.style.fontSize = value;
+        const px = parseFloat(value);
+        startParent.style.lineHeight = px > 18 ? `${Math.ceil(px * 1.35)}px` : '';
+      }
+      const r = document.createRange();
+      r.selectNodeContents(startParent);
+      r.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      return;
+    }
+
+    const span = document.createElement('span');
+    if (prop === 'color') {
+      span.style.color = value;
+    } else {
+      span.style.fontSize = value;
+      const px = parseFloat(value);
+      if (px > 18) span.style.lineHeight = `${Math.ceil(px * 1.35)}px`;
+    }
+    const zwsp = document.createTextNode('\u200B');
+    span.appendChild(zwsp);
+    range.insertNode(span);
+    const innerRange = document.createRange();
+    innerRange.setStart(zwsp, 1);
+    innerRange.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(innerRange);
+    return;
+  }
+
+  const frag = range.extractContents();
+  stripInlineStyleFromFragment(frag, prop);
+
+  const hasBlockElement = Array.from(frag.childNodes).some(
+    (n) =>
+      n.nodeType === Node.ELEMENT_NODE &&
+      BLOCK_TAG_NAMES.has((n as HTMLElement).tagName.toUpperCase())
+  );
+
+  const createStyledSpan = () => {
+    const span = document.createElement('span');
+    if (prop === 'color') {
+      span.style.color = value;
+    } else {
+      span.style.fontSize = value;
+      const px = parseFloat(value);
+      if (px > 18) span.style.lineHeight = `${Math.ceil(px * 1.35)}px`;
+    }
+    return span;
+  };
+
+  if (!hasBlockElement) {
+    const wrapper = createStyledSpan();
+    wrapper.appendChild(frag);
+    range.insertNode(wrapper);
+    const newRange = document.createRange();
+    newRange.selectNodeContents(wrapper);
+    sel.removeAllRanges();
+    sel.addRange(newRange);
+    return;
+  }
+
+  const wrapBlockInlineContents = (container: Node) => {
+    const children = Array.from(container.childNodes);
+    for (const child of children) {
+      if (
+        child.nodeType === Node.ELEMENT_NODE &&
+        BLOCK_TAG_NAMES.has((child as HTMLElement).tagName.toUpperCase())
+      ) {
+        wrapBlockInlineContents(child);
+      } else if (child.nodeType === Node.TEXT_NODE && !(child.textContent || '')) {
+        continue;
+      } else {
+        const wrapper = createStyledSpan();
+        container.insertBefore(wrapper, child);
+        wrapper.appendChild(child);
+      }
+    }
+  };
+
+  wrapBlockInlineContents(frag);
+  const firstNode = frag.firstChild;
+  const lastNode = frag.lastChild;
+  range.insertNode(frag);
+
+  if (firstNode && lastNode) {
+    try {
+      const newRange = document.createRange();
+      newRange.setStartBefore(firstNode);
+      newRange.setEndAfter(lastNode);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+    } catch {}
+  }
 }
 
 interface EditableTextBlockProps {
@@ -95,7 +375,7 @@ const EditableTextBlock: React.FC<EditableTextBlockProps> = ({
       <div
         className="anotacao-rich-content"
         style={{
-          fontSize: '15px',
+          fontSize: `${DEFAULT_FONT_SIZE}px`,
           lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
           color: '#0F172A',
           wordBreak: 'break-word',
@@ -135,7 +415,6 @@ const EditableTextBlock: React.FC<EditableTextBlockProps> = ({
           e.preventDefault();
           const cleaned = sanitizeNoteHtml(htmlData)
             .replace(/line-height\s*:[^;"']+;?/gi, '')
-            .replace(/font-size\s*:[^;"']+;?/gi, '')
             .replace(/margin[^:]*:[^;"']+;?/gi, '')
             .replace(/padding[^:]*:[^;"']+;?/gi, '');
           document.execCommand('insertHTML', false, cleaned || plainData);
@@ -156,7 +435,7 @@ const EditableTextBlock: React.FC<EditableTextBlockProps> = ({
       className="anotacao-rich-content rich-text-editor"
       style={{
         outline: 'none',
-        fontSize: '15px',
+        fontSize: `${DEFAULT_FONT_SIZE}px`,
         lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
         color: '#0F172A',
         minHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
@@ -169,39 +448,56 @@ const EditableTextBlock: React.FC<EditableTextBlockProps> = ({
 };
 
 interface ChecklistItemEditableProps {
+  noteId: string;
   value: string;
+  html?: string;
   checked: boolean;
   strikeCompleted: boolean;
   autoFocus?: boolean;
   onFocus?: () => void;
-  onChange: (val: string) => void;
+  onBlur?: () => void;
+  onSelectionChange?: () => void;
+  onChange: (text: string, html: string) => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void;
   inputRef?: (el: HTMLDivElement | null) => void;
 }
 
 const ChecklistItemEditable: React.FC<ChecklistItemEditableProps> = ({
+  noteId,
   value,
+  html,
   checked,
   strikeCompleted,
   autoFocus,
   onFocus,
+  onBlur,
+  onSelectionChange,
   onChange,
   onKeyDown,
   inputRef,
 }) => {
   const localRef = useRef<HTMLDivElement | null>(null);
-  const lastTextRef = useRef<string>(value);
+  const lastHtmlRef = useRef<string>(html ?? (value ? escapeHtml(value) : ''));
+  const lastNoteIdRef = useRef<string>(noteId);
 
   useEffect(() => {
     const el = localRef.current;
     if (!el) return;
-    if (document.activeElement !== el || value !== lastTextRef.current) {
-      if (el.textContent !== value) {
-        el.textContent = value;
-      }
-      lastTextRef.current = value;
+    const expectedHtml = html !== undefined ? html : value ? escapeHtml(value) : '';
+    const noteChanged = lastNoteIdRef.current !== noteId;
+
+    if (noteChanged) {
+      el.innerHTML = expectedHtml;
+      lastHtmlRef.current = expectedHtml;
+      lastNoteIdRef.current = noteId;
+      return;
     }
-  }, [value]);
+
+    if (el.innerHTML !== expectedHtml && (document.activeElement !== el || expectedHtml !== lastHtmlRef.current)) {
+      el.innerHTML = expectedHtml;
+      lastHtmlRef.current = expectedHtml;
+    }
+  }, [noteId, value, html]);
 
   useEffect(() => {
     if (autoFocus && localRef.current) {
@@ -230,16 +526,43 @@ const ChecklistItemEditable: React.FC<ChecklistItemEditableProps> = ({
       suppressContentEditableWarning
       spellCheck
       data-placeholder="Item do checklist..."
-      onFocus={onFocus}
-      onPaste={(e) => {
-        e.preventDefault();
-        const plain = e.clipboardData?.getData('text/plain') || '';
-        document.execCommand('insertText', false, plain.replace(/\r?\n/g, ' '));
+      onFocus={() => {
+        onFocus?.();
+        onSelectionChange?.();
       }}
+      onBlur={() => {
+        onBlur?.();
+      }}
+      onPaste={(e) => {
+        const htmlData = e.clipboardData?.getData('text/html');
+        const plain = e.clipboardData?.getData('text/plain') || '';
+        e.preventDefault();
+        if (htmlData) {
+          const cleaned = sanitizeNoteHtml(htmlData)
+            .replace(/<\/?(?:p|div|li|ul|ol)[^>]*>/gi, ' ')
+            .replace(/<br\s*\/?>/gi, ' ')
+            .replace(/line-height\s*:[^;"']+;?/gi, '')
+            .replace(/margin[^:]*:[^;"']+;?/gi, '')
+            .replace(/padding[^:]*:[^;"']+;?/gi, '')
+            .trim();
+          document.execCommand('insertHTML', false, cleaned || escapeHtml(plain.replace(/\r?\n/g, ' ')));
+        } else {
+          document.execCommand('insertText', false, plain.replace(/\r?\n/g, ' '));
+        }
+        const nextHtml = e.currentTarget.innerHTML;
+        const nextText = e.currentTarget.textContent || '';
+        lastHtmlRef.current = nextHtml;
+        onChange(nextText, nextHtml);
+        onSelectionChange?.();
+      }}
+      onMouseUp={onSelectionChange}
+      onKeyUp={onSelectionChange}
       onInput={(e) => {
-        const text = e.currentTarget.textContent || '';
-        lastTextRef.current = text;
-        onChange(text);
+        const nextHtml = e.currentTarget.innerHTML;
+        const nextText = e.currentTarget.textContent || '';
+        lastHtmlRef.current = nextHtml;
+        onChange(nextText, nextHtml);
+        onSelectionChange?.();
       }}
       onKeyDown={onKeyDown}
       className="anotacao-checklist-editable"
@@ -250,7 +573,7 @@ const ChecklistItemEditable: React.FC<ChecklistItemEditableProps> = ({
         outline: 'none',
         padding: 0,
         margin: 0,
-        fontSize: '15px',
+        fontSize: `${DEFAULT_FONT_SIZE}px`,
         lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
         minHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
         color: checked ? '#64748B' : '#0F172A',
@@ -279,11 +602,35 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
   ) => {
     const textElsRef = useRef<Record<string, HTMLDivElement | null>>({});
     const checklistInputRefs = useRef<Record<string, HTMLDivElement | null>>({});
+    const checklistBlockMapRef = useRef<Record<string, string>>({});
     const activeBlockIdRef = useRef<string | null>(null);
+    const activeTargetRef = useRef<EditorTarget | null>(null);
     const savedRangeRef = useRef<Range | null>(null);
     const pendingFocusChecklistItemId = useRef<string | null>(null);
 
     const safeBlocks = blocks.length > 0 ? blocks : [createTextBlock('')];
+    const latestBlocksRef = useRef<AnotacaoBlock[]>(safeBlocks);
+    latestBlocksRef.current = safeBlocks;
+
+    const getTargetElement = useCallback((target: EditorTarget | null): HTMLDivElement | null => {
+      if (!target) return null;
+      if (target.kind === 'text') {
+        return textElsRef.current[target.blockId] || null;
+      }
+      return checklistInputRefs.current[target.itemId] || null;
+    }, []);
+
+    const findChecklistBlockIdForItem = useCallback((itemId: string): string | null => {
+      if (checklistBlockMapRef.current[itemId]) {
+        return checklistBlockMapRef.current[itemId];
+      }
+      for (const b of latestBlocksRef.current) {
+        if (b.kind === 'checklist' && b.items.some((it) => it.id === itemId)) {
+          return b.id;
+        }
+      }
+      return null;
+    }, []);
 
     const saveSelection = useCallback(() => {
       if (typeof window === 'undefined') return;
@@ -291,40 +638,69 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       if (!sel || sel.rangeCount === 0) return;
       const range = sel.getRangeAt(0);
       const containerNode = range.commonAncestorContainer;
-      const matchedEntry = (
+
+      const matchedTextEntry = (
         Object.entries(textElsRef.current) as [string, HTMLDivElement | null][]
-      ).find(([, el]) => {
-        if (!el) return false;
-        return el === containerNode || el.contains(containerNode);
-      });
-      if (matchedEntry) {
-        activeBlockIdRef.current = matchedEntry[0];
+      ).find(([, el]) => Boolean(el && (el === containerNode || el.contains(containerNode))));
+
+      if (matchedTextEntry) {
+        activeBlockIdRef.current = matchedTextEntry[0];
+        activeTargetRef.current = { kind: 'text', blockId: matchedTextEntry[0] };
         savedRangeRef.current = range.cloneRange();
+        return;
       }
-    }, []);
+
+      const matchedChecklistEntry = (
+        Object.entries(checklistInputRefs.current) as [string, HTMLDivElement | null][]
+      ).find(([, el]) => Boolean(el && (el === containerNode || el.contains(containerNode))));
+
+      if (matchedChecklistEntry) {
+        const itemId = matchedChecklistEntry[0];
+        const blockId = findChecklistBlockIdForItem(itemId);
+        if (blockId) {
+          activeBlockIdRef.current = blockId;
+          activeTargetRef.current = { kind: 'checklist', blockId, itemId };
+          savedRangeRef.current = range.cloneRange();
+        }
+      }
+    }, [findChecklistBlockIdForItem]);
 
     const emitActiveFormats = useCallback(() => {
       if (!onActiveFormatsChange || typeof document === 'undefined') return;
       try {
+        const sel = window.getSelection();
+        const activeEl = getTargetElement(activeTargetRef.current);
+        let fontSize = DEFAULT_FONT_SIZE;
+        let textColor: string | null = null;
+        if (sel && sel.rangeCount > 0 && activeEl && activeEl.contains(sel.anchorNode)) {
+          fontSize = Math.round(getEffectiveFontSizeAtSelection(activeEl, sel));
+          textColor = getEffectiveTextColorAtSelection(activeEl, sel);
+        }
         onActiveFormatsChange({
           bold: document.queryCommandState('bold'),
           italic: document.queryCommandState('italic'),
           underline: document.queryCommandState('underline'),
           unorderedList: document.queryCommandState('insertUnorderedList'),
           orderedList: document.queryCommandState('insertOrderedList'),
+          fontSize,
+          textColor,
         });
       } catch {}
-    }, [onActiveFormatsChange]);
+    }, [onActiveFormatsChange, getTargetElement]);
 
     useEffect(() => {
       const handleDocSelectionChange = () => {
         const sel = window.getSelection();
         if (!sel || sel.rangeCount === 0) return;
         const containerNode = sel.getRangeAt(0).commonAncestorContainer;
-        const insideEditor = (
+        const insideText = (
           Object.values(textElsRef.current) as (HTMLDivElement | null)[]
         ).some((el) => el && (el === containerNode || el.contains(containerNode)));
-        if (insideEditor) {
+        const insideChecklist = (
+          Object.values(checklistInputRefs.current) as (HTMLDivElement | null)[]
+        ).some((el) => el && (el === containerNode || el.contains(containerNode)));
+
+        if (insideText || insideChecklist) {
           saveSelection();
           emitActiveFormats();
         }
@@ -333,56 +709,117 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       return () => document.removeEventListener('selectionchange', handleDocSelectionChange);
     }, [saveSelection, emitActiveFormats]);
 
-    const restoreSelectionOrFocus = useCallback((): HTMLDivElement | null => {
-      const targetId =
-        activeBlockIdRef.current ||
-        safeBlocks.find((b) => b.kind === 'text')?.id ||
-        null;
-      const targetEl = targetId ? textElsRef.current[targetId] : null;
-      if (!targetEl) return null;
+    const restoreSelectionOrFocus = useCallback(
+      (options?: { preferTextBlock?: boolean }): { el: HTMLDivElement; target: EditorTarget } | null => {
+        const currentBlocks = latestBlocksRef.current;
+        let resolvedTarget = activeTargetRef.current;
+        let targetEl = getTargetElement(resolvedTarget);
 
-      if (document.activeElement !== targetEl) {
-        targetEl.focus({ preventScroll: true });
-      }
+        if (options?.preferTextBlock && resolvedTarget?.kind === 'checklist') {
+          const checkIdx = currentBlocks.findIndex((b) => b.id === resolvedTarget!.blockId);
+          const nextTextBlock =
+            currentBlocks.slice(checkIdx + 1).find((b) => b.kind === 'text') ||
+            currentBlocks.find((b) => b.kind === 'text');
+          if (nextTextBlock) {
+            resolvedTarget = { kind: 'text', blockId: nextTextBlock.id };
+            targetEl = textElsRef.current[nextTextBlock.id] || null;
+          }
+        }
 
-      const sel = window.getSelection();
-      if (
-        sel &&
-        savedRangeRef.current &&
-        savedRangeRef.current.startContainer.isConnected &&
-        targetEl.contains(savedRangeRef.current.commonAncestorContainer)
-      ) {
-        try {
+        if (!targetEl || !targetEl.isConnected) {
+          const fallbackBlockId =
+            activeBlockIdRef.current && textElsRef.current[activeBlockIdRef.current]
+              ? activeBlockIdRef.current
+              : currentBlocks.find((b) => b.kind === 'text' && textElsRef.current[b.id])?.id || null;
+
+          if (fallbackBlockId && textElsRef.current[fallbackBlockId]) {
+            resolvedTarget = { kind: 'text', blockId: fallbackBlockId };
+            targetEl = textElsRef.current[fallbackBlockId]!;
+          } else {
+            const firstChecklist = currentBlocks.find((b) => b.kind === 'checklist' && b.items.length > 0);
+            if (firstChecklist && firstChecklist.kind === 'checklist') {
+              const firstItemId = firstChecklist.items[0].id;
+              const checkEl = checklistInputRefs.current[firstItemId];
+              if (checkEl) {
+                resolvedTarget = {
+                  kind: 'checklist',
+                  blockId: firstChecklist.id,
+                  itemId: firstItemId,
+                };
+                targetEl = checkEl;
+              }
+            }
+          }
+        }
+
+        if (!targetEl || !resolvedTarget) return null;
+
+        activeTargetRef.current = resolvedTarget;
+        activeBlockIdRef.current = resolvedTarget.blockId;
+
+        if (document.activeElement !== targetEl) {
+          targetEl.focus({ preventScroll: true });
+        }
+
+        const sel = window.getSelection();
+        if (
+          sel &&
+          savedRangeRef.current &&
+          savedRangeRef.current.startContainer.isConnected &&
+          targetEl.contains(savedRangeRef.current.commonAncestorContainer)
+        ) {
+          try {
+            sel.removeAllRanges();
+            sel.addRange(savedRangeRef.current);
+            return { el: targetEl, target: resolvedTarget };
+          } catch {}
+        }
+
+        if (sel) {
+          const r = document.createRange();
+          r.selectNodeContents(targetEl);
+          r.collapse(false);
           sel.removeAllRanges();
-          sel.addRange(savedRangeRef.current);
-          return targetEl;
-        } catch {}
-      }
+          sel.addRange(r);
+          savedRangeRef.current = r.cloneRange();
+        }
+        return { el: targetEl, target: resolvedTarget };
+      },
+      [getTargetElement]
+    );
 
-      if (sel) {
-        const r = document.createRange();
-        r.selectNodeContents(targetEl);
-        r.collapse(false);
-        sel.removeAllRanges();
-        sel.addRange(r);
-        savedRangeRef.current = r.cloneRange();
-      }
-      return targetEl;
-    }, [safeBlocks]);
-
-    const syncBlockDomHtml = useCallback(
-      (targetEl: HTMLDivElement, blockId: string) => {
-        const html = targetEl.innerHTML;
-        const current = safeBlocks.find((b) => b.id === blockId && b.kind === 'text');
-        if (current && current.kind === 'text' && current.html === html) {
+    const syncTargetDom = useCallback(
+      (targetEl: HTMLDivElement, target: EditorTarget) => {
+        const currentBlocks = latestBlocksRef.current;
+        if (target.kind === 'text') {
+          const html = targetEl.innerHTML;
+          const current = currentBlocks.find((b) => b.id === target.blockId && b.kind === 'text');
+          if (current && current.kind === 'text' && current.html === html) {
+            return;
+          }
+          const nextBlocks = currentBlocks.map((b) =>
+            b.id === target.blockId && b.kind === 'text' ? { ...b, html } : b
+          );
+          latestBlocksRef.current = nextBlocks;
+          onChangeBlocks(nextBlocks, false);
           return;
         }
-        const nextBlocks = safeBlocks.map((b) =>
-          b.id === blockId && b.kind === 'text' ? { ...b, html } : b
-        );
+
+        const html = targetEl.innerHTML;
+        const text = targetEl.textContent || '';
+        const nextBlocks = currentBlocks.map((b) => {
+          if (b.id !== target.blockId || b.kind !== 'checklist') return b;
+          return {
+            ...b,
+            items: b.items.map((it) =>
+              it.id === target.itemId ? { ...it, text, html } : it
+            ),
+          };
+        });
+        latestBlocksRef.current = nextBlocks;
         onChangeBlocks(nextBlocks, false);
       },
-      [safeBlocks, onChangeBlocks]
+      [onChangeBlocks]
     );
 
     const handleInsertChecklist = useCallback(() => {
@@ -390,19 +827,21 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       const newItem: AnotacaoChecklistItem = {
         id: generateUid('chk'),
         text: '',
+        html: '',
         checked: false,
       };
       const newChecklist = createChecklistBlock([newItem]);
       pendingFocusChecklistItemId.current = newItem.id;
 
-      const activeId = activeBlockIdRef.current;
-      const idx = activeId ? safeBlocks.findIndex((b) => b.id === activeId) : safeBlocks.length - 1;
-      const insertAfter = idx >= 0 ? idx : safeBlocks.length - 1;
+      const currentBlocks = latestBlocksRef.current;
+      const activeId = activeTargetRef.current?.blockId || activeBlockIdRef.current;
+      const idx = activeId ? currentBlocks.findIndex((b) => b.id === activeId) : currentBlocks.length - 1;
+      const insertAfter = idx >= 0 ? idx : currentBlocks.length - 1;
 
       const next: AnotacaoBlock[] = [
-        ...safeBlocks.slice(0, insertAfter + 1),
+        ...currentBlocks.slice(0, insertAfter + 1),
         newChecklist,
-        ...safeBlocks.slice(insertAfter + 1),
+        ...currentBlocks.slice(insertAfter + 1),
       ];
 
       const insertedIdx = insertAfter + 1;
@@ -410,12 +849,25 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
         next.splice(insertedIdx + 1, 0, createTextBlock(''));
       }
 
+      checklistBlockMapRef.current[newItem.id] = newChecklist.id;
+      activeBlockIdRef.current = newChecklist.id;
+      activeTargetRef.current = {
+        kind: 'checklist',
+        blockId: newChecklist.id,
+        itemId: newItem.id,
+      };
+
+      latestBlocksRef.current = next;
       onChangeBlocks(next, true);
       setTimeout(() => {
         const input = checklistInputRefs.current[newItem.id];
-        if (input) input.focus();
+        if (input) {
+          input.focus();
+          saveSelection();
+          emitActiveFormats();
+        }
       }, 40);
-    }, [safeBlocks, onChangeBlocks, onActivateEditing]);
+    }, [onChangeBlocks, onActivateEditing, saveSelection, emitActiveFormats]);
 
     useImperativeHandle(
       ref,
@@ -426,7 +878,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
         },
         focusLastBlock: () => {
           onActivateEditing?.();
-          const lastText = [...safeBlocks].reverse().find((b) => b.kind === 'text');
+          const lastText = [...latestBlocksRef.current].reverse().find((b) => b.kind === 'text');
           if (!lastText) return;
           const el = textElsRef.current[lastText.id];
           if (!el) return;
@@ -441,27 +893,65 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
             savedRangeRef.current = r.cloneRange();
           }
           activeBlockIdRef.current = lastText.id;
+          activeTargetRef.current = { kind: 'text', blockId: lastText.id };
+          emitActiveFormats();
         },
         saveSelection,
         applyCommand: (command) => {
           onActivateEditing?.();
-          const el = restoreSelectionOrFocus();
-          if (!el) return;
+          const isListCommand =
+            command === 'insertUnorderedList' || command === 'insertOrderedList';
+
+          // Listas com marcadores / numeradas funcionam em bloco de texto mesmo quando o cursor estava em um checklist
+          if (isListCommand && activeTargetRef.current?.kind === 'checklist') {
+            const checkBlockId = activeTargetRef.current.blockId;
+            const currentBlocks = latestBlocksRef.current;
+            const checkIdx = currentBlocks.findIndex((b) => b.id === checkBlockId);
+            const nextBlock = checkIdx >= 0 ? currentBlocks[checkIdx + 1] : undefined;
+
+            if (!nextBlock || nextBlock.kind !== 'text') {
+              const newText = createTextBlock('');
+              const updatedBlocks: AnotacaoBlock[] = [
+                ...currentBlocks.slice(0, checkIdx + 1),
+                newText,
+                ...currentBlocks.slice(checkIdx + 1),
+              ];
+              latestBlocksRef.current = updatedBlocks;
+              onChangeBlocks(updatedBlocks, true);
+              setTimeout(() => {
+                const newEl = textElsRef.current[newText.id];
+                if (!newEl) return;
+                newEl.focus({ preventScroll: true });
+                activeBlockIdRef.current = newText.id;
+                activeTargetRef.current = { kind: 'text', blockId: newText.id };
+                try {
+                  document.execCommand('styleWithCSS', false, 'false');
+                } catch {}
+                document.execCommand(command, false);
+                saveSelection();
+                emitActiveFormats();
+                syncTargetDom(newEl, { kind: 'text', blockId: newText.id });
+              }, 30);
+              return;
+            }
+          }
+
+          const resolved = restoreSelectionOrFocus({ preferTextBlock: isListCommand });
+          if (!resolved) return;
+
           try {
             document.execCommand('styleWithCSS', false, 'false');
           } catch {}
           document.execCommand(command, false);
           saveSelection();
           emitActiveFormats();
-          const blockId = activeBlockIdRef.current;
-          if (blockId) {
-            syncBlockDomHtml(el, blockId);
-          }
+          syncTargetDom(resolved.el, resolved.target);
         },
         applyHighlight: (color) => {
           onActivateEditing?.();
-          const el = restoreSelectionOrFocus();
-          if (!el) return;
+          const resolved = restoreSelectionOrFocus();
+          if (!resolved) return;
+          const { el, target } = resolved;
           const sel = window.getSelection();
           if (!sel || sel.rangeCount === 0) return;
 
@@ -469,7 +959,6 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
 
           if (color === null) {
             if (range.collapsed) {
-              // Se estiver dentro de um <mark> ou <span style="background-color">, sai dele ou remove se vazio
               let node: Node | null = range.startContainer;
               let highlightEl: HTMLElement | null = null;
               while (node && node !== el) {
@@ -497,7 +986,6 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                 document.execCommand('styleWithCSS', false, 'true');
                 document.execCommand('hiliteColor', false, 'transparent');
               } catch {}
-              // Limpa também tags <mark> e backgrounds residuais que interceptam a seleção
               const nodes = Array.from(el.querySelectorAll('mark, span')) as HTMLElement[];
               for (const htmlNode of nodes) {
                 try {
@@ -517,15 +1005,10 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                   htmlNode.style.backgroundColor = '';
                   htmlNode.style.padding = '';
                   htmlNode.style.borderRadius = '';
-                  if (!htmlNode.getAttribute('style')?.trim() && htmlNode.attributes.length <= 1) {
-                    const parent = htmlNode.parentNode;
-                    if (parent) {
-                      while (htmlNode.firstChild) {
-                        parent.insertBefore(htmlNode.firstChild, htmlNode);
-                      }
-                      parent.removeChild(htmlNode);
-                    }
+                  if (!htmlNode.getAttribute('style')?.trim()) {
+                    htmlNode.removeAttribute('style');
                   }
+                  unwrapIfEmptyInlineWrapper(htmlNode);
                 }
               }
             }
@@ -543,41 +1026,122 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
             sel.removeAllRanges();
             sel.addRange(innerRange);
           } else {
-            const beforeHtml = el.innerHTML;
-            let applied = false;
-            try {
-              document.execCommand('styleWithCSS', false, 'true');
-              applied = document.execCommand('hiliteColor', false, color);
-              if (!applied) {
-                applied = document.execCommand('backColor', false, color);
+            // Limpa apenas <mark> / backgroundColor no trecho mantendo cor da fonte, tamanho, negrito, itálico e sublinhado
+            const frag = range.extractContents();
+            const nestedHighlights = Array.from(frag.querySelectorAll('mark, span')) as HTMLElement[];
+            for (const nh of nestedHighlights) {
+              if (nh.tagName === 'MARK') {
+                const parent = nh.parentNode;
+                if (parent) {
+                  while (nh.firstChild) parent.insertBefore(nh.firstChild, nh);
+                  parent.removeChild(nh);
+                }
+              } else if (nh.style?.backgroundColor) {
+                nh.style.backgroundColor = '';
+                nh.style.borderRadius = '';
+                nh.style.padding = '';
+                if (!nh.getAttribute('style')?.trim()) nh.removeAttribute('style');
+                unwrapIfEmptyInlineWrapper(nh);
               }
-            } catch {
-              applied = false;
             }
-            if (!applied || el.innerHTML === beforeHtml) {
-              try {
-                const activeRange = sel.getRangeAt(0);
-                const frag = activeRange.extractContents();
-                const mark = document.createElement('mark');
-                mark.style.backgroundColor = color;
-                mark.style.borderRadius = '3px';
-                mark.style.padding = '0 2px';
-                mark.appendChild(frag);
-                activeRange.insertNode(mark);
-                const newRange = document.createRange();
-                newRange.selectNodeContents(mark);
-                sel.removeAllRanges();
-                sel.addRange(newRange);
-              } catch {}
+            const hasBlock = Array.from(frag.childNodes).some(
+              (n) =>
+                n.nodeType === Node.ELEMENT_NODE &&
+                BLOCK_TAG_NAMES.has((n as HTMLElement).tagName.toUpperCase())
+            );
+            const createMark = () => {
+              const mark = document.createElement('mark');
+              mark.style.backgroundColor = color;
+              mark.style.borderRadius = '3px';
+              mark.style.padding = '0 2px';
+              return mark;
+            };
+            if (!hasBlock) {
+              const mark = createMark();
+              mark.appendChild(frag);
+              range.insertNode(mark);
+              const newRange = document.createRange();
+              newRange.selectNodeContents(mark);
+              sel.removeAllRanges();
+              sel.addRange(newRange);
+            } else {
+              const wrapInlineInMark = (container: Node) => {
+                const children = Array.from(container.childNodes);
+                for (const child of children) {
+                  if (
+                    child.nodeType === Node.ELEMENT_NODE &&
+                    BLOCK_TAG_NAMES.has((child as HTMLElement).tagName.toUpperCase())
+                  ) {
+                    wrapInlineInMark(child);
+                  } else if (child.nodeType === Node.TEXT_NODE && !(child.textContent || '')) {
+                    continue;
+                  } else {
+                    const mark = createMark();
+                    container.insertBefore(mark, child);
+                    mark.appendChild(child);
+                  }
+                }
+              };
+              wrapInlineInMark(frag);
+              const firstNode = frag.firstChild;
+              const lastNode = frag.lastChild;
+              range.insertNode(frag);
+              if (firstNode && lastNode) {
+                try {
+                  const newRange = document.createRange();
+                  newRange.setStartBefore(firstNode);
+                  newRange.setEndAfter(lastNode);
+                  sel.removeAllRanges();
+                  sel.addRange(newRange);
+                } catch {}
+              }
             }
           }
 
           saveSelection();
           emitActiveFormats();
-          const blockId = activeBlockIdRef.current;
-          if (blockId) {
-            syncBlockDomHtml(el, blockId);
-          }
+          syncTargetDom(el, target);
+        },
+        applyTextColor: (color) => {
+          onActivateEditing?.();
+          const resolved = restoreSelectionOrFocus();
+          if (!resolved) return;
+          const sel = window.getSelection();
+          if (!sel || sel.rangeCount === 0) return;
+
+          applyStyledSpanToRange(resolved.el, sel, 'color', color);
+          saveSelection();
+          emitActiveFormats();
+          syncTargetDom(resolved.el, resolved.target);
+        },
+        changeFontSize: (direction) => {
+          onActivateEditing?.();
+          const resolved = restoreSelectionOrFocus();
+          if (!resolved) return;
+          const sel = window.getSelection();
+          if (!sel || sel.rangeCount === 0) return;
+
+          const currentPx = getEffectiveFontSizeAtSelection(resolved.el, sel);
+          let nearestIdx = 0;
+          let bestDiff = Infinity;
+          FONT_SIZE_STEPS.forEach((step, idx) => {
+            const diff = Math.abs(step - currentPx);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              nearestIdx = idx;
+            }
+          });
+
+          const nextIdx =
+            direction === 'increase'
+              ? Math.min(FONT_SIZE_STEPS.length - 1, nearestIdx + 1)
+              : Math.max(0, nearestIdx - 1);
+          const nextPx = FONT_SIZE_STEPS[nextIdx];
+
+          applyStyledSpanToRange(resolved.el, sel, 'fontSize', `${nextPx}px`);
+          saveSelection();
+          emitActiveFormats();
+          syncTargetDom(resolved.el, resolved.target);
         },
         insertChecklist: handleInsertChecklist,
       }),
@@ -586,22 +1150,23 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
         restoreSelectionOrFocus,
         saveSelection,
         emitActiveFormats,
-        syncBlockDomHtml,
+        syncTargetDom,
         handleInsertChecklist,
-        safeBlocks,
+        onChangeBlocks,
       ]
     );
 
     const handleTextBlockInput = (blockId: string, html: string) => {
       onActivateEditing?.();
-      const next = safeBlocks.map((b) =>
+      const next = latestBlocksRef.current.map((b) =>
         b.id === blockId && b.kind === 'text' ? { ...b, html } : b
       );
+      latestBlocksRef.current = next;
       onChangeBlocks(next, false);
     };
 
     const handleToggleCheckItem = (blockId: string, itemId: string) => {
-      const next = safeBlocks.map((b) => {
+      const next = latestBlocksRef.current.map((b) => {
         if (b.id !== blockId || b.kind !== 'checklist') return b;
         return {
           ...b,
@@ -610,18 +1175,20 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
           ),
         };
       });
+      latestBlocksRef.current = next;
       onChangeBlocks(next, true);
     };
 
-    const handleChangeCheckItemText = (blockId: string, itemId: string, text: string) => {
+    const handleChangeCheckItem = (blockId: string, itemId: string, text: string, html: string) => {
       onActivateEditing?.();
-      const next = safeBlocks.map((b) => {
+      const next = latestBlocksRef.current.map((b) => {
         if (b.id !== blockId || b.kind !== 'checklist') return b;
         return {
           ...b,
-          items: b.items.map((it) => (it.id === itemId ? { ...it, text } : it)),
+          items: b.items.map((it) => (it.id === itemId ? { ...it, text, html } : it)),
         };
       });
+      latestBlocksRef.current = next;
       onChangeBlocks(next, false);
     };
 
@@ -630,11 +1197,13 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       const newItem: AnotacaoChecklistItem = {
         id: generateUid('chk'),
         text: '',
+        html: '',
         checked: false,
       };
       pendingFocusChecklistItemId.current = newItem.id;
+      checklistBlockMapRef.current[newItem.id] = blockId;
 
-      const next = safeBlocks.map((b) => {
+      const next = latestBlocksRef.current.map((b) => {
         if (b.id !== blockId || b.kind !== 'checklist') return b;
         if (!afterItemId) {
           return { ...b, items: [...b.items, newItem] };
@@ -647,16 +1216,25 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
         };
       });
 
+      activeBlockIdRef.current = blockId;
+      activeTargetRef.current = { kind: 'checklist', blockId, itemId: newItem.id };
+      latestBlocksRef.current = next;
       onChangeBlocks(next, true);
       setTimeout(() => {
-        checklistInputRefs.current[newItem.id]?.focus();
+        const input = checklistInputRefs.current[newItem.id];
+        if (input) {
+          input.focus();
+          saveSelection();
+          emitActiveFormats();
+        }
       }, 30);
     };
 
     const handleDeleteCheckItem = (blockId: string, itemId: string) => {
       onActivateEditing?.();
       let focusTargetId: string | null = null;
-      let next = safeBlocks
+      let focusBlockId: string = blockId;
+      let next = latestBlocksRef.current
         .map((b) => {
           if (b.id !== blockId || b.kind !== 'checklist') return b;
           const idx = b.items.findIndex((i) => i.id === itemId);
@@ -670,21 +1248,44 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
       if (next.length === 0) {
         next = [createTextBlock('')];
       }
+      if (activeTargetRef.current?.kind === 'checklist' && activeTargetRef.current.itemId === itemId) {
+        if (focusTargetId) {
+          activeTargetRef.current = {
+            kind: 'checklist',
+            blockId: focusBlockId,
+            itemId: focusTargetId,
+          };
+        } else {
+          const fallbackText = next.find((b) => b.kind === 'text');
+          activeTargetRef.current = fallbackText ? { kind: 'text', blockId: fallbackText.id } : null;
+          activeBlockIdRef.current = fallbackText?.id || null;
+        }
+      }
+
+      latestBlocksRef.current = next;
       onChangeBlocks(next, true);
 
       if (focusTargetId) {
         setTimeout(() => {
           checklistInputRefs.current[focusTargetId!]?.focus();
+          saveSelection();
+          emitActiveFormats();
         }, 25);
       }
     };
 
     const handleRemoveChecklistBlock = (blockId: string) => {
       onActivateEditing?.();
-      let next = safeBlocks.filter((b) => b.id !== blockId);
+      let next = latestBlocksRef.current.filter((b) => b.id !== blockId);
       if (next.length === 0) {
         next = [createTextBlock('')];
       }
+      if (activeTargetRef.current?.blockId === blockId) {
+        const fallbackText = next.find((b) => b.kind === 'text');
+        activeTargetRef.current = fallbackText ? { kind: 'text', blockId: fallbackText.id } : null;
+        activeBlockIdRef.current = fallbackText?.id || null;
+      }
+      latestBlocksRef.current = next;
       onChangeBlocks(next, true);
     };
 
@@ -740,6 +1341,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                 }}
                 onFocusBlock={(id) => {
                   activeBlockIdRef.current = id;
+                  activeTargetRef.current = { kind: 'text', blockId: id };
                   onActivateEditing?.();
                 }}
                 onBlurBlock={() => {
@@ -852,6 +1454,13 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
 
               {block.items.map((item) => {
                 const isDone = Boolean(item.checked);
+                const itemHtml =
+                  item.html !== undefined
+                    ? sanitizeNoteHtml(item.html)
+                    : item.text
+                    ? escapeHtml(item.text)
+                    : '&nbsp;';
+
                 return (
                   <div
                     key={item.id}
@@ -916,7 +1525,7 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                         <div
                           className="anotacao-checklist-editable"
                           style={{
-                            fontSize: '15px',
+                            fontSize: `${DEFAULT_FONT_SIZE}px`,
                             lineHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
                             minHeight: `${NOTEBOOK_LINE_HEIGHT}px`,
                             color: isDone ? '#64748B' : '#0F172A',
@@ -925,20 +1534,39 @@ export const AnotacaoRichEditor = forwardRef<AnotacaoRichEditorHandle, AnotacaoR
                             wordBreak: 'break-word',
                             overflowWrap: 'anywhere',
                           }}
-                        >
-                          {item.text || '\u00A0'}
-                        </div>
+                          dangerouslySetInnerHTML={{ __html: itemHtml }}
+                        />
                       ) : (
                         <ChecklistItemEditable
+                          noteId={noteId}
                           value={item.text}
+                          html={item.html}
                           checked={isDone}
                           strikeCompleted={strikeCompleted}
                           autoFocus={pendingFocusChecklistItemId.current === item.id}
-                          onFocus={() => onActivateEditing?.()}
-                          onChange={(val) => handleChangeCheckItemText(block.id, item.id, val)}
+                          onFocus={() => {
+                            activeBlockIdRef.current = block.id;
+                            activeTargetRef.current = {
+                              kind: 'checklist',
+                              blockId: block.id,
+                              itemId: item.id,
+                            };
+                            onActivateEditing?.();
+                          }}
+                          onBlur={() => {
+                            saveSelection();
+                          }}
+                          onSelectionChange={() => {
+                            saveSelection();
+                            emitActiveFormats();
+                          }}
+                          onChange={(text, nextHtml) =>
+                            handleChangeCheckItem(block.id, item.id, text, nextHtml)
+                          }
                           onKeyDown={(e) => handleChecklistKeyDown(e, block.id, item)}
                           inputRef={(el) => {
                             checklistInputRefs.current[item.id] = el;
+                            checklistBlockMapRef.current[item.id] = block.id;
                             if (el && pendingFocusChecklistItemId.current === item.id) {
                               pendingFocusChecklistItemId.current = null;
                             }

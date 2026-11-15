@@ -143,7 +143,11 @@ export interface SavedOrcamento {
     total: number;
     requestedMl?: number;
     barLengthMeters?: number;
+    autoTag?: string;
   }[];
+  limpaPisoAtivo?: boolean;
+  areaTerreaAtiva?: boolean;
+  areaTerreaSqm?: string;
   freteAtivo?: boolean;
   freteValor: number;
   freteEndereco: string;
