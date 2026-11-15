@@ -309,6 +309,136 @@ export function isRecordOfResponsible(
   });
 }
 
+const isGenericSellerPlaceholder = (val?: string | null): boolean => {
+  if (!val) return true;
+  const n = normalizeUserStr(val);
+  return (
+    !n ||
+    n === 'sistema' ||
+    n === 'sistema fenix' ||
+    n === 'usuario fenix' ||
+    n === 'consultora fenix' ||
+    n === 'crm fenix' ||
+    n === 'geral' ||
+    n === 'todos' ||
+    n === 'equipe' ||
+    n === 'sem responsavel'
+  );
+};
+
+/**
+ * Resolve o vendedor/responsável único e canônico de um orçamento ou card de Follow-up.
+ * Evita que registros editados ou repassados apareçam para dois vendedores ao mesmo tempo.
+ */
+export function resolveCanonicalProposalSeller(record: {
+  consultoraName?: string;
+  responsavel?: string;
+  vendedor?: string;
+  criadoPor?: string;
+  registeredBy?: string;
+  vendedorId?: string | null;
+  responsavelId?: string | null;
+}): { sellerName: string; sellerId: string | null } {
+  const orderedCandidates = [
+    record.consultoraName,
+    record.responsavel,
+    record.vendedor,
+    record.criadoPor,
+    record.registeredBy,
+  ];
+
+  for (const c of orderedCandidates) {
+    if (typeof c === 'string' && !isGenericSellerPlaceholder(c)) {
+      const cleanName = c.trim();
+      return {
+        sellerName: cleanName,
+        sellerId: SELLER_ID_BY_NAME[cleanName] || getSellerIdForUser(cleanName),
+      };
+    }
+  }
+
+  const rawId = (record.responsavelId || record.vendedorId || '').trim();
+  if (rawId) {
+    const mappedName = SELLER_NAME_BY_ID[rawId] || '';
+    if (mappedName) {
+      return { sellerName: mappedName, sellerId: rawId };
+    }
+    return { sellerName: '', sellerId: rawId };
+  }
+
+  return { sellerName: '', sellerId: null };
+}
+
+/**
+ * Verifica com rigor se uma Proposta Ativa (em Metas) pertence EXCLUSIVAMENTE ao vendedor alvo.
+ * - Nunca retorna true quando targetSellerName está vazio ou quando a proposta não tem dono válido.
+ * - Nunca duplica a mesma proposta entre criador e outro vendedor quando há apenas um responsável canônico.
+ */
+export function isBudgetProposalOfSeller(
+  record: {
+    consultoraName?: string;
+    responsavel?: string;
+    vendedor?: string;
+    criadoPor?: string;
+    registeredBy?: string;
+    vendedorId?: string | null;
+    responsavelId?: string | null;
+  },
+  targetSellerName?: string | null
+): boolean {
+  if (!record || !targetSellerName || !targetSellerName.trim()) return false;
+  const targetNorm = normalizeUserStr(targetSellerName);
+  if (!targetNorm || targetNorm === 'todos') return false;
+
+  const { sellerName, sellerId } = resolveCanonicalProposalSeller(record);
+  if (!sellerName && !sellerId) return false;
+
+  const sellerNorm = normalizeUserStr(sellerName);
+  const targetSellerId = getSellerIdForUser(targetSellerName);
+  const targetUserId = getUserIdByName(targetSellerName);
+
+  // 1. Vendedores conhecidos da equipe Fênix
+  if (targetNorm.includes('vanessa')) {
+    return sellerNorm.includes('vanessa') || sellerId === SELLER_IDS.VANESSA_GOMES;
+  }
+  if (
+    targetNorm.includes('jhessica') ||
+    targetNorm.includes('jessica') ||
+    targetNorm.includes('jhess') ||
+    targetNorm.includes('jess')
+  ) {
+    return (
+      sellerNorm.includes('jhessica') ||
+      sellerNorm.includes('jessica') ||
+      sellerNorm.includes('jhess') ||
+      sellerNorm.includes('jess') ||
+      sellerId === SELLER_IDS.JHESSICA_CAMARGO
+    );
+  }
+  if (targetNorm.includes('eder') || targetNorm.includes('diretor')) {
+    return (
+      sellerNorm.includes('eder') ||
+      sellerNorm.includes('diretor') ||
+      sellerId === SELLER_IDS.EDER_PEREZ
+    );
+  }
+  if (targetNorm.includes('jeferson') || targetNorm.includes('trolesi')) {
+    return (
+      sellerNorm.includes('jeferson') ||
+      sellerNorm.includes('trolesi') ||
+      sellerId === SELLER_IDS.JEFERSON_TROLESI
+    );
+  }
+
+  // 2. Demais vendedores ativos cadastrados (comparação exata, prefixo de palavra inteira ou ID oficial)
+  if (sellerId && ((targetSellerId && sellerId === targetSellerId) || (targetUserId && sellerId === targetUserId))) {
+    return true;
+  }
+  if (!sellerNorm) return false;
+  if (sellerNorm === targetNorm) return true;
+  return sellerNorm.startsWith(`${targetNorm} `) || targetNorm.startsWith(`${sellerNorm} `);
+}
+
 /**
  * Utilitário central de comparação e equivalência de usuários do CRM Fênix.
  * Trata variações de escrita, acentuação e apelidos/nomes curtos:

@@ -30,9 +30,11 @@ const DEFAULT_MODULES = [
   'Calculadora',
   'Orçamentos',
   'Follow-up',
+  'Promoções Ativas',
   'Metas',
   'Produtos',
   'Tarefas',
+  'Anotações',
   'Configurações',
 ];
 

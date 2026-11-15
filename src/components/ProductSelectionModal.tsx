@@ -21,7 +21,20 @@ import { PriceTableTier } from '../types';
 import {
   isRodapeProduct,
   convertMetrosToBarras,
+  extractBarLengthFromProductName,
+  formatRodapeDetailText,
+  parseBarCountFromInput,
 } from '../utils/rodapeCalculator';
+import {
+  convertBoxesToPisoSqm,
+  convertSqmToPisoBoxes,
+  extractPisoBoxYield,
+  formatBoxesDetail,
+  isPisoVinilicoProduct,
+  isSquareMeterUnit,
+  parseBoxesFromDetail,
+  parsePtBrNumeric,
+} from '../utils/pisoInsumosCalculator';
 
 interface ProductSelectionModalProps {
   isOpen: boolean;
@@ -35,6 +48,10 @@ interface ProductSelectionModalProps {
     price: number;
     quantity: string;
     subtitulo?: string;
+    requestedSqm?: number;
+    effectiveSqm?: number;
+    boxes?: number;
+    requestedRodapeMl?: number;
   }) => void;
   onOpenCadastrarNovoProduto?: (initialName?: string) => void;
 }
@@ -54,8 +71,31 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
   const [subtituloInput, setSubtituloInput] = useState<string>('');
   const [priceInput, setPriceInput] = useState<string>('');
 
-  const rodapeModalConvertedRef = useRef(false);
+  const rodapeModalRequestedMlRef = useRef<number | null>(null);
+  const rodapeModalLastBarrasRef = useRef<number | null>(null);
   const rodapeModalDebounceRef = useRef<any>(null);
+
+  const pisoModalRequestedSqmRef = useRef<number | null>(null);
+  const pisoModalLastRealSqmRef = useRef<number | null>(null);
+  const pisoModalDebounceRef = useRef<any>(null);
+
+  const resetRodapeModalRefs = () => {
+    if (rodapeModalDebounceRef.current) {
+      clearTimeout(rodapeModalDebounceRef.current);
+      rodapeModalDebounceRef.current = null;
+    }
+    rodapeModalRequestedMlRef.current = null;
+    rodapeModalLastBarrasRef.current = null;
+  };
+
+  const resetPisoModalRefs = () => {
+    if (pisoModalDebounceRef.current) {
+      clearTimeout(pisoModalDebounceRef.current);
+      pisoModalDebounceRef.current = null;
+    }
+    pisoModalRequestedSqmRef.current = null;
+    pisoModalLastRealSqmRef.current = null;
+  };
 
   const products = useMemo(() => getDynamicProductCatalog(), [isOpen]);
   const categories = useMemo(() => getOfficialCategories(), [isOpen]);
@@ -79,9 +119,102 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
 
   if (!isOpen) return null;
 
+  const applyPisoModalFromQuantity = (
+    prod: CatalogProduct,
+    rawQty: string,
+    updateQtyField: boolean
+  ) => {
+    const isPiso =
+      isPisoVinilicoProduct(prod.name, prod.category, prod.categoryId) &&
+      isSquareMeterUnit(prod.unit);
+    if (!isPiso) return null;
+    const boxYield = extractPisoBoxYield(prod.name);
+    if (!boxYield) return null;
+
+    const parsedNum = parsePtBrNumeric(rawQty);
+    if (parsedNum <= 0) return null;
+
+    const isAlreadyEffective =
+      pisoModalLastRealSqmRef.current !== null &&
+      Math.abs(parsedNum - pisoModalLastRealSqmRef.current) <= 0.009;
+
+    const requestedSqm = isAlreadyEffective
+      ? (pisoModalRequestedSqmRef.current ?? parsedNum)
+      : parsedNum;
+
+    pisoModalRequestedSqmRef.current = requestedSqm;
+
+    const conv = convertSqmToPisoBoxes(requestedSqm, boxYield, subtituloInput);
+    setSubtituloInput(conv.detailText);
+    if (updateQtyField) {
+      setQuantityInput(conv.realSqmDisplay);
+      pisoModalLastRealSqmRef.current = conv.realSqm;
+    }
+    return conv;
+  };
+
+  const applyRodapeModalConversion = (
+    prod: CatalogProduct,
+    rawVal: string,
+    updateQtyField: boolean
+  ) => {
+    if (!isRodapeProduct(prod.name, prod.category, prod.categoryId)) return null;
+    const barLen = extractBarLengthFromProductName(prod.name, 2.4);
+    const explicitBars = parseBarCountFromInput(rawVal);
+
+    if (explicitBars && explicitBars > 0) {
+      const effMl = Math.round(explicitBars * barLen * 100) / 100;
+      rodapeModalRequestedMlRef.current = effMl;
+      rodapeModalLastBarrasRef.current = explicitBars;
+      const detailText = formatRodapeDetailText({
+        requestedMl: effMl,
+        barCount: explicitBars,
+        barLengthMeters: barLen,
+        existingDetail: subtituloInput,
+      });
+      setSubtituloInput(detailText);
+      if (updateQtyField) setQuantityInput(String(explicitBars));
+      return { barras: explicitBars, metros: effMl, barLen, detailText };
+    }
+
+    const parsedNum = parsePtBrNumeric(rawVal);
+    if (parsedNum <= 0) return null;
+
+    const isAlreadyBarras =
+      rodapeModalLastBarrasRef.current !== null &&
+      Math.abs(parsedNum - rodapeModalLastBarrasRef.current) <= 0.005;
+
+    const requestedMl = isAlreadyBarras
+      ? (rodapeModalRequestedMlRef.current ?? Math.round(parsedNum * barLen * 100) / 100)
+      : parsedNum;
+
+    const conv = convertMetrosToBarras(requestedMl, prod.name, barLen);
+    if (!conv || conv.barras <= 0) return null;
+
+    rodapeModalRequestedMlRef.current = requestedMl;
+    rodapeModalLastBarrasRef.current = conv.barras;
+
+    const detailText = formatRodapeDetailText({
+      requestedMl,
+      barCount: conv.barras,
+      barLengthMeters: barLen,
+      existingDetail: subtituloInput,
+    });
+    setSubtituloInput(detailText);
+    if (updateQtyField) {
+      setQuantityInput(String(conv.barras));
+    }
+    return { ...conv, detailText };
+  };
+
   const handleChooseProduct = (prod: CatalogProduct) => {
     if (rodapeModalDebounceRef.current) {
       clearTimeout(rodapeModalDebounceRef.current);
+      rodapeModalDebounceRef.current = null;
+    }
+    if (pisoModalDebounceRef.current) {
+      clearTimeout(pisoModalDebounceRef.current);
+      pisoModalDebounceRef.current = null;
     }
     const tierPrice = getProductTierPrice(prod, priceTable);
     const parsedPrice = priceInput
@@ -90,18 +223,48 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
 
     const isRodape = isRodapeProduct(prod.name, prod.category, prod.categoryId);
     let cleanQty = quantityInput.trim() || '1';
+    let requestedRodapeMl: number | undefined;
+    let finalSubtitulo = subtituloInput.trim() || undefined;
 
-    if (isRodape && !rodapeModalConvertedRef.current) {
-      const conv = convertMetrosToBarras(cleanQty, prod.name);
-      if (conv && conv.barras > 0) {
-        cleanQty = String(conv.barras);
-        rodapeModalConvertedRef.current = true;
+    if (isRodape) {
+      const rodConv = applyRodapeModalConversion(prod, cleanQty, true);
+      if (rodConv && rodConv.barras > 0) {
+        cleanQty = String(rodConv.barras);
+        requestedRodapeMl = rodConv.metros;
+        finalSubtitulo = rodConv.detailText.trim() || finalSubtitulo;
       }
     }
 
     const finalUnit = isRodape ? 'barras' : prod.unit;
-    // Detalhe: preenchimento manual pelo vendedor (não preenchido automaticamente)
-    const finalSubtitulo = subtituloInput.trim() || undefined;
+    let requestedSqm: number | undefined;
+    let effectiveSqm: number | undefined;
+    let boxes: number | undefined;
+
+    const isPiso =
+      isPisoVinilicoProduct(prod.name, prod.category, prod.categoryId) &&
+      isSquareMeterUnit(finalUnit);
+    const boxYield = isPiso ? extractPisoBoxYield(prod.name) : null;
+
+    if (isPiso && boxYield) {
+      const pisoConv = applyPisoModalFromQuantity(prod, cleanQty, true);
+      if (pisoConv) {
+        cleanQty = pisoConv.realSqmDisplay;
+        finalSubtitulo = pisoConv.detailText.trim() || undefined;
+        requestedSqm = pisoConv.requestedSqm;
+        effectiveSqm = pisoConv.realSqm;
+        boxes = pisoConv.boxes;
+      } else {
+        const boxesFromSub = parseBoxesFromDetail(subtituloInput);
+        if (boxesFromSub && boxesFromSub > 0) {
+          const boxConv = convertBoxesToPisoSqm(boxesFromSub, boxYield);
+          cleanQty = boxConv.realSqmDisplay;
+          finalSubtitulo = formatBoxesDetail(boxesFromSub, subtituloInput).trim() || undefined;
+          requestedSqm = boxConv.realSqm;
+          effectiveSqm = boxConv.realSqm;
+          boxes = boxConv.boxes;
+        }
+      }
+    }
 
     onSelectProduct({
       name: prod.name,
@@ -110,6 +273,10 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
       price: parsedPrice,
       quantity: cleanQty,
       subtitulo: finalSubtitulo,
+      requestedSqm,
+      effectiveSqm,
+      boxes,
+      requestedRodapeMl,
     });
 
     // Reset temporary state & close
@@ -117,7 +284,8 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
     setQuantityInput('1');
     setSubtituloInput('');
     setPriceInput('');
-    rodapeModalConvertedRef.current = false;
+    resetRodapeModalRefs();
+    resetPisoModalRefs();
     onClose();
   };
 
@@ -353,6 +521,8 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                       <button
                         type="button"
                         onClick={() => {
+                          resetPisoModalRefs();
+                          resetRodapeModalRefs();
                           if (isSelected) {
                             setSelectedProductId(null);
                           } else {
@@ -360,7 +530,6 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                             const safeNum = Number(currentPrice) || 0;
                             setPriceInput(safeNum.toFixed(2).replace('.', ','));
                             setQuantityInput('1');
-                            rodapeModalConvertedRef.current = false;
                             setSubtituloInput(prod.defaultSubtitle || '');
                           }
                         }}
@@ -401,44 +570,102 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                               setQuantityInput(val);
                               const isRod = isRodapeProduct(prod.name, prod.category, prod.categoryId);
                               if (isRod) {
-                                rodapeModalConvertedRef.current = false;
                                 if (rodapeModalDebounceRef.current) {
                                   clearTimeout(rodapeModalDebounceRef.current);
+                                  rodapeModalDebounceRef.current = null;
+                                }
+                                const parsedNum = parsePtBrNumeric(val);
+                                if (parsedNum <= 0) {
+                                  rodapeModalRequestedMlRef.current = null;
+                                  rodapeModalLastBarrasRef.current = null;
+                                  return;
+                                }
+                                if (
+                                  rodapeModalLastBarrasRef.current !== null &&
+                                  Math.abs(parsedNum - rodapeModalLastBarrasRef.current) <= 0.005
+                                ) {
+                                  return;
+                                }
+                                rodapeModalRequestedMlRef.current = parsedNum;
+                                rodapeModalLastBarrasRef.current = null;
+                                const barLen = extractBarLengthFromProductName(prod.name, 2.4);
+                                const conv = convertMetrosToBarras(parsedNum, prod.name, barLen);
+                                if (conv && conv.barras > 0) {
+                                  setSubtituloInput(
+                                    formatRodapeDetailText({
+                                      requestedMl: parsedNum,
+                                      barCount: conv.barras,
+                                      barLengthMeters: barLen,
+                                      existingDetail: subtituloInput,
+                                    })
+                                  );
                                 }
                                 rodapeModalDebounceRef.current = setTimeout(() => {
-                                  const res = convertMetrosToBarras(val, prod.name);
-                                  if (res && res.barras > 0) {
-                                    setQuantityInput(String(res.barras));
-                                    rodapeModalConvertedRef.current = true;
+                                  applyRodapeModalConversion(prod, val, true);
+                                  rodapeModalDebounceRef.current = null;
+                                }, 650);
+                              } else {
+                                if (pisoModalDebounceRef.current) {
+                                  clearTimeout(pisoModalDebounceRef.current);
+                                  pisoModalDebounceRef.current = null;
+                                }
+                                const isPiso =
+                                  isPisoVinilicoProduct(prod.name, prod.category, prod.categoryId) &&
+                                  isSquareMeterUnit(prod.unit);
+                                const boxYield = isPiso ? extractPisoBoxYield(prod.name) : null;
+                                if (isPiso && boxYield) {
+                                  const parsedNum = parsePtBrNumeric(val);
+                                  if (parsedNum <= 0) {
+                                    pisoModalRequestedSqmRef.current = null;
+                                    pisoModalLastRealSqmRef.current = null;
+                                  } else if (
+                                    pisoModalLastRealSqmRef.current === null ||
+                                    Math.abs(parsedNum - pisoModalLastRealSqmRef.current) > 0.009
+                                  ) {
+                                    pisoModalRequestedSqmRef.current = parsedNum;
+                                    pisoModalLastRealSqmRef.current = null;
+                                    const conv = convertSqmToPisoBoxes(parsedNum, boxYield, subtituloInput);
+                                    setSubtituloInput(conv.detailText);
+                                    pisoModalDebounceRef.current = setTimeout(() => {
+                                      setQuantityInput(conv.realSqmDisplay);
+                                      pisoModalLastRealSqmRef.current = conv.realSqm;
+                                      pisoModalDebounceRef.current = null;
+                                    }, 550);
                                   }
-                                }, 700);
+                                }
                               }
                             }}
                             onBlur={() => {
                               const isRod = isRodapeProduct(prod.name, prod.category, prod.categoryId);
-                              if (isRod && !rodapeModalConvertedRef.current) {
+                              if (isRod) {
                                 if (rodapeModalDebounceRef.current) {
                                   clearTimeout(rodapeModalDebounceRef.current);
+                                  rodapeModalDebounceRef.current = null;
                                 }
-                                const res = convertMetrosToBarras(quantityInput, prod.name);
-                                if (res && res.barras > 0) {
-                                  setQuantityInput(String(res.barras));
-                                  rodapeModalConvertedRef.current = true;
+                                applyRodapeModalConversion(prod, quantityInput, true);
+                              } else {
+                                if (pisoModalDebounceRef.current) {
+                                  clearTimeout(pisoModalDebounceRef.current);
+                                  pisoModalDebounceRef.current = null;
                                 }
+                                applyPisoModalFromQuantity(prod, quantityInput, true);
                               }
                             }}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
                                 const isRod = isRodapeProduct(prod.name, prod.category, prod.categoryId);
-                                if (isRod && !rodapeModalConvertedRef.current) {
+                                if (isRod) {
                                   if (rodapeModalDebounceRef.current) {
                                     clearTimeout(rodapeModalDebounceRef.current);
+                                    rodapeModalDebounceRef.current = null;
                                   }
-                                  const res = convertMetrosToBarras(quantityInput, prod.name);
-                                  if (res && res.barras > 0) {
-                                    setQuantityInput(String(res.barras));
-                                    rodapeModalConvertedRef.current = true;
+                                  applyRodapeModalConversion(prod, quantityInput, true);
+                                } else {
+                                  if (pisoModalDebounceRef.current) {
+                                    clearTimeout(pisoModalDebounceRef.current);
+                                    pisoModalDebounceRef.current = null;
                                   }
+                                  applyPisoModalFromQuantity(prod, quantityInput, true);
                                 }
                               }
                             }}
@@ -455,7 +682,45 @@ export const ProductSelectionModal: React.FC<ProductSelectionModalProps> = ({
                           <input
                             type="text"
                             value={subtituloInput}
-                            onChange={(e) => setSubtituloInput(e.target.value)}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setSubtituloInput(val);
+                              const isPiso =
+                                isPisoVinilicoProduct(prod.name, prod.category, prod.categoryId) &&
+                                isSquareMeterUnit(prod.unit);
+                              const boxYield = isPiso ? extractPisoBoxYield(prod.name) : null;
+                              if (isPiso && boxYield) {
+                                if (pisoModalDebounceRef.current) {
+                                  clearTimeout(pisoModalDebounceRef.current);
+                                  pisoModalDebounceRef.current = null;
+                                }
+                                const boxes = parseBoxesFromDetail(val);
+                                if (boxes !== null && boxes > 0) {
+                                  const conv = convertBoxesToPisoSqm(boxes, boxYield);
+                                  setQuantityInput(conv.realSqmDisplay);
+                                  pisoModalLastRealSqmRef.current = conv.realSqm;
+                                  pisoModalRequestedSqmRef.current = conv.realSqm;
+                                }
+                              }
+                            }}
+                            onBlur={() => {
+                              const isPiso =
+                                isPisoVinilicoProduct(prod.name, prod.category, prod.categoryId) &&
+                                isSquareMeterUnit(prod.unit);
+                              const boxYield = isPiso ? extractPisoBoxYield(prod.name) : null;
+                              if (isPiso && boxYield) {
+                                const boxes = parseBoxesFromDetail(subtituloInput);
+                                if (boxes !== null && boxes > 0) {
+                                  const conv = convertBoxesToPisoSqm(boxes, boxYield);
+                                  setQuantityInput(conv.realSqmDisplay);
+                                  pisoModalLastRealSqmRef.current = conv.realSqm;
+                                  pisoModalRequestedSqmRef.current = conv.realSqm;
+                                  if (/^\d+$/.test(subtituloInput.trim())) {
+                                    setSubtituloInput(formatBoxesDetail(boxes));
+                                  }
+                                }
+                              }
+                            }}
                             placeholder="Ex: cor, quantidade de caixas..."
                             className="w-full h-10 rounded-xl border border-slate-300 px-3 text-xs sm:text-sm text-slate-800 outline-none focus:border-[#0057ff]"
                           />

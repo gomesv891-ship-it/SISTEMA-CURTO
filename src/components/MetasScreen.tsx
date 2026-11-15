@@ -10,7 +10,6 @@ import {
   Plus,
   CheckCircle2,
   ExternalLink,
-  Sparkles,
   PhoneCall,
   User,
   Store,
@@ -32,9 +31,6 @@ import {
   History,
   Filter,
   ChevronDown,
-  Package,
-  Layers,
-  Tag,
 } from 'lucide-react';
 import { ClientRecord, PriceTableTier, FormaPagamentoItem } from '../types';
 import {
@@ -44,14 +40,6 @@ import {
   isFormaCartaoCredito,
 } from './common/PaymentSplitManager';
 import { sendUserNotification } from '../utils/notifications';
-import {
-  getDynamicProductCatalog,
-  getOfficialCategories,
-  getProductTierPrice,
-  getOfficialPriceTableLabel,
-  CatalogProduct,
-} from '../data/productCatalog';
-import { ProductSelectionModal } from './ProductSelectionModal';
 import { onMetaSaleDeleted } from '../utils/followUpSalesSync';
 import {
   syncSingleMetaSaleToVendas,
@@ -73,11 +61,11 @@ import {
   normalizeUserMetaKey,
 } from '../utils/configOrcamentoEMetas';
 import { addOrUpdateSaleInPosVendas } from '../utils/syncPosVendas';
-import { isRecordOfResponsible } from '../utils/userDataFilter';
-import { getSupabaseClient, saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase } from '../utils/supabaseClient';
+import { isRecordOfResponsible, isBudgetProposalOfSeller, resolveCanonicalProposalSeller, getSellerIdForUser } from '../utils/userDataFilter';
+import { getSupabaseClient, saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase, pullDataFromSupabase } from '../utils/supabaseClient';
 import { ResponsibleFilterTabs } from './ResponsibleFilterTabs';
 import { MetasMarketplaceJeferson } from './metas/MetasMarketplaceJeferson';
-import { isMarketplaceUser, isUserRevoked } from '../utils/auth';
+import { isMarketplaceUser } from '../utils/auth';
 
 export type ClientType =
   | 'Cliente Final'
@@ -115,7 +103,9 @@ export interface VendaItem {
   responsavelId?: string | null;
   orcamentoId?: string;
   followUpId?: string;
+  clienteId?: string;
   origem?: string;
+  updatedAt?: string;
   desconto?: number;
   frete?: number;
   formaPagamento?: 'Pix' | 'Boleto' | 'Cartão' | string;
@@ -386,12 +376,74 @@ export const isSaleToday = (dateStr?: string, refDate: Date = new Date()): boole
   return false;
 };
 
+export const isProposalInTargetMonth = (
+  dateStr?: string,
+  targetMonth: number = new Date().getMonth(),
+  targetYear: number = new Date().getFullYear()
+): boolean => {
+  if (!dateStr) return false;
+  const raw = String(dateStr).trim();
+  if (!raw) return false;
+
+  // Timestamp numérico (ex: epoch ms)
+  if (/^\d{10,13}$/.test(raw)) {
+    const num = raw.length === 10 ? Number(raw) * 1000 : Number(raw);
+    const d = new Date(num);
+    if (!isNaN(d.getTime())) {
+      return d.getMonth() === targetMonth && d.getFullYear() === targetYear;
+    }
+  }
+
+  // ISO completo com T (usa horário local para evitar deslocamento de virada de mês)
+  if (/^\d{4}-\d{2}-\d{2}T/.test(raw)) {
+    const d = new Date(raw);
+    if (!isNaN(d.getTime())) {
+      return d.getMonth() === targetMonth && d.getFullYear() === targetYear;
+    }
+  }
+
+  const dateOnly = raw.split('T')[0].split(' ')[0];
+
+  if (dateOnly.includes('-')) {
+    const parts = dateOnly.split('-');
+    if (parts.length >= 3) {
+      if (parts[0].length === 4) {
+        const y = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10) - 1;
+        if (!isNaN(y) && !isNaN(m)) return y === targetYear && m === targetMonth;
+      } else if (parts[2].length === 4) {
+        const m = parseInt(parts[1], 10) - 1;
+        const y = parseInt(parts[2], 10);
+        if (!isNaN(y) && !isNaN(m)) return y === targetYear && m === targetMonth;
+      }
+    }
+  }
+
+  if (dateOnly.includes('/')) {
+    const parts = dateOnly.split('/');
+    if (parts.length >= 3) {
+      if (parts[2].length === 4) {
+        const m = parseInt(parts[1], 10) - 1;
+        const y = parseInt(parts[2], 10);
+        if (!isNaN(y) && !isNaN(m)) return y === targetYear && m === targetMonth;
+      } else if (parts[0].length === 4) {
+        const y = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10) - 1;
+        if (!isNaN(y) && !isNaN(m)) return y === targetYear && m === targetMonth;
+      }
+    }
+  }
+
+  return false;
+};
+
 export interface PipelineBudgetItem {
   id: string;
   orcamentoId?: string;
   cliente: string;
   valor: number;
   status: string;
+  data?: string;
   responsavel?: string;
   vendedor?: string;
   criadoPor?: string;
@@ -423,71 +475,258 @@ export const isPipelineBudgetOpen = (status?: string): boolean => {
 export function loadAllPipelineBudgets(): PipelineBudgetItem[] {
   if (typeof window === 'undefined') return [];
   const items: PipelineBudgetItem[] = [];
-  const seenIds = new Set<string>();
+  const seenBareIds = new Set<string>();
+  const seenRawIds = new Set<string>();
 
-  // 1. Esteira de Follow-up (fonte primária dos cards e propostas ativas)
+  const normalizeBareOrcId = (raw?: string | null): string => {
+    if (!raw) return '';
+    return String(raw).trim().replace(/^fup_/, '').replace(/^orc_/, '');
+  };
+
+  // 0a. Carrega base de orçamentos (histórico + salvos) para enriquecimento 1:1 e propostas complementares
+  const orcByBareId = new Map<string, any>();
+  ['fenix_orcamentos_history', 'fenix_saved_orcamentos'].forEach((storageKey) => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      parsed.forEach((orc: any) => {
+        if (!orc || !orc.id) return;
+        const bare = normalizeBareOrcId(orc.id);
+        if (!bare) return;
+        const existing = orcByBareId.get(bare);
+        if (!existing) {
+          orcByBareId.set(bare, orc);
+        } else {
+          const existingTs = new Date(existing.updatedAt || existing.savedAt || 0).getTime() || 0;
+          const incomingTs = new Date(orc.updatedAt || orc.savedAt || 0).getTime() || 0;
+          if (incomingTs >= existingTs) {
+            orcByBareId.set(bare, { ...existing, ...orc });
+          }
+        }
+      });
+    } catch {}
+  });
+
+  // 0b. Vendas já confirmadas e ativas em Metas não devem constar como propostas em aberto
+  const deletedSet = new Set<string>();
   try {
-    const rawFup = localStorage.getItem('fenix_followup_cards_v2') || localStorage.getItem('fenix_followup_db');
-    if (rawFup) {
-      const parsed = JSON.parse(rawFup);
-      if (Array.isArray(parsed)) {
-        parsed.forEach((it: any) => {
-          if (!it || !it.id) return;
-          const clientName = (it.cliente || it.clientName || '').toLowerCase().trim();
-          if (clientName.includes('roberto silveira')) return;
+    const rawDel = localStorage.getItem('fenix_deleted_vendas_ids');
+    if (rawDel) {
+      const parsedDel = JSON.parse(rawDel);
+      if (Array.isArray(parsedDel)) {
+        parsedDel.forEach((d: any) => deletedSet.add(String(d).trim()));
+      }
+    }
+  } catch {}
 
-          seenIds.add(String(it.id));
-          if (it.orcamentoId) seenIds.add(String(it.orcamentoId));
-
-          items.push({
-            id: String(it.id),
-            orcamentoId: it.orcamentoId ? String(it.orcamentoId) : undefined,
-            cliente: it.cliente || it.clientName || 'Cliente',
-            valor: Number(it.valor) || 0,
-            status: it.status || 'Orçamento Enviado',
-            responsavel: it.responsavel || it.vendedor || it.criadoPor || it.registeredBy,
-            vendedor: it.vendedor || it.responsavel,
-            criadoPor: it.criadoPor || it.registeredBy,
-            registeredBy: it.registeredBy || it.criadoPor,
-            consultoraName: it.consultoraName || it.vendedor || it.responsavel,
-            vendedorId: it.vendedorId || null,
-            responsavelId: it.responsavelId || null,
-          });
+  const soldBareIds = new Set<string>();
+  const soldFupIds = new Set<string>();
+  try {
+    const rawMetas = localStorage.getItem('fenix_metas_sales_db');
+    if (rawMetas) {
+      const parsedMetas = JSON.parse(rawMetas);
+      if (Array.isArray(parsedMetas)) {
+        parsedMetas.forEach((s: any) => {
+          if (!s || isMockSale(s)) return;
+          const sId = String(s.id || '').trim();
+          const sFupId = s.followUpId ? String(s.followUpId).trim() : '';
+          const sOrcId = s.orcamentoId ? String(s.orcamentoId).trim() : '';
+          const sBare = normalizeBareOrcId(sOrcId || (sFupId.startsWith('fup_') ? sFupId : ''));
+          if (
+            (sId && deletedSet.has(sId)) ||
+            (sFupId && deletedSet.has(sFupId)) ||
+            (sOrcId && deletedSet.has(sOrcId)) ||
+            (sBare && (deletedSet.has(sBare) || deletedSet.has(`v_orc_${sBare}`)))
+          ) {
+            return;
+          }
+          if (sBare) soldBareIds.add(sBare);
+          if (sFupId) soldFupIds.add(sFupId);
         });
       }
     }
   } catch {}
 
-  // 2. Histórico de Orçamentos (captura propostas complementares emitidas)
+  // 1. Esteira de Follow-up (fonte primária dos cards e propostas ativas)
   try {
-    const rawOrcs = localStorage.getItem('fenix_orcamentos_history') || localStorage.getItem('fenix_saved_orcamentos');
-    if (rawOrcs) {
-      const parsed = JSON.parse(rawOrcs);
-      if (Array.isArray(parsed)) {
-        parsed.forEach((orc: any) => {
-          if (!orc || !orc.id) return;
-          const orcId = String(orc.id);
-          const fupId = `fup_${orcId}`;
-          if (seenIds.has(orcId) || seenIds.has(fupId)) return;
-
-          seenIds.add(orcId);
-          items.push({
-            id: orcId,
-            orcamentoId: orcId,
-            cliente: orc.clientName || orc.clienteNome || orc.cliente || 'Cliente',
-            valor: Number(orc.totalFinal) || Number(orc.totalGeral) || Number(orc.valor) || 0,
-            status: orc.status || 'Orçamento Enviado',
-            responsavel: orc.responsavel || orc.consultoraName || orc.vendedor || orc.registeredBy || orc.criadoPor,
-            vendedor: orc.vendedor || orc.consultoraName || orc.responsavel,
-            criadoPor: orc.criadoPor || orc.registeredBy,
-            registeredBy: orc.registeredBy || orc.criadoPor,
-            consultoraName: orc.consultoraName || orc.vendedor,
-            vendedorId: orc.vendedorId || null,
-            responsavelId: orc.responsavelId || null,
-          });
-        });
+    let parsedFup: any[] = [];
+    const rawFupV2 = localStorage.getItem('fenix_followup_cards_v2');
+    if (rawFupV2) {
+      const p = JSON.parse(rawFupV2);
+      if (Array.isArray(p)) parsedFup = p;
+    }
+    if (parsedFup.length === 0) {
+      const rawFupLegacy = localStorage.getItem('fenix_followup_db');
+      if (rawFupLegacy) {
+        const p = JSON.parse(rawFupLegacy);
+        if (Array.isArray(p)) parsedFup = p;
       }
     }
+
+    parsedFup.forEach((it: any) => {
+      if (!it || !it.id) return;
+      const rawId = String(it.id).trim();
+      const clientName = (it.cliente || it.clientName || '').toLowerCase().trim();
+      if (clientName.includes('roberto silveira') || isMockSale({ cliente: it.cliente || it.clientName, id: rawId })) return;
+
+      const bareOrc = normalizeBareOrcId(it.orcamentoId || (rawId.startsWith('fup_') ? rawId : ''));
+      if ((bareOrc && seenBareIds.has(bareOrc)) || seenRawIds.has(rawId)) return;
+
+      seenRawIds.add(rawId);
+      if (it.orcamentoId) seenRawIds.add(String(it.orcamentoId).trim());
+      if (bareOrc) seenBareIds.add(bareOrc);
+
+      const linkedOrc = bareOrc ? orcByBareId.get(bareOrc) : undefined;
+      const isAlreadySold =
+        soldFupIds.has(rawId) ||
+        (bareOrc ? soldBareIds.has(bareOrc) : false) ||
+        (linkedOrc?.status && !isPipelineBudgetOpen(linkedOrc.status) && ['vendido', 'fechado', 'fechados', 'aprovado', 'ganho'].includes(String(linkedOrc.status).trim().toLowerCase()));
+
+      const effectiveStatus = isAlreadySold
+        ? 'Vendido'
+        : it.status || linkedOrc?.status || 'Orçamento Enviado';
+
+      const { sellerName, sellerId } = resolveCanonicalProposalSeller({
+        consultoraName: it.consultoraName || linkedOrc?.consultoraName,
+        responsavel: it.responsavel || linkedOrc?.responsavel,
+        vendedor: it.vendedor || linkedOrc?.vendedor,
+        criadoPor: it.criadoPor || linkedOrc?.criadoPor,
+        registeredBy: it.registeredBy || linkedOrc?.registeredBy,
+        vendedorId: it.vendedorId || linkedOrc?.vendedorId || null,
+        responsavelId: it.responsavelId || linkedOrc?.responsavelId || null,
+      });
+
+      const resolvedValue =
+        parseBRLCurrency(it.valor) ||
+        parseBRLCurrency(linkedOrc?.totalFinal) ||
+        parseBRLCurrency(linkedOrc?.totalGeral) ||
+        parseBRLCurrency(linkedOrc?.valor) ||
+        0;
+
+      const extractFallbackTimestampDate = (idStr?: string): string => {
+        if (!idStr) return '';
+        const match = String(idStr).match(/(\d{13})/);
+        if (match) {
+          const ms = Number(match[1]);
+          if (!isNaN(ms) && ms > 1500000000000) {
+            return new Date(ms).toISOString();
+          }
+        }
+        return '';
+      };
+
+      const proposalDate =
+        it.dataCriacao ||
+        it.dataOrcamento ||
+        linkedOrc?.dataOrcamento ||
+        it.dataEntradaFollowUp ||
+        it.createdAt ||
+        linkedOrc?.savedAt ||
+        linkedOrc?.createdAt ||
+        it.dataCadastro ||
+        it.data ||
+        it.dataAtualizacao ||
+        it.updatedAt ||
+        extractFallbackTimestampDate(rawId) ||
+        extractFallbackTimestampDate(linkedOrc?.id);
+
+      items.push({
+        id: rawId,
+        orcamentoId: it.orcamentoId ? String(it.orcamentoId).trim() : linkedOrc?.id ? String(linkedOrc.id).trim() : undefined,
+        cliente: it.cliente || it.clientName || linkedOrc?.clientName || 'Cliente',
+        valor: resolvedValue,
+        status: effectiveStatus,
+        data: proposalDate ? String(proposalDate).trim() : undefined,
+        responsavel: sellerName || undefined,
+        vendedor: sellerName || undefined,
+        criadoPor: sellerName || undefined,
+        registeredBy: sellerName || undefined,
+        consultoraName: sellerName || undefined,
+        vendedorId: sellerId,
+        responsavelId: sellerId,
+      });
+    });
+  } catch {}
+
+  // 2. Histórico de Orçamentos (captura propostas complementares emitidas ainda não listadas no Follow-up)
+  try {
+    orcByBareId.forEach((orc, bareOrc) => {
+      if (!orc || !orc.id) return;
+      const orcId = String(orc.id).trim();
+      const fupId = `fup_${orcId}`;
+      if (
+        seenBareIds.has(bareOrc) ||
+        seenRawIds.has(orcId) ||
+        seenRawIds.has(fupId)
+      ) {
+        return;
+      }
+
+      const clientName = (orc.clientName || orc.clienteNome || orc.cliente || '').toLowerCase().trim();
+      if (clientName.includes('roberto silveira') || isMockSale({ cliente: clientName, id: orcId })) return;
+
+      seenBareIds.add(bareOrc);
+      seenRawIds.add(orcId);
+
+      const effectiveStatus = soldBareIds.has(bareOrc)
+        ? 'Vendido'
+        : orc.status || 'Orçamento Enviado';
+
+      const { sellerName, sellerId } = resolveCanonicalProposalSeller({
+        consultoraName: orc.consultoraName,
+        responsavel: orc.responsavel,
+        vendedor: orc.vendedor,
+        criadoPor: orc.criadoPor,
+        registeredBy: orc.registeredBy,
+        vendedorId: orc.vendedorId || null,
+        responsavelId: orc.responsavelId || null,
+      });
+
+      const resolvedValue =
+        parseBRLCurrency(orc.totalFinal) ||
+        parseBRLCurrency(orc.totalGeral) ||
+        parseBRLCurrency(orc.valor) ||
+        0;
+
+      const extractFallbackTimestampDate = (idStr?: string): string => {
+        if (!idStr) return '';
+        const match = String(idStr).match(/(\d{13})/);
+        if (match) {
+          const ms = Number(match[1]);
+          if (!isNaN(ms) && ms > 1500000000000) {
+            return new Date(ms).toISOString();
+          }
+        }
+        return '';
+      };
+
+      const proposalDate =
+        orc.dataOrcamento ||
+        orc.savedAt ||
+        orc.createdAt ||
+        orc.dataCriacao ||
+        orc.data ||
+        orc.updatedAt ||
+        extractFallbackTimestampDate(orcId);
+
+      items.push({
+        id: orcId,
+        orcamentoId: orcId,
+        cliente: orc.clientName || orc.clienteNome || orc.cliente || 'Cliente',
+        valor: resolvedValue,
+        status: effectiveStatus,
+        data: proposalDate ? String(proposalDate).trim() : undefined,
+        responsavel: sellerName || undefined,
+        vendedor: sellerName || undefined,
+        criadoPor: sellerName || undefined,
+        registeredBy: sellerName || undefined,
+        consultoraName: sellerName || undefined,
+        vendedorId: sellerId,
+        responsavelId: sellerId,
+      });
+    });
   } catch {}
 
   return items;
@@ -515,6 +754,67 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
     } catch {}
   }
 
+  const toLocalDateYYYYMMDD = (val?: string): string => {
+    const now = new Date();
+    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    if (!val) return todayLocal;
+    const str = String(val).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+    if (/^\d{4}-\d{2}-\d{2}T/.test(str)) {
+      const d = new Date(str);
+      if (!isNaN(d.getTime())) {
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      }
+      return str.split('T')[0];
+    }
+    return str;
+  };
+
+  const isGenericSellerName = (name?: string): boolean => {
+    if (!name) return true;
+    const n = name.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return (
+      !n ||
+      n === 'sistema' ||
+      n === 'usuario fenix' ||
+      n === 'consultora fenix' ||
+      n === 'crm fenix' ||
+      n === 'geral' ||
+      n === 'todos'
+    );
+  };
+
+  const pickValidSeller = (candidates: Array<string | undefined | null>, fallback: string): string => {
+    for (const c of candidates) {
+      if (typeof c === 'string' && !isGenericSellerName(c)) return c.trim();
+    }
+    return fallback;
+  };
+
+  const trackSaleKeys = (id: string, fupId: string, orcId: string, dedupKey: string) => {
+    if (id) seenKeys.add(id);
+    if (fupId) {
+      seenKeys.add(fupId);
+      seenKeys.add(`v_orc_${fupId}`);
+    }
+    if (orcId) {
+      const bareOrc = orcId.replace(/^orc_/, '');
+      seenKeys.add(orcId);
+      seenKeys.add(`fup_${orcId}`);
+      seenKeys.add(`v_orc_${orcId}`);
+      seenKeys.add(`v_orc_fup_${orcId}`);
+      if (bareOrc) {
+        seenKeys.add(bareOrc);
+        seenKeys.add(`orc_${bareOrc}`);
+        seenKeys.add(`fup_${bareOrc}`);
+        seenKeys.add(`fup_orc_${bareOrc}`);
+        seenKeys.add(`v_orc_${bareOrc}`);
+        seenKeys.add(`v_orc_orc_${bareOrc}`);
+      }
+    }
+    if (dedupKey) seenKeys.add(dedupKey);
+  };
+
   // 1. Vendas cadastradas diretamente em Metas (e já salvas no banco)
   try {
     const rawMetas = localStorage.getItem('fenix_metas_sales_db');
@@ -527,29 +827,46 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           const cleanPed = item.pedido ? String(item.pedido).replace(/^#+/, '').trim() : '';
           const clientNorm = (item.cliente || '').trim().toLowerCase();
 
+          const fupId = item.followUpId ? String(item.followUpId).trim() : '';
+          const orcId = item.orcamentoId ? String(item.orcamentoId).trim() : '';
+          const bareOrc = orcId.replace(/^orc_/, '');
+          const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
+
           if (
             deletedSet.has(id) ||
+            (fupId && deletedSet.has(fupId)) ||
+            (orcId && deletedSet.has(orcId)) ||
+            (bareOrc && (deletedSet.has(bareOrc) || deletedSet.has(`v_orc_${bareOrc}`))) ||
             (cleanPed && deletedSet.has(cleanPed)) ||
             (cleanPed && deletedSet.has(`ped_${cleanPed}`))
           ) {
             return;
           }
 
-          seenKeys.add(id);
-          if (item.followUpId) seenKeys.add(String(item.followUpId));
-          if (item.orcamentoId) seenKeys.add(String(item.orcamentoId));
-          if (cleanPed && clientNorm) seenKeys.add(`${cleanPed}_${clientNorm}`);
-          if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
+          // Impede contagem duplicada apenas da MESMA venda (mesmo ID/Follow-up/Orçamento ou mesmo Pedido + Cliente)
+          const sameOrcOrFup =
+            seenKeys.has(id) ||
+            (fupId && seenKeys.has(fupId)) ||
+            (orcId && seenKeys.has(orcId)) ||
+            (bareOrc && seenKeys.has(bareOrc));
+          const samePedClient = !orcId && Boolean(dedupKey && seenKeys.has(dedupKey));
 
-          const seller = (
-            item.responsavel ||
-            item.vendedor ||
-            item.consultoraName ||
-            item.criadoPor ||
-            item.registeredBy ||
-            currentUserName ||
-            'Vanessa Gomes'
-          ).trim();
+          if (sameOrcOrFup || samePedClient) {
+            return;
+          }
+
+          trackSaleKeys(id, fupId, orcId, dedupKey);
+
+          const seller = pickValidSeller(
+            [
+              item.responsavel,
+              item.vendedor,
+              item.consultoraName,
+              item.criadoPor,
+              item.registeredBy,
+            ],
+            currentUserName || 'Vanessa Gomes'
+          );
 
           const mapped: VendaItem = {
             id,
@@ -565,15 +882,20 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
               ? item.tipoCliente
               : 'Cliente Final') as ClientType,
             cliente: item.cliente || 'Cliente',
+            clienteId: item.clienteId,
             whatsapp: item.whatsapp || '',
-            data: item.data || new Date().toISOString().split('T')[0],
+            data: toLocalDateYYYYMMDD(item.data),
             responsavel: seller,
             vendedor: seller,
+            consultoraName: item.consultoraName || seller,
             criadoPor: item.criadoPor || seller,
             registeredBy: item.registeredBy || seller,
             vendedorId: item.vendedorId || null,
+            responsavelId: item.responsavelId || null,
             orcamentoId: item.orcamentoId,
             followUpId: item.followUpId,
+            origem: item.origem,
+            updatedAt: item.updatedAt,
           };
           map.set(id, mapped);
         });
@@ -593,9 +915,11 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           if (statusNorm !== 'vendido') return;
           if (isMockSale(fup)) return;
 
-          const fupId = String(fup.id);
-          const orcId = fup.orcamentoId ? String(fup.orcamentoId) : undefined;
-          const saleId = `v_orc_${fupId}`;
+          const fupId = String(fup.id).trim();
+          const orcId = fup.orcamentoId ? String(fup.orcamentoId).trim() : fupId.replace(/^fup_/, '');
+          const bareOrc = orcId.replace(/^orc_/, '');
+          const saleId = `v_orc_${orcId || fupId}`;
+          const legacySaleId = `v_orc_${fupId}`;
           const cleanPed = fup.pedido ? String(fup.pedido).replace(/^#+/, '').trim() : '';
           const clientNorm = (fup.cliente || fup.clientName || '').trim().toLowerCase();
           const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
@@ -603,7 +927,9 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           if (
             deletedSet.has(fupId) ||
             deletedSet.has(saleId) ||
+            deletedSet.has(legacySaleId) ||
             (orcId && deletedSet.has(orcId)) ||
+            (bareOrc && (deletedSet.has(bareOrc) || deletedSet.has(`v_orc_${bareOrc}`))) ||
             (cleanPed && deletedSet.has(cleanPed))
           ) {
             return;
@@ -613,22 +939,24 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           if (
             seenKeys.has(fupId) ||
             seenKeys.has(saleId) ||
+            seenKeys.has(legacySaleId) ||
             (orcId && seenKeys.has(orcId)) ||
-            (dedupKey && seenKeys.has(dedupKey)) ||
-            (cleanPed && seenKeys.has(`ped_${cleanPed}`))
+            (bareOrc && (seenKeys.has(bareOrc) || seenKeys.has(`v_orc_${bareOrc}`))) ||
+            (dedupKey && seenKeys.has(dedupKey))
           ) {
             return;
           }
 
-          const seller = (
-            fup.responsavel ||
-            fup.vendedor ||
-            fup.consultoraName ||
-            fup.criadoPor ||
-            fup.registeredBy ||
-            currentUserName ||
-            'Vanessa Gomes'
-          ).trim();
+          const seller = pickValidSeller(
+            [
+              fup.responsavel,
+              fup.vendedor,
+              fup.consultoraName,
+              fup.criadoPor,
+              fup.registeredBy,
+            ],
+            currentUserName || 'Vanessa Gomes'
+          );
 
           const fupSale: VendaItem = {
             id: saleId,
@@ -644,24 +972,26 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
               ? (fup.clientType || fup.tipoCliente)
               : 'Cliente Final') as ClientType,
             cliente: fup.cliente || fup.clientName || 'Cliente',
+            clienteId: fup.clientId,
             whatsapp: fup.telefone || fup.whatsapp || '',
-            data: fup.dataAtualizacao
-              ? String(fup.dataAtualizacao).split('T')[0]
-              : fup.dataCadastro || new Date().toISOString().split('T')[0],
+            data: toLocalDateYYYYMMDD(
+              fup.dataVenda || fup.updatedAt || fup.dataAtualizacao || fup.dataCadastro || fup.dataCriacao
+            ),
             responsavel: seller,
             vendedor: seller,
+            consultoraName: seller,
             criadoPor: fup.criadoPor || seller,
             registeredBy: fup.registeredBy || seller,
             vendedorId: fup.vendedorId || null,
+            responsavelId: fup.responsavelId || null,
             orcamentoId: orcId,
             followUpId: fupId,
+            origem: 'followup',
+            updatedAt: fup.updatedAt || fup.dataAtualizacao,
           };
 
           map.set(saleId, fupSale);
-          seenKeys.add(saleId);
-          seenKeys.add(fupId);
-          if (orcId) seenKeys.add(orcId);
-          if (dedupKey) seenKeys.add(dedupKey);
+          trackSaleKeys(saleId, fupId, orcId, dedupKey);
         });
       }
     }
@@ -699,8 +1029,7 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           if (
             seenKeys.has(rawId) ||
             seenKeys.has(saleId) ||
-            (dedupKey && seenKeys.has(dedupKey)) ||
-            (cleanPed && seenKeys.has(`ped_${cleanPed}`))
+            (dedupKey && seenKeys.has(dedupKey))
           ) {
             return;
           }
@@ -720,7 +1049,7 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
             tipoCliente: (CLIENT_TYPES_LIST.includes(p.clientType) ? p.clientType : 'Cliente Final') as ClientType,
             cliente: p.clientName || 'Cliente',
             whatsapp: p.clientPhone || '',
-            data: (p.completionDate || p.createdAt || new Date().toISOString()).split('T')[0],
+            data: toLocalDateYYYYMMDD(p.completionDate || p.createdAt),
             responsavel: seller,
             vendedor: seller,
             criadoPor: seller,
@@ -734,7 +1063,6 @@ export function loadConsolidatedMetasSales(currentUserName?: string): VendaItem[
           map.set(sale.id, sale);
           seenKeys.add(sale.id);
           seenKeys.add(rawId);
-          if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
           if (dedupKey) seenKeys.add(dedupKey);
         });
       }
@@ -917,70 +1245,82 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
             } catch {}
           }
 
-          const existingMap = new Map<string, any>();
-          const seenKeys = new Set<string>();
+          const mergedList: any[] = [];
+          const findIdx = (candidate: any): number => {
+            const id = String(candidate.id || '').trim();
+            const fupId = candidate.followUpId ? String(candidate.followUpId).trim() : '';
+            const orcId = candidate.orcamentoId ? String(candidate.orcamentoId).trim() : '';
+            const bareOrc = orcId.replace(/^orc_/, '');
+            const cleanPed = candidate.pedido ? String(candidate.pedido).replace(/^#+/, '').trim() : '';
+            const clientNorm = (candidate.cliente || candidate.clientName || '').trim().toLowerCase();
 
-          // 1. Registros oficiais do banco de dados (prioridade e fidelidade total)
+            return mergedList.findIndex((existing) => {
+              const eId = String(existing.id || '').trim();
+              const eFupId = existing.followUpId ? String(existing.followUpId).trim() : '';
+              const eOrcId = existing.orcamentoId ? String(existing.orcamentoId).trim() : '';
+              const eBareOrc = eOrcId.replace(/^orc_/, '');
+
+              if (id && eId && id === eId) return true;
+              if (fupId && eFupId && fupId === eFupId) return true;
+              if (bareOrc && eBareOrc && bareOrc === eBareOrc) return true;
+              if (fupId && eOrcId && (fupId === eOrcId || fupId === `fup_${eBareOrc}`)) return true;
+              if (orcId && eFupId && (eFupId === orcId || eFupId === `fup_${bareOrc}`)) return true;
+
+              const ePed = existing.pedido ? String(existing.pedido).replace(/^#+/, '').trim() : '';
+              const eCli = (existing.cliente || existing.clientName || '').trim().toLowerCase();
+              const bothHaveDiffOrcs = Boolean(bareOrc && eBareOrc && bareOrc !== eBareOrc);
+              if (!bothHaveDiffOrcs && cleanPed && ePed && cleanPed === ePed && clientNorm && eCli && clientNorm === eCli) {
+                return true;
+              }
+              return false;
+            });
+          };
+
+          // 1. Registros do banco de dados
           data.data.forEach((s: any) => {
             if (!s || isMockSale(s)) return;
-            const id = String(s.id || `v_${Math.random()}`);
-            const cleanPed = s.pedido ? String(s.pedido).replace(/^#+/, '').trim() : '';
-            const clientNorm = (s.cliente || s.clientName || '').trim().toLowerCase();
-            const fupId = s.followUpId ? String(s.followUpId) : '';
-            const orcId = s.orcamentoId ? String(s.orcamentoId) : '';
-            const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-            existingMap.set(id, s);
-            seenKeys.add(id);
-            if (fupId) seenKeys.add(fupId);
-            if (orcId) seenKeys.add(orcId);
-            if (dedupKey) seenKeys.add(dedupKey);
-            if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
+            if (findIdx(s) < 0) mergedList.push(s);
           });
 
-          // 2. Preserva vendas locais recém-adicionadas que ainda não subiram
+          // 2. Preserva vendas locais recém-adicionadas ou com atualização mais recente
           localArr.forEach((s: any) => {
             if (!s || isMockSale(s)) return;
-            const id = String(s.id || `v_${Math.random()}`);
-            const cleanPed = s.pedido ? String(s.pedido).replace(/^#+/, '').trim() : '';
-            const clientNorm = (s.cliente || s.clientName || '').trim().toLowerCase();
-            const fupId = s.followUpId ? String(s.followUpId) : '';
-            const orcId = s.orcamentoId ? String(s.orcamentoId) : '';
-            const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-            if (
-              seenKeys.has(id) ||
-              (fupId && seenKeys.has(fupId)) ||
-              (orcId && seenKeys.has(orcId)) ||
-              (dedupKey && seenKeys.has(dedupKey)) ||
-              (cleanPed && seenKeys.has(`ped_${cleanPed}`))
-            ) {
-              return;
+            const idx = findIdx(s);
+            if (idx < 0) {
+              mergedList.push(s);
+            } else {
+              const existing = mergedList[idx];
+              const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+              const localTs = new Date(s.updatedAt || s.dataAtualizacao || 0).getTime() || 0;
+              if (localTs > existingTs) {
+                mergedList[idx] = { ...existing, ...s, id: existing.id || s.id };
+              }
             }
-
-            existingMap.set(id, s);
-            seenKeys.add(id);
-            if (fupId) seenKeys.add(fupId);
-            if (orcId) seenKeys.add(orcId);
-            if (dedupKey) seenKeys.add(dedupKey);
-            if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
           });
 
-          const merged = Array.from(existingMap.values());
-          if (merged.length > 0) {
-            localStorage.setItem('fenix_metas_sales_db', JSON.stringify(merged));
-            setVendas(loadConsolidatedMetasSales(currentUserName));
-            window.dispatchEvent(new Event('fenix_metas_updated'));
-            window.dispatchEvent(new Event('fenix_vendas_updated'));
-            window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
+            if (mergedList.length > 0) {
+              localStorage.setItem('fenix_metas_sales_db', JSON.stringify(mergedList));
+              setVendas(loadConsolidatedMetasSales(currentUserName));
+              window.dispatchEvent(new Event('fenix_metas_updated'));
+              window.dispatchEvent(new Event('fenix_vendas_updated'));
+              window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
+            }
           }
-        }
-      } catch (err) {
-        console.warn('Erro ao restaurar vendas do Supabase em Metas:', err);
-      }
-    };
 
-    fetchRemoteMetas();
+          // Garante também sincronização atualizada da esteira de propostas ativas (Follow-up + Orçamentos)
+          await pullDataFromSupabase([
+            'fenix_followup_cards_v2',
+            'fenix_orcamentos_history',
+            'fenix_saved_orcamentos',
+          ]);
+          setPipelineBudgets(loadAllPipelineBudgets());
+        } catch (err) {
+          console.warn('Erro ao restaurar vendas do Supabase em Metas:', err);
+        }
+      };
+
+      handleSync();
+      fetchRemoteMetas();
 
     window.addEventListener('fenix_metas_updated', handleSync);
     window.addEventListener('fenix_followup_updated', handleSync);
@@ -1021,206 +1361,22 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
   // Estado do Modal de Adicionar Venda
   const [isAddVendaOpen, setIsAddVendaOpen] = useState<boolean>(false);
 
-  // Vendedor selecionado no formulário de venda (para Éder Perez, Vanessa Gomes e Jhessica Camargo)
-  const [formVendedor, setFormVendedor] = useState<string>(() => {
-    if (currentUserName) return currentUserName;
-    return 'Vanessa Gomes';
-  });
-
-  // Estados para seleção de produtos com mesmo funcionamento do Novo Orçamento
-  const [productSubTab, setProductSubTab] = useState<'buscar' | 'categorias' | 'produtos'>('buscar');
-  const [searchProductQuery, setSearchProductQuery] = useState<string>('');
-  const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
-  const [categoryFilterQuery, setCategoryFilterQuery] = useState<string>('');
-  const [isProductCatalogModalOpen, setIsProductCatalogModalOpen] = useState<boolean>(false);
-
-  // Campos do produto ativo a ser puxado/adicionado
-  const [selectedProductCatalog, setSelectedProductCatalog] = useState<string>('');
-  const [newCategoria, setNewCategoria] = useState<string>('');
-  const [newSubtitulo, setNewSubtitulo] = useState<string>('');
-  const [newQtd, setNewQtd] = useState<string>('1');
-  const [newUnid, setNewUnid] = useState<string>('m²');
-  const [newPrecoUnitario, setNewPrecoUnitario] = useState<string>('');
-
-  // Catálogo e categorias oficiais
-  const dynamicCatalog = useMemo(() => getDynamicProductCatalog(), [isAddVendaOpen]);
-  const categoriesList = useMemo(() => getOfficialCategories(), [isAddVendaOpen]);
-
-  // Resultados da busca com dropdown embaixo
-  const searchProductResults = useMemo(() => {
-    if (!searchProductQuery.trim()) return [];
-    const q = searchProductQuery.toLowerCase().trim();
-    return dynamicCatalog
-      .filter((p) => p.name.toLowerCase().includes(q) || p.category.toLowerCase().includes(q))
-      .slice(0, 15);
-  }, [searchProductQuery, dynamicCatalog]);
-
-  // Produtos da categoria selecionada
-  const categoryProductsList = useMemo(() => {
-    if (!selectedCategoryId) return [];
-    const cat = categoriesList.find((c) => c.id === selectedCategoryId);
-    const catName = cat?.name?.toLowerCase() || '';
-    let filtered = dynamicCatalog.filter(
-      (p) =>
-        (p.categoryId && p.categoryId === selectedCategoryId) ||
-        (p.category && p.category.toLowerCase() === catName)
-    );
-    if (categoryFilterQuery.trim()) {
-      const fq = categoryFilterQuery.toLowerCase().trim();
-      filtered = filtered.filter((p) => p.name.toLowerCase().includes(fq));
-    }
-    return filtered;
-  }, [selectedCategoryId, categoriesList, dynamicCatalog, categoryFilterQuery]);
-
-  // Helper para puxar um produto do catálogo oficial para os campos
-  const handleSelectAndPullProduct = (prod: CatalogProduct) => {
-    const tierPrice = getProductTierPrice(prod, formTipoCliente);
-    setSelectedProductCatalog(prod.name);
-    setNewCategoria(prod.category || 'Geral');
-    setNewUnid(prod.unit || 'un');
-    setNewPrecoUnitario(
-      tierPrice.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    );
-    setNewQtd('1');
-    setNewSubtitulo('');
-    setProductSubTab('produtos');
-  };
-
-  // Helper para adicionar o produto ativo à lista da venda
-  const handleAddProductToSale = (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if (!selectedProductCatalog.trim()) return;
-
-    const qty = Math.max(0.1, parseFloat(newQtd.replace(',', '.')) || 1);
-    const unitPrice = parseBRLCurrency(newPrecoUnitario);
-    const subtotal = Math.round(qty * unitPrice * 100) / 100;
-
-    const newItem: VendaProdutoItem = {
-      id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      nome: selectedProductCatalog.trim(),
-      detalhe: newSubtitulo.trim() || undefined,
-      categoria: newCategoria.trim() || undefined,
-      unidade: newUnid.trim() || 'un',
-      quantidade: qty,
-      valorUnitario: unitPrice,
-      subtotal: subtotal,
-    };
-
-    const currentClean = formProdutos.filter((p) => p.nome.trim() !== '');
-    const updated = [...currentClean, newItem];
-    setFormProdutos(updated);
-
-    // Recalcula o valor total da venda
-    const totalItens = updated.reduce(
-      (acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario),
-      0
-    );
-    const desc = parseBRLCurrency(formDesconto);
-    const frt = parseBRLCurrency(formFrete);
-    const finalVal = Math.max(0, totalItens - desc + frt);
-    setFormValor(finalVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-
-    // Reset campos para o próximo
-    setSelectedProductCatalog('');
-    setNewSubtitulo('');
-    setNewQtd('1');
-    setNewPrecoUnitario('');
-    setProductSubTab('buscar');
-  };
-
-  // Helper para remover produto da venda
-  const handleRemoveProductFromSale = (idx: number) => {
-    const clean = formProdutos.filter((p) => p.nome.trim() !== '');
-    const updated = clean.filter((_, i) => i !== idx);
-    setFormProdutos(
-      updated.length > 0
-        ? updated
-        : [{ id: 'prod_1', nome: '', quantidade: 1, valorUnitario: 0 }]
-    );
-    if (updated.length > 0) {
-      const totalItens = updated.reduce(
-        (acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario),
-        0
-      );
-      const desc = parseBRLCurrency(formDesconto);
-      const frt = parseBRLCurrency(formFrete);
-      const finalVal = Math.max(0, totalItens - desc + frt);
-      setFormValor(finalVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-    }
-  };
-
-  // Helper para seleção vinda do modal completo do catálogo (ProductSelectionModal)
-  const handleSelectFromModal = (prod: {
-    name: string;
-    category: string;
-    unit: string;
-    price: number;
-    quantity: string;
-    subtitulo?: string;
-  }) => {
-    const qty = Math.max(0.1, parseFloat(prod.quantity.replace(',', '.')) || 1);
-    const subtotal = Math.round(qty * prod.price * 100) / 100;
-    const newItem: VendaProdutoItem = {
-      id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      nome: prod.name,
-      detalhe: prod.subtitulo,
-      categoria: prod.category,
-      unidade: prod.unit,
-      quantidade: qty,
-      valorUnitario: prod.price,
-      subtotal: subtotal,
-    };
-    const currentClean = formProdutos.filter((p) => p.nome.trim() !== '');
-    const updated = [...currentClean, newItem];
-    setFormProdutos(updated);
-
-    const totalItens = updated.reduce(
-      (acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario),
-      0
-    );
-    const desc = parseBRLCurrency(formDesconto);
-    const frt = parseBRLCurrency(formFrete);
-    const finalVal = Math.max(0, totalItens - desc + frt);
-    setFormValor(finalVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-  };
-
-  // Helper centralizado para abertura do modal Adicionar Venda
+  // Helper centralizado para abertura do modal Cadastrar Venda
   const handleOpenAddVenda = () => {
     setFormError('');
     setShowClientSuggestions(false);
-    let initialVendedor = 'Vanessa Gomes';
-    if (responsibleTab === 'vanessa') initialVendedor = 'Vanessa Gomes';
-    else if (responsibleTab === 'jhessica') initialVendedor = 'Jhessica Camargo';
-    else if (currentUserName && !isUserRevoked(currentUserName)) initialVendedor = currentUserName;
-    else initialVendedor = 'Vanessa Gomes';
-    setFormVendedor(initialVendedor);
-    setProductSubTab('buscar');
-    setSearchProductQuery('');
-    setSelectedCategoryId(null);
-    setCategoryFilterQuery('');
-    setSelectedProductCatalog('');
-    setNewCategoria('');
-    setNewSubtitulo('');
-    setNewQtd('1');
-    setNewUnid('m²');
     setFormPedido('');
-    setNewPrecoUnitario('');
-    setFormPayments([]);
+    setFormCliente('');
+    setFormWhatsapp('');
+    setFormTipoCliente('Cliente Final');
+    setFormValor('');
     setIsAddVendaOpen(true);
   };
   const [formPedido, setFormPedido] = useState<string>('');
   const [formCliente, setFormCliente] = useState<string>('');
   const [formWhatsapp, setFormWhatsapp] = useState<string>('');
-  const [formValor, setFormValor] = useState<string>('');
   const [formTipoCliente, setFormTipoCliente] = useState<ClientType>('Cliente Final');
-  const [formDesconto, setFormDesconto] = useState<string>('');
-  const [formFrete, setFormFrete] = useState<string>('');
-  const [formFormaPagamento, setFormFormaPagamento] = useState<'Pix' | 'Boleto' | 'Cartão'>('Pix');
-  const [formParcelas, setFormParcelas] = useState<string>('1x à vista');
-  const [formPayments, setFormPayments] = useState<FormaPagamentoItem[]>([]);
-  const [formProdutos, setFormProdutos] = useState<VendaProdutoItem[]>([
-    { id: 'prod_1', nome: '', quantidade: 1, valorUnitario: 0 },
-  ]);
+  const [formValor, setFormValor] = useState<string>('');
   const [formError, setFormError] = useState<string>('');
   const [successToast, setSuccessToast] = useState<string>('');
 
@@ -1283,22 +1439,31 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     return monthSales.filter((v) => isRecordOfResponsible(v, currentUserName || ''));
   }, [vendas, isDirector, responsibleTab, currentUserName, selectedDate]);
 
-  // Orçamentos em negociação / abertos com permissões rigorosas:
-  // - Usuário comum: SOMENTE seus próprios orçamentos em negociação/abertos
-  // - Éder Perez: manter a permissão atual (próprios orçamentos ou visão geral com aba "Todos")
+  // Orçamentos em negociação / abertos com permissões rigorosas por vendedor e somente do mês selecionado:
+  // - Considera exclusivamente propostas ativas do mês/ano selecionado em Metas
+  // - Cada vendedor visualiza EXCLUSIVAMENTE suas próprias propostas ativas (dono canônico)
+  // - Diretor (se aplicável) pode filtrar por aba ou visualizar visão geral
   const userOpenBudgets = useMemo(() => {
-    const openItems = pipelineBudgets.filter((b) => isPipelineBudgetOpen(b.status));
+    const targetMonth = selectedDate.getMonth();
+    const targetYear = selectedDate.getFullYear();
+    const openItems = pipelineBudgets.filter(
+      (b) => isPipelineBudgetOpen(b.status) && isProposalInTargetMonth(b.data, targetMonth, targetYear)
+    );
 
     if (isDirector) {
       if (responsibleTab === 'Todos') {
         return openItems;
       }
-      return openItems.filter((b) => isRecordOfResponsible(b, responsibleTab));
+      return openItems.filter((b) => isBudgetProposalOfSeller(b, responsibleTab));
     }
 
-    // Usuário comum calcula a projeção SOMENTE com seus próprios orçamentos
-    return openItems.filter((b) => isRecordOfResponsible(b, currentUserName || ''));
-  }, [pipelineBudgets, isDirector, responsibleTab, currentUserName]);
+    if (!currentUserName || !currentUserName.trim()) {
+      return [];
+    }
+
+    // Vendedor visualiza e calcula a projeção SOMENTE com suas próprias propostas ativas do mês
+    return openItems.filter((b) => isBudgetProposalOfSeller(b, currentUserName));
+  }, [pipelineBudgets, isDirector, responsibleTab, currentUserName, selectedDate]);
 
   // Total em negociação (soma dos orçamentos do usuário)
   const openBudgetsTotal = useMemo(() => {
@@ -1604,19 +1769,18 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     setEditError('');
   };
 
-  // Submissão do cadastro de venda (Modal / Botão Adicionar Venda)
-  // Campos solicitados: Pedido sem por #, Nome do Cliente/Razão Social, Whatsapp, Valor, Tipo de Cliente
+  // Submissão simplificada do cadastro de venda (Número do Pedido, Nome do Cliente / Razão Social, WhatsApp, Tipo de Cliente, Valor Vendido)
   const handleSalvarVenda = (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
     if (!formPedido.trim()) {
-      setFormError('Informe o número do Pedido.');
+      setFormError('Informe o Número do Pedido.');
       return;
     }
 
     if (!formCliente.trim()) {
-      setFormError('Informe o Nome Completo ou Razão Social.');
+      setFormError('Informe o Nome do Cliente / Razão Social.');
       return;
     }
 
@@ -1628,13 +1792,7 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     }
 
     if (valorNum <= 0) {
-      setFormError('Informe um valor de venda válido maior que zero.');
-      return;
-    }
-
-    // Validação estrita de pagamento múltiplo
-    if (!isPaymentSplitComplete(formPayments, valorNum)) {
-      setFormError('A soma das formas de pagamento deve ser exatamente igual ao valor total da venda.');
+      setFormError('Informe o Valor Vendido (R$) válido maior que zero.');
       return;
     }
 
@@ -1643,14 +1801,10 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     const mes = String(now.getMonth() + 1).padStart(2, '0');
     const ano = now.getFullYear();
 
-    // Pedido sem por # (limpa qualquer hashtag acidental inserida)
+    // Pedido sem #
     const cleanPedido = formPedido.trim().replace(/^#+/, '');
-    const descontoNum = parseBRLCurrency(formDesconto);
-    const freteNum = parseBRLCurrency(formFrete);
-    const validProdutos = formProdutos.filter((p) => p.nome.trim() !== '');
-    const paymentSummary = summarizePayments(formPayments);
-    const cardPayment = formPayments.find((p) => isFormaCartaoCredito(p.forma));
-    const resolvedParcelas = cardPayment?.parcelas || (formFormaPagamento === 'Cartão' ? formParcelas : undefined);
+    const sellerName = (currentUserName || 'Vanessa Gomes').trim();
+    const sellerId = getSellerIdForUser(sellerName);
 
     const newSale: VendaItem = {
       id: `v_${Date.now()}`,
@@ -1660,31 +1814,24 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
       valor: valorNum,
       tipoCliente: formTipoCliente,
       data: `${ano}-${mes}-${dia}`,
-      responsavel: formVendedor || currentUserName || 'Vanessa Gomes',
-      vendedor: formVendedor || currentUserName || 'Vanessa Gomes',
-      criadoPor: currentUserName || formVendedor || 'Vanessa Gomes',
-      registeredBy: currentUserName || formVendedor || 'Vanessa Gomes',
-      desconto: descontoNum > 0 ? descontoNum : undefined,
-      frete: freteNum > 0 ? freteNum : undefined,
-      formaPagamento: paymentSummary,
-      formasPagamento: formPayments,
-      parcelas: resolvedParcelas,
-      produtos: validProdutos.length > 0 ? validProdutos : undefined,
+      responsavel: sellerName,
+      vendedor: sellerName,
+      consultoraName: sellerName,
+      criadoPor: sellerName,
+      registeredBy: sellerName,
+      vendedorId: sellerId,
+      responsavelId: sellerId,
+      origem: 'metas',
+      updatedAt: now.toISOString(),
     };
 
     const updatedSales = [newSale, ...vendas.filter((v) => v.id !== newSale.id)];
     setVendas(updatedSales);
-    setFormValor('');
+    setFormPedido('');
     setFormCliente('');
     setFormWhatsapp('');
-    setFormPedido(String(Math.floor(1050 + Math.random() * 8900)));
     setFormTipoCliente('Cliente Final');
-    setFormDesconto('');
-    setFormFrete('');
-    setFormFormaPagamento('Pix');
-    setFormParcelas('1x à vista');
-    setFormPayments([]);
-    setFormProdutos([{ id: 'prod_1', nome: '', quantidade: 1, valorUnitario: 0 }]);
+    setFormValor('');
     setShowClientSuggestions(false);
     setIsAddVendaOpen(false);
 
@@ -3334,77 +3481,42 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
     </div>
   )}
 
-      {/* MODAL ADICIONAR VENDA */}
+      {/* MODAL CADASTRAR VENDA (SIMPLIFICADO) */}
       {isAddVendaOpen && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-3 sm:p-4 animate-in fade-in duration-150">
-          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl p-5 sm:p-7 w-full max-w-2xl sm:max-w-3xl max-h-[92vh] overflow-y-auto space-y-4 animate-in zoom-in-95 duration-150 text-slate-800">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <div className="flex items-center gap-2.5">
-                <div className="w-10 h-10 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-100 shadow-2xs">
-                  <Plus className="w-5 h-5 stroke-[2.5]" />
-                </div>
-                <div>
-                  <h3 className="text-lg font-black text-[#0B2046]">Cadastrar Venda</h3>
-                  <p className="text-xs text-slate-400">Lançamento de venda para a meta mensal com catálogo de produtos</p>
-                </div>
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl p-5 sm:p-7 w-full max-w-lg max-h-[92vh] overflow-y-auto space-y-5 animate-in zoom-in-95 duration-150 text-slate-800">
+            <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+              <div className="w-10 h-10 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-100 shadow-2xs flex-shrink-0">
+                <Plus className="w-5 h-5 stroke-[2.5]" />
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsAddVendaOpen(false);
-                  setShowClientSuggestions(false);
-                }}
-                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-xl hover:bg-slate-100 transition-colors cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div>
+                <h3 className="text-lg font-black text-[#0B2046]">Cadastrar Venda</h3>
+                <p className="text-xs text-slate-400">Lançamento rápido de venda para a meta mensal</p>
+              </div>
             </div>
 
             <form onSubmit={handleSalvarVenda} className="space-y-4">
-              {/* 1. Vendedor e Pedido */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Vendedor / Responsável <span className="text-rose-500">*</span>
-                  </label>
-                  <div className="relative">
-                    <select
-                      value={formVendedor}
-                      onChange={(e) => setFormVendedor(e.target.value)}
-                      className="w-full appearance-none px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-bold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs pr-10 cursor-pointer"
-                    >
-                      <option value="Vanessa Gomes">Vanessa Gomes (Comercial / Vendas)</option>
-                      <option value="Jhessica Camargo">Jhessica Camargo (Comercial / Vendas)</option>
-                      {formVendedor && !['Vanessa Gomes', 'Jhessica Camargo'].includes(formVendedor) && (
-                        <option value={formVendedor}>{formVendedor} (Histórico)</option>
-                      )}
-                    </select>
-                    <ChevronDown className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Pedido <span className="text-rose-500">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={formPedido}
-                    onChange={(e) => {
-                      setFormPedido(e.target.value.replace(/^#+/, ''));
-                      if (formError) setFormError('');
-                    }}
-                    placeholder="Ex: 1052"
-                    className="w-full px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-bold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
-                  />
-                  <span className="text-[11px] text-slate-400 mt-1 block">Número do pedido (sem #)</span>
-                </div>
+              {/* 1. Número do Pedido */}
+              <div>
+                <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
+                  Número do Pedido <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={formPedido}
+                  onChange={(e) => {
+                    setFormPedido(e.target.value.replace(/^#+/, ''));
+                    if (formError) setFormError('');
+                  }}
+                  placeholder="Ex: 1052"
+                  className="w-full px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-bold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
+                />
               </div>
 
-              {/* 2. Nome Completo / Razão Social */}
+              {/* 2. Nome do Cliente / Razão Social */}
               <div className="relative">
                 <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                  Nome Completo / Razão Social <span className="text-rose-500">*</span>
+                  Nome do Cliente / Razão Social <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
@@ -3415,11 +3527,10 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
                     if (formError) setFormError('');
                   }}
                   onFocus={() => setShowClientSuggestions(true)}
-                  placeholder="Digite o nome completo ou razão social..."
+                  placeholder="Digite o nome do cliente ou razão social..."
                   className="w-full px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-semibold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
                 />
 
-                {/* Dropdown de sugestões de clientes */}
                 {showClientSuggestions && clientSuggestions.length > 0 && (
                   <div className="absolute left-0 right-0 top-full mt-1 bg-white rounded-2xl border border-slate-200 shadow-xl z-50 overflow-hidden max-h-52 overflow-y-auto divide-y divide-slate-100">
                     <div className="p-2 bg-slate-50 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
@@ -3461,543 +3572,51 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
                 )}
               </div>
 
-              {/* 3. Whatsapp e 4. Tipo de Cliente */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Whatsapp
-                  </label>
-                  <div className="relative">
-                    <MessageCircle className="w-4 h-4 text-emerald-600 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={formWhatsapp}
-                      onChange={(e) => {
-                        setFormWhatsapp(formatPhone(e.target.value));
-                        if (formError) setFormError('');
-                      }}
-                      placeholder="(11) 99999-9999"
-                      className="w-full pl-10 pr-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-medium focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Tipo de Cliente
-                  </label>
-                  <div className="relative">
-                    <select
-                      value={formTipoCliente}
-                      onChange={(e) => setFormTipoCliente(e.target.value as ClientType)}
-                      className="w-full appearance-none px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-bold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs pr-10 cursor-pointer"
-                    >
-                      {CLIENT_TYPES_LIST.map((tipo) => (
-                        <option key={tipo} value={tipo}>
-                          {tipo}
-                        </option>
-                      ))}
-                    </select>
-                    <ChevronDown className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  </div>
-                </div>
-              </div>
-
-              {/* 5. Desconto e Frete */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Desconto (R$)
-                  </label>
-                  <input
-                    type="text"
-                    value={formDesconto}
-                    onChange={(e) => {
-                      const digits = e.target.value.replace(/\D/g, '');
-                      const desc = digits ? (parseFloat(digits) / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : '';
-                      setFormDesconto(desc);
-                      // Atualiza valor total
-                      const totalItens = formProdutos.reduce((acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario), 0);
-                      const descNum = digits ? parseFloat(digits) / 100 : 0;
-                      const frtNum = parseBRLCurrency(formFrete);
-                      if (totalItens > 0) {
-                        const finalVal = Math.max(0, totalItens - descNum + frtNum);
-                        setFormValor(finalVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-                      }
-                    }}
-                    placeholder="R$ 0,00"
-                    className="w-full px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-semibold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                    Frete (R$)
-                  </label>
-                  <input
-                    type="text"
-                    value={formFrete}
-                    onChange={(e) => {
-                      const digits = e.target.value.replace(/\D/g, '');
-                      const frt = digits ? (parseFloat(digits) / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : '';
-                      setFormFrete(frt);
-                      // Atualiza valor total
-                      const totalItens = formProdutos.reduce((acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario), 0);
-                      const descNum = parseBRLCurrency(formDesconto);
-                      const frtNum = digits ? parseFloat(digits) / 100 : 0;
-                      if (totalItens > 0) {
-                        const finalVal = Math.max(0, totalItens - descNum + frtNum);
-                        setFormValor(finalVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-                      }
-                    }}
-                    placeholder="R$ 0,00"
-                    className="w-full px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-semibold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
-                  />
-                </div>
-              </div>
-
-              {/* 6. Formas de Pagamento (Múltiplos Pagamentos com Soma Automática) */}
-              <div className="pt-1">
-                <PaymentSplitManager
-                  totalVenda={parseBRLCurrency(formValor)}
-                  payments={formPayments}
-                  onChange={setFormPayments}
-                />
-              </div>
-
-              {/* 7. SELEÇÃO DE PRODUTOS (MESMO FUNCIONAMENTO DO NOVO ORÇAMENTO) */}
-              <div className="space-y-3 pt-3 border-t border-slate-200">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <label className="text-xs sm:text-sm font-bold text-[#0B2046] uppercase tracking-wider flex items-center gap-1.5">
-                        <Package className="w-4 h-4 text-[#0052cc]" />
-                        Produtos e Itens da Venda
-                      </label>
-                      <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-blue-50 text-[#0052cc] border border-blue-200">
-                        {getOfficialPriceTableLabel(formTipoCliente)}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      Puxe produtos cadastrados com tabela automática de preços.
-                    </p>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => setIsProductCatalogModalOpen(true)}
-                    className="px-3 py-1.5 rounded-xl border border-blue-200 bg-blue-50/80 hover:bg-blue-100 text-[#0052cc] text-xs font-bold flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer self-start sm:self-auto"
-                  >
-                    <Sparkles className="w-3.5 h-3.5 text-[#0052cc]" />
-                    <span>Catálogo Geral</span>
-                  </button>
-                </div>
-
-                {/* Sub-Abas de Navegação */}
-                <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-xl overflow-x-auto border border-slate-200">
-                  <button
-                    type="button"
-                    onClick={() => setProductSubTab('buscar')}
-                    className={`flex-1 min-w-[130px] py-1.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                      productSubTab === 'buscar'
-                        ? 'bg-white text-[#0052cc] shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <Search className="w-3.5 h-3.5" />
-                    <span>1. Barra de Busca</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setProductSubTab('categorias')}
-                    className={`flex-1 min-w-[140px] py-1.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                      productSubTab === 'categorias'
-                        ? 'bg-white text-[#0052cc] shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <Layers className="w-3.5 h-3.5" />
-                    <span>2. Categorias</span>
-                    {selectedCategoryId && <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setProductSubTab('produtos')}
-                    className={`flex-1 min-w-[140px] py-1.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                      productSubTab === 'produtos'
-                        ? 'bg-white text-[#0052cc] shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <Package className="w-3.5 h-3.5" />
-                    <span>3. Aba Produtos</span>
-                    {selectedProductCatalog && (
-                      <span className="inline-flex items-center px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-100 text-emerald-700">
-                        Puxado ✓
-                      </span>
-                    )}
-                  </button>
-                </div>
-
-                {/* SUB-ABA 1: BARRA DE BUSCA COM DROPDOWN IMEDIATO */}
-                {productSubTab === 'buscar' && (
-                  <div className="space-y-2.5 p-3 rounded-2xl bg-blue-50/40 border border-blue-100">
-                    <div className="relative">
-                      <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={searchProductQuery}
-                        onChange={(e) => setSearchProductQuery(e.target.value)}
-                        placeholder="Digite para buscar produtos no catálogo..."
-                        className="w-full pl-9 pr-8 py-2 rounded-xl bg-white border border-slate-200 text-xs font-medium focus:outline-none focus:border-[#0052cc]"
-                      />
-                      {searchProductQuery && (
-                        <button
-                          type="button"
-                          onClick={() => setSearchProductQuery('')}
-                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Sugestões rápidas de busca */}
-                    <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px]">
-                      <span className="text-slate-400 text-[10px] uppercase font-bold flex-shrink-0">
-                        Atalhos:
-                      </span>
-                      {['Pisos Vinílicos', 'Rodapés', 'Colas', 'Autonivelantes', 'Manta', 'Santa Luzia'].map((chip) => (
-                        <button
-                          key={chip}
-                          type="button"
-                          onClick={() => setSearchProductQuery(chip)}
-                          className="px-2 py-0.5 rounded-lg bg-white border border-slate-200 hover:border-[#0052cc] text-slate-600 hover:text-[#0052cc] text-[11px] font-semibold whitespace-nowrap cursor-pointer transition-colors shadow-2xs"
-                        >
-                          {chip}
-                        </button>
-                      ))}
-                    </div>
-
-                    {/* Lista de resultados da busca */}
-                    {searchProductResults.length > 0 ? (
-                      <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 divide-y divide-slate-100 bg-white rounded-xl p-2 border border-slate-200">
-                        {searchProductResults.map((prod) => {
-                          const priceVal = getProductTierPrice(prod, formTipoCliente);
-                          return (
-                            <div
-                              key={prod.id}
-                              className="pt-1.5 first:pt-0 flex items-center justify-between gap-2"
-                            >
-                              <div className="min-w-0 flex-1">
-                                <div className="text-xs font-bold text-slate-800 truncate">{prod.name}</div>
-                                <div className="flex items-center gap-2 text-[10px] text-slate-500">
-                                  <span className="font-semibold text-[#0052cc]">{prod.category}</span>
-                                  <span>•</span>
-                                  <span>{prod.unit}</span>
-                                  <span>•</span>
-                                  <span className="font-bold text-emerald-700">
-                                    R$ {priceVal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                  </span>
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => handleSelectAndPullProduct(prod)}
-                                className="px-2.5 py-1 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-[11px] font-bold flex-shrink-0 cursor-pointer shadow-2xs transition-colors"
-                              >
-                                Puxar
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : searchProductQuery.trim() ? (
-                      <div className="p-3 text-center text-xs text-slate-400 bg-white rounded-xl border border-slate-200">
-                        Nenhum produto encontrado com esse termo.
-                      </div>
-                    ) : (
-                      <div className="p-2.5 text-center text-[11px] text-slate-500 bg-white/70 rounded-xl border border-slate-200">
-                        Digite no campo acima ou clique em uma categoria para puxar o produto.
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* SUB-ABA 2: ESCOLHER CATEGORIA */}
-                {productSubTab === 'categorias' && (
-                  <div className="space-y-2.5 p-3 rounded-2xl bg-blue-50/40 border border-blue-100">
-                    {!selectedCategoryId ? (
-                      <div className="space-y-2">
-                        <div className="text-xs font-bold text-slate-700">Selecione uma categoria do catálogo:</div>
-                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                          {categoriesList.map((cat) => (
-                            <button
-                              key={cat.id}
-                              type="button"
-                              onClick={() => setSelectedCategoryId(cat.id)}
-                              className="p-2 rounded-xl bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-300 text-left transition-all cursor-pointer shadow-2xs group"
-                            >
-                              <div className="text-xs font-bold text-slate-800 group-hover:text-[#0052cc] truncate">
-                                {cat.name}
-                              </div>
-                              <div className="text-[10px] text-slate-400 mt-0.5">Ver produtos →</div>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setSelectedCategoryId(null)}
-                            className="text-xs font-bold text-[#0052cc] hover:underline flex items-center gap-1 cursor-pointer"
-                          >
-                            ← Voltar para Categorias
-                          </button>
-                          <span className="text-xs font-bold text-slate-700">
-                            {categoriesList.find((c) => c.id === selectedCategoryId)?.name || 'Categoria'}
-                          </span>
-                        </div>
-
-                        <div className="relative">
-                          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                          <input
-                            type="text"
-                            value={categoryFilterQuery}
-                            onChange={(e) => setCategoryFilterQuery(e.target.value)}
-                            placeholder="Filtrar nesta categoria..."
-                            className="w-full pl-8 pr-3 py-1.5 rounded-lg bg-white border border-slate-200 text-xs font-medium focus:outline-none focus:border-[#0052cc]"
-                          />
-                        </div>
-
-                        <div className="max-h-44 overflow-y-auto space-y-1 bg-white rounded-xl p-2 border border-slate-200 divide-y divide-slate-100">
-                          {categoryProductsList.map((prod) => {
-                            const priceVal = getProductTierPrice(prod, formTipoCliente);
-                            return (
-                              <div key={prod.id} className="pt-1.5 first:pt-0 flex items-center justify-between gap-2">
-                                <div className="min-w-0 flex-1">
-                                  <div className="text-xs font-bold text-slate-800 truncate">{prod.name}</div>
-                                  <div className="text-[10px] text-slate-500">
-                                    {prod.unit} • R$ {priceVal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={() => handleSelectAndPullProduct(prod)}
-                                  className="px-2.5 py-1 rounded-lg bg-[#0052cc] hover:bg-blue-700 text-white text-[11px] font-bold flex-shrink-0 cursor-pointer shadow-2xs"
-                                >
-                                  Puxar
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* SUB-ABA 3: ABA PRODUTOS (Preenchimento e Inclusão na Venda) */}
-                {productSubTab === 'produtos' && (
-                  <div className="space-y-2.5 p-3 rounded-2xl bg-blue-50/40 border border-blue-100">
-                    {selectedProductCatalog ? (
-                      <div className="p-2.5 rounded-xl bg-white border border-blue-200 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="text-[10px] font-bold text-[#0052cc] uppercase tracking-wider">
-                            Produto Selecionado do Catálogo:
-                          </div>
-                          <div className="text-xs sm:text-sm font-bold text-slate-800 truncate">
-                            {selectedProductCatalog}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setProductSubTab('buscar')}
-                          className="text-[11px] font-bold text-slate-500 hover:text-slate-800 underline cursor-pointer flex-shrink-0"
-                        >
-                          Trocar
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800 flex items-center justify-between gap-2">
-                        <span>Nenhum produto puxado ainda. Digite na busca ou escolha uma categoria.</span>
-                        <button
-                          type="button"
-                          onClick={() => setProductSubTab('buscar')}
-                          className="px-2.5 py-1 rounded-lg bg-amber-600 text-white text-[11px] font-bold cursor-pointer hover:bg-amber-700 flex-shrink-0"
-                        >
-                          Ir para Busca
-                        </button>
-                      </div>
-                    )}
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                          Produto / Descrição
-                        </label>
-                        <input
-                          type="text"
-                          value={selectedProductCatalog}
-                          onChange={(e) => setSelectedProductCatalog(e.target.value)}
-                          placeholder="Nome do produto"
-                          className="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-800 focus:outline-none focus:border-[#0052cc]"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                          Detalhe (ex: cor, caixas, lote, acabamento)
-                        </label>
-                        <input
-                          type="text"
-                          value={newSubtitulo}
-                          onChange={(e) => setNewSubtitulo(e.target.value)}
-                          placeholder="Ex: Cor Carvalho / 10 Caixas"
-                          className="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-medium text-slate-800 focus:outline-none focus:border-[#0052cc]"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                          Quantidade
-                        </label>
-                        <input
-                          type="number"
-                          min="0.1"
-                          step="any"
-                          value={newQtd}
-                          onChange={(e) => setNewQtd(e.target.value)}
-                          className="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-center text-slate-800 focus:outline-none focus:border-[#0052cc]"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                          Unidade
-                        </label>
-                        <input
-                          type="text"
-                          value={newUnid}
-                          onChange={(e) => setNewUnid(e.target.value)}
-                          placeholder="m², cx, un"
-                          className="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-center text-slate-800 focus:outline-none focus:border-[#0052cc]"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                          Preço Unitário (R$)
-                        </label>
-                        <input
-                          type="text"
-                          value={newPrecoUnitario}
-                          onChange={(e) => {
-                            const digits = e.target.value.replace(/\D/g, '');
-                            const val = digits ? parseFloat(digits) / 100 : 0;
-                            setNewPrecoUnitario(val.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
-                          }}
-                          placeholder="0,00"
-                          className="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-bold text-right text-slate-800 focus:outline-none focus:border-[#0052cc]"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
-                      <div className="text-xs">
-                        <span className="text-slate-500">Subtotal do item: </span>
-                        <span className="font-extrabold text-[#0052cc]">
-                          {(() => {
-                            const q = Math.max(0, parseFloat(newQtd.replace(',', '.')) || 0);
-                            const p = parseBRLCurrency(newPrecoUnitario);
-                            return (q * p).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-                          })()}
-                        </span>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={handleAddProductToSale}
-                        disabled={!selectedProductCatalog.trim()}
-                        className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
-                      >
-                        <Plus className="w-3.5 h-3.5 stroke-[3]" />
-                        <span>Adicionar Produto à Venda</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* TABELA DE PRODUTOS ADICIONADOS À VENDA */}
-                <div className="space-y-1.5">
-                  <div className="text-xs font-bold text-slate-700 flex items-center justify-between">
-                    <span>Itens Inclusos na Venda ({formProdutos.filter((p) => p.nome.trim()).length})</span>
-                    {formProdutos.filter((p) => p.nome.trim()).length > 0 && (
-                      <span className="text-xs font-extrabold text-slate-900">
-                        Total Produtos: {formatCurrency(
-                          formProdutos.reduce((acc, p) => acc + (p.subtotal ?? p.quantidade * p.valorUnitario), 0)
-                        )}
-                      </span>
-                    )}
-                  </div>
-
-                  {formProdutos.filter((p) => p.nome.trim()).length === 0 ? (
-                    <div className="p-3 text-center text-xs text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-                      Nenhum produto adicionado ainda. Puxe produtos pelo catálogo acima.
-                    </div>
-                  ) : (
-                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl bg-slate-50/50 max-h-48 overflow-y-auto">
-                      {formProdutos
-                        .filter((p) => p.nome.trim())
-                        .map((prod, idx) => {
-                          const subtotal = prod.subtotal ?? prod.quantidade * prod.valorUnitario;
-                          return (
-                            <div
-                              key={prod.id || idx}
-                              className="p-2.5 flex items-center justify-between gap-3 text-xs"
-                            >
-                              <div className="min-w-0 flex-1">
-                                <div className="font-bold text-slate-800 truncate">{prod.nome}</div>
-                                <div className="text-[11px] text-slate-500 truncate flex items-center gap-2">
-                                  {prod.detalhe && (
-                                    <span className="text-slate-600 font-medium">({prod.detalhe})</span>
-                                  )}
-                                  <span>
-                                    {prod.quantidade} {prod.unidade || 'un'} × {formatCurrency(prod.valorUnitario)}
-                                  </span>
-                                </div>
-                              </div>
-
-                              <div className="text-right flex items-center gap-2 flex-shrink-0">
-                                <div className="font-extrabold text-slate-900 text-xs">
-                                  {formatCurrency(subtotal)}
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={() => handleRemoveProductFromSale(idx)}
-                                  className="p-1 text-slate-400 hover:text-rose-600 rounded-lg cursor-pointer"
-                                  title="Remover produto"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* 8. VALOR TOTAL DA VENDA */}
-              <div className="pt-2 border-t border-slate-200">
+              {/* 3. WhatsApp */}
+              <div>
                 <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
-                  Valor Total da Venda <span className="text-rose-500">*</span>
+                  WhatsApp
+                </label>
+                <div className="relative">
+                  <MessageCircle className="w-4 h-4 text-emerald-600 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={formWhatsapp}
+                    onChange={(e) => {
+                      setFormWhatsapp(formatPhone(e.target.value));
+                      if (formError) setFormError('');
+                    }}
+                    placeholder="(11) 99999-9999"
+                    className="w-full pl-10 pr-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-medium focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
+                  />
+                </div>
+              </div>
+
+              {/* 4. Tipo de Cliente */}
+              <div>
+                <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
+                  Tipo de Cliente
+                </label>
+                <div className="relative">
+                  <select
+                    value={formTipoCliente}
+                    onChange={(e) => setFormTipoCliente(e.target.value as ClientType)}
+                    className="w-full appearance-none px-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-sm font-bold focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs pr-10 cursor-pointer"
+                  >
+                    {CLIENT_TYPES_LIST.map((tipo) => (
+                      <option key={tipo} value={tipo}>
+                        {tipo}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                </div>
+              </div>
+
+              {/* 5. Valor Vendido (R$) */}
+              <div>
+                <label className="block text-xs font-bold text-[#0B2046] mb-1 uppercase tracking-wider">
+                  Valor Vendido (R$) <span className="text-rose-500">*</span>
                 </label>
                 <div className="relative">
                   <DollarSign className="w-4 h-4 text-[#0052cc] absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -4012,14 +3631,6 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
                     className="w-full pl-10 pr-4 py-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 text-slate-900 text-base font-black focus:outline-none focus:border-[#0052cc] focus:bg-white transition-all shadow-2xs"
                   />
                 </div>
-                <span className="text-[11px] text-slate-400 mt-0.5 block">
-                  Calculado automaticamente pela soma dos produtos (- Desconto + Frete), editável se necessário.
-                </span>
-                {parseBRLCurrency(formFrete) > 0 && (
-                  <span className="text-[11px] text-emerald-700 font-bold mt-1 block bg-emerald-50 p-2 rounded-xl border border-emerald-200">
-                    ✓ Frete ({formFrete}) registrado na venda, mas não entra na Meta. Valor considerado para a Meta: {formatCurrency(Math.max(0, parseBRLCurrency(formValor) - parseBRLCurrency(formFrete)))}.
-                  </span>
-                )}
               </div>
 
               {formError && (
@@ -4052,24 +3663,6 @@ export const MetasScreen: React.FC<MetasScreenProps> = ({
           </div>
         </div>
       )}
-
-      {/* MODAL CATÁLOGO GERAL DE PRODUTOS */}
-      <ProductSelectionModal
-        isOpen={isProductCatalogModalOpen}
-        onClose={() => setIsProductCatalogModalOpen(false)}
-        clientType={formTipoCliente}
-        priceTable={
-          formTipoCliente.toLowerCase().includes('revenda') || formTipoCliente.toLowerCase().includes('instalador')
-            ? 'tier1'
-            : formTipoCliente.toLowerCase().includes('arquiteto') || formTipoCliente.toLowerCase().includes('engenheiro')
-            ? 'tier2'
-            : 'tier3'
-        }
-        onSelectProduct={(prod) => {
-          handleSelectFromModal(prod);
-          setIsProductCatalogModalOpen(false);
-        }}
-      />
 
       {/* MODAL ALTERAR VENDA */}
       {editingVenda && (

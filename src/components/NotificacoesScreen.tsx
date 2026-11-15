@@ -23,7 +23,6 @@ import {
   ChevronLeft,
   Eye,
   EyeOff,
-  MessageCircle,
   Table,
   BellOff,
 } from 'lucide-react';
@@ -238,14 +237,6 @@ export const NotificacoesScreen: React.FC<NotificacoesScreenProps> = ({
           sessionStorage.setItem('fenix_fup_highlight_id', n.metadata?.followUpId || '');
           sessionStorage.setItem('fenix_fup_highlight_client', n.metadata?.cliente || '');
         } catch {}
-      }
-      if (n.targetTab === 'Chat' || (n.category as string) === 'Chat') {
-        const convId = n.metadata?.conversationId;
-        if (convId) {
-          window.dispatchEvent(
-            new CustomEvent('fenix_select_chat_conversation', { detail: { conversationId: convId } })
-          );
-        }
       }
       onNavigateTab(n.targetTab, n.metadata);
     }

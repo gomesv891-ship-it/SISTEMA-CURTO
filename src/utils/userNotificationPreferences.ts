@@ -17,7 +17,6 @@ export type NotificationCategoryType =
   | 'notas'
   | 'pendencias'
   | 'posvendas'
-  | 'chat'
   | 'outras';
 
 export interface CustomAudioSound {
@@ -102,7 +101,6 @@ export interface UserNotificationPreferences {
     followup: boolean;
     boletos: boolean;
     metas: boolean;
-    chat: boolean;
     estoque: boolean;
     tabelas?: boolean;
     posvendas?: boolean;
@@ -137,7 +135,6 @@ export const DEFAULT_SOUNDS_PER_TYPE: Record<NotificationCategoryType, Notificat
   notas: 'Chime Cristalino com Ressonância',
   pendencias: 'Alerta Duplo Atenção',
   posvendas: 'Campainha Corporativa (Longa)',
-  chat: 'Pop Discreto',
   outras: 'Sino Suave (Padrão)',
 };
 
@@ -156,7 +153,6 @@ export const DEFAULT_NOTIF_PREFS: Omit<UserNotificationPreferences, 'userId'> = 
     notas: 85,
     pendencias: 85,
     posvendas: 85,
-    chat: 85,
     outras: 85,
   },
   scheduleEnabled: false,
@@ -172,7 +168,6 @@ export const DEFAULT_NOTIF_PREFS: Omit<UserNotificationPreferences, 'userId'> = 
     notas: true,
     pendencias: true,
     posvendas: true,
-    chat: true,
     outras: true,
   },
   alerts: {
@@ -182,7 +177,6 @@ export const DEFAULT_NOTIF_PREFS: Omit<UserNotificationPreferences, 'userId'> = 
     followup: true,
     boletos: true,
     metas: true,
-    chat: true,
     estoque: true,
     tabelas: true,
     posvendas: true,
@@ -580,7 +574,6 @@ export function getAllCustomAudioForUser(
     'notas',
     'pendencias',
     'posvendas',
-    'chat',
     'outras',
   ];
 
@@ -937,9 +930,6 @@ export function normalizeCategoryKey(category: string): NotificationCategoryType
   if (c === 'pendências' || c === 'pendencias' || c === 'pendencia') {
     return 'pendencias';
   }
-  if (c === 'chat' || c === 'mensagem' || c === 'mensagens') {
-    return 'chat';
-  }
   if (c === 'tabelas' || c === 'tabela' || c === 'tabela comercial' || c === 'tabela de revenda' || c === 'revenda') {
     return 'tabelas';
   }
@@ -1035,7 +1025,7 @@ export function playUserCustomSoundForCategory(
  */
 export function isAlertCategoryEnabled(
   userId: string,
-  category: 'pendencias' | 'notas' | 'tarefas' | 'followup' | 'boletos' | 'metas' | 'chat' | 'estoque' | 'tabelas'
+  category: 'pendencias' | 'notas' | 'tarefas' | 'followup' | 'boletos' | 'metas' | 'estoque' | 'tabelas'
 ): boolean {
   const prefs = getUserNotificationPreferences(userId);
   return (prefs.alerts as any)[category] ?? true;

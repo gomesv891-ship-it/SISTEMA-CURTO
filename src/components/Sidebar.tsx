@@ -7,7 +7,9 @@ import {
   Target,
   Package,
   CheckSquare,
+  NotebookPen,
   Settings,
+  Tag,
   X,
   LogOut,
 } from 'lucide-react';
@@ -48,6 +50,8 @@ const REMOVED_MENU_TAB_IDS = new Set([
   'notas',
   'vendas',
   'venda',
+  'negociacoes',
+  'negociações',
 ]);
 
 const MENU_SECTIONS: MenuSection[] = [
@@ -58,6 +62,7 @@ const MENU_SECTIONS: MenuSection[] = [
       { id: 'Calculadora', label: 'Calculadora', icon: Calculator },
       { id: 'Orçamentos', label: 'Orçamentos', icon: FileText },
       { id: 'Follow-up', label: 'Follow-up', icon: PhoneCall },
+      { id: 'Promoções Ativas', label: 'Promoções Ativas', icon: Tag },
       { id: 'Metas', label: 'Metas', icon: Target },
     ],
   },
@@ -66,6 +71,7 @@ const MENU_SECTIONS: MenuSection[] = [
     items: [
       { id: 'Produtos', label: 'Produtos', icon: Package },
       { id: 'Tarefas', label: 'Tarefas', icon: CheckSquare },
+      { id: 'Anotações', label: 'Anotações', icon: NotebookPen },
     ],
   },
   {
@@ -170,7 +176,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     (item.id === 'Estoque' && (currentTab === 'Materiais' || currentTab === 'Controle de Estoque' || currentTab === 'Estoque')) ||
                     (item.id === 'Metas' && (currentTab === 'Meta' || currentTab === 'Metas')) ||
                     (item.id === 'Pendências' && (currentTab === 'Pendencias' || currentTab === 'Pendências')) ||
-                    (item.id === 'Follow-up' && (currentTab === 'FollowUp' || currentTab === 'Follow-up'));
+                    (item.id === 'Follow-up' && (currentTab === 'FollowUp' || currentTab === 'Follow-up')) ||
+                    (item.id === 'Promoções Ativas' && (currentTab === 'Promocoes Ativas' || currentTab === 'Promoções Ativas')) ||
+                    (item.id === 'Anotações' && (currentTab === 'Anotacoes' || currentTab === 'Anotações'));
 
                   return (
                     <button

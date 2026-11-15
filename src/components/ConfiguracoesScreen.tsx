@@ -50,8 +50,6 @@ import {
   Trophy,
   Truck,
 } from 'lucide-react';
-import { CustosVariaveisConfigView } from './CustosVariaveisConfigView';
-import { CustosConfigView } from './custos/CustosConfigView';
 import { CustosTarkettTab } from './custos/CustosTarkettTab';
 import { UserAvatar } from './UserAvatar';
 import { AudioSnippetEditor } from './AudioSnippetEditor';
@@ -125,8 +123,6 @@ interface ConfiguracoesScreenProps {
 
 type TabType =
   | 'Gestão de Usuários'
-  | 'Custos'
-  | 'Custos Variáveis'
   | 'Tarkett'
   | 'Notificações & Alertas'
   | 'Segurança & Acesso'
@@ -152,9 +148,11 @@ const ALL_MODULES = [
   'Calculadora',
   'Orçamentos',
   'Follow-up',
+  'Promoções Ativas',
   'Metas',
   'Produtos',
   'Tarefas',
+  'Anotações',
   'Configurações',
 ];
 
@@ -169,7 +167,7 @@ const INITIAL_USERS: FenixUser[] = [
     cargo: 'Consultora Comercial',
     acesso: 'CRM Completo',
     status: 'Ativo',
-    modulos: ['Clientes', 'Calculadora', 'Orçamentos', 'Follow-up', 'Metas', 'Produtos', 'Tarefas', 'Configurações'],
+    modulos: ['Clientes', 'Calculadora', 'Orçamentos', 'Follow-up', 'Promoções Ativas', 'Metas', 'Produtos', 'Tarefas', 'Anotações', 'Configurações'],
     loginSugerido: 'vanessa.gomes',
     avatarIniciais: 'VG',
     avatarBg: 'bg-[#1D4ED8]',
@@ -181,7 +179,7 @@ const INITIAL_USERS: FenixUser[] = [
     cargo: 'Consultora Comercial',
     acesso: 'CRM Completo',
     status: 'Ativo',
-    modulos: ['Clientes', 'Calculadora', 'Orçamentos', 'Follow-up', 'Metas', 'Produtos', 'Tarefas', 'Configurações'],
+    modulos: ['Clientes', 'Calculadora', 'Orçamentos', 'Follow-up', 'Promoções Ativas', 'Metas', 'Produtos', 'Tarefas', 'Anotações', 'Configurações'],
     loginSugerido: 'jhessica.camargo',
     avatarIniciais: 'JC',
     avatarBg: 'bg-[#0B2046]',
@@ -1303,15 +1301,6 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
       iconBg: 'bg-indigo-50',
       iconColor: 'text-indigo-700',
     },
-    {
-      id: 'chat',
-      label: 'Chat / Mensagens',
-      shortDesc: 'Mensagens diretas e em grupos',
-      description: 'Toque para novas mensagens privadas e em grupo no chat',
-      icon: MessageCircle,
-      iconBg: 'bg-teal-50',
-      iconColor: 'text-teal-700',
-    },
   ];
 
   // ==========================================
@@ -1425,27 +1414,12 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
         {(
           [
             { id: 'Gestão de Usuários', label: 'Gestão de Usuários', icon: Users },
-            ...(isDirector
-              ? [
-                  {
-                    id: 'Custos' as TabType,
-                    label: 'Custos',
-                    icon: DollarSign,
-                    isExclusiveDirector: true,
-                  },
-                ]
-              : [
-                  {
-                    id: 'Tarkett' as TabType,
-                    label: 'Simulador Tarkett',
-                    icon: Calculator,
-                  },
-                ]),
+            { id: 'Tarkett', label: 'Simulador Tarkett', icon: Calculator },
             { id: 'Notificações & Alertas', label: 'Notificações & Alertas', icon: Bell },
             { id: 'Segurança & Acesso', label: 'Segurança & Acesso', icon: Shield },
             { id: 'Mensagem WhatsApp', label: 'Mensagem WhatsApp', icon: MessageSquare },
             { id: 'Configurações de Metas', label: 'Configurações de Metas', icon: Target },
-          ] as { id: TabType; label: string; icon: React.FC<{ className?: string }>; isExclusiveDirector?: boolean }[]
+          ] as { id: TabType; label: string; icon: React.FC<{ className?: string }> }[]
         ).map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
@@ -1462,17 +1436,6 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
             >
               <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-slate-400'}`} />
               <span>{tab.label}</span>
-              {tab.isExclusiveDirector && (
-                <span
-                  className={`text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded-md ${
-                    isActive
-                      ? 'bg-amber-400 text-slate-900'
-                      : 'bg-amber-100 text-amber-800'
-                  }`}
-                >
-                  Diretor
-                </span>
-              )}
             </button>
           );
         })}
@@ -3116,20 +3079,9 @@ export const ConfiguracoesScreen: React.FC<ConfiguracoesScreenProps> = ({
       )}
 
       {/* ======================================================== */}
-      {/* 6. CONTEÚDO DA ABA 6: CUSTOS & PARÂMETROS GERAIS          */}
+      {/* 6. SIMULAÇÃO TARKETT                                     */}
       {/* ======================================================== */}
-      {isDirector && (activeTab === 'Custos' || activeTab === 'Custos Variáveis') && (
-        <CustosConfigView
-          currentUserName={currentUserName}
-          isDirector={isDirector}
-          showToast={showToast}
-        />
-      )}
-
-      {/* ======================================================== */}
-      {/* 7. SIMULAÇÃO TARKETT P/ DEMAIS USUÁRIOS (SEM ÁREA CUSTOS) */}
-      {/* ======================================================== */}
-      {!isDirector && activeTab === 'Tarkett' && (
+      {activeTab === 'Tarkett' && (
         <CustosTarkettTab
           currentUserName={currentUserName}
           isDirector={false}

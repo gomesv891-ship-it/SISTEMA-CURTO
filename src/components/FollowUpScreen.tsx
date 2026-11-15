@@ -41,30 +41,20 @@ import {
   FollowUpStatus,
   FollowUpHistoryEntry,
   ClientRecord,
-  PosVendaItem,
-  FormaPagamentoItem,
   SavedOrcamento,
   OrcamentoStatus,
 } from '../types';
-import {
-  PaymentSplitManager,
-  isPaymentSplitComplete,
-  summarizePayments,
-  isFormaCartaoCredito,
-} from './common/PaymentSplitManager';
 import { ProspeccaoView } from './followup/ProspeccaoView';
 import { ModalVerOrcamentoFollowUp } from './followup/ModalVerOrcamentoFollowUp';
 import { ModalSemOrcamentoVinculado } from './followup/ModalSemOrcamentoVinculado';
 import { ModalSelecionarOrcamentoFollowUp } from './followup/ModalSelecionarOrcamentoFollowUp';
 import { isRecordOfResponsible, getSellerIdForUser } from '../utils/userDataFilter';
 import { getUserIdByName } from '../utils/auth';
-import { triggerTwoDayAlert } from '../utils/followupNotifications';
 import { ResponsibleFilterTabs } from './ResponsibleFilterTabs';
 import {
   saveItemToSupabase,
   saveWholeCollectionToSupabase,
   getSupabaseClient,
-  executeWithRetry,
   safeMergeLists,
 } from '../utils/supabaseClient';
 import {
@@ -72,9 +62,45 @@ import {
   formatOrcamentoMessage,
 } from '../utils/configOrcamentoEMetas';
 import { syncFollowUpStatusWithMetasAndVendas } from '../utils/followUpSalesSync';
-import { syncSingleMetaSaleToVendas } from '../utils/vendasService';
 import { isFollowUpAtrasado, isFollowUpRetornoHoje } from '../utils/followUpCycles';
-import { syncAllSavedOrcamentosToFollowUp } from '../utils/orcamentoFollowUpSync';
+import {
+  syncAllSavedOrcamentosToFollowUp,
+  deduplicateFollowUpList,
+  findMatchingFollowUpIndex,
+  resolveOrcamentoResponsible,
+} from '../utils/orcamentoFollowUpSync';
+import {
+  ListaAcompanhamentoOrcamentos,
+  TrackingListStatus,
+  TrackingOrcamentoRow,
+} from './followup/ListaAcompanhamentoOrcamentos';
+
+const readLocalOrcamentosSnapshot = (): SavedOrcamento[] => {
+  try {
+    const map = new Map<string, SavedOrcamento>();
+    const raw1 = localStorage.getItem('fenix_orcamentos_history');
+    if (raw1) {
+      const p1 = JSON.parse(raw1);
+      if (Array.isArray(p1)) {
+        p1.forEach((o) => {
+          if (o && o.id) map.set(o.id, o);
+        });
+      }
+    }
+    const raw2 = localStorage.getItem('fenix_saved_orcamentos');
+    if (raw2) {
+      const p2 = JSON.parse(raw2);
+      if (Array.isArray(p2)) {
+        p2.forEach((o) => {
+          if (o && o.id && !map.has(o.id)) map.set(o.id, o);
+        });
+      }
+    }
+    return Array.from(map.values());
+  } catch {
+    return [];
+  }
+};
 
 interface FollowUpScreenProps {
   currentUserName?: string;
@@ -85,8 +111,6 @@ interface FollowUpScreenProps {
 
 const STORAGE_KEY = 'fenix_followup_cards_v2';
 const CLIENTS_STORAGE_KEY = 'fenix_clients_db';
-const POS_VENDAS_STORAGE_KEY = 'fenix_pos_vendas_db';
-const METAS_SALES_STORAGE_KEY = 'fenix_metas_sales_db';
 const ORCAMENTOS_HISTORY_KEY = 'fenix_orcamentos_history';
 const ORCAMENTOS_SAVED_KEY = 'fenix_saved_orcamentos';
 
@@ -390,6 +414,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     }
   }, [activeSection]);
 
+  // Sub-visualização dentro de ORÇAMENTOS: 'visao_geral' | 'lista_acompanhamento'
+  const [orcamentosSubView, setOrcamentosSubView] = useState<'visao_geral' | 'lista_acompanhamento'>('visao_geral');
+
+  // Orçamentos oficiais carregados do Supabase + localStorage para a Lista de Acompanhamento
+  const [allOrcamentos, setAllOrcamentos] = useState<SavedOrcamento[]>(() =>
+    readLocalOrcamentosSnapshot()
+  );
+
   // Clients database for accurate clientType lookup
   const [clients, setClients] = useState<ClientRecord[]>([]);
 
@@ -440,9 +472,6 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   const [statusError, setStatusError] = useState('');
   const [numeroPedidoInput, setNumeroPedidoInput] = useState('');
   const [pedidoError, setPedidoError] = useState('');
-  const [formaPagamentoInput, setFormaPagamentoInput] = useState<'Pix' | 'Boleto' | 'Cartão'>('Pix');
-  const [parcelasInput, setParcelasInput] = useState<string>('1x');
-  const [statusPayments, setStatusPayments] = useState<FormaPagamentoItem[]>([]);
 
   // History modal for viewing timeline of a budget
   const [viewingHistoryBudget, setViewingHistoryBudget] = useState<FollowUpItem | null>(null);
@@ -721,36 +750,37 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
         }
       });
 
-      // Constrói lista inicial de follow-up com status normalizado e sincronizado com orçamentos
-      let currentItems: FollowUpItem[] = mergedFup
-        .filter((it: FollowUpItem) => !(it.cliente || '').toLowerCase().includes('roberto silveira'))
-        .map((it) => {
-          const matchingSoldOrc =
-            soldOrcMap.get(it.orcamentoId || '') ||
-            soldOrcMap.get(it.id.replace('fup_', '')) ||
-            soldOrcMap.get(it.id);
+      // Constrói lista inicial de follow-up com status normalizado, 1:1 com orçamentos
+      let currentItems: FollowUpItem[] = deduplicateFollowUpList(
+        mergedFup
+          .filter((it: FollowUpItem) => !(it.cliente || '').toLowerCase().includes('roberto silveira'))
+          .map((it) => {
+            const matchingSoldOrc =
+              soldOrcMap.get(it.orcamentoId || '') ||
+              soldOrcMap.get(it.id.replace('fup_', '')) ||
+              soldOrcMap.get(it.id);
 
-          const isItemSold = isSoldStatus(it.status) || Boolean(matchingSoldOrc);
-          const finalStatus = isItemSold ? 'Vendido' : normalizeStatus(it.status);
-          const resolvedVal =
-            parseMonetaryValue(it.valor) ||
-            parseMonetaryValue(matchingSoldOrc?.totalFinal) ||
-            parseMonetaryValue(matchingSoldOrc?.valor) ||
-            0;
+            const isItemSold = isSoldStatus(it.status) || Boolean(matchingSoldOrc);
+            const finalStatus = isItemSold ? 'Vendido' : normalizeStatus(it.status);
+            const resolvedVal =
+              parseMonetaryValue(it.valor) ||
+              parseMonetaryValue(matchingSoldOrc?.totalFinal) ||
+              parseMonetaryValue(matchingSoldOrc?.valor) ||
+              0;
 
-          return {
-            ...it,
-            status: finalStatus,
-            valor: resolvedVal,
-          };
-        });
+            return {
+              ...it,
+              status: finalStatus,
+              valor: resolvedVal,
+            };
+          })
+      );
 
-      // 4. Auto-sync orçamentos emitidos que ainda não estão na esteira de Follow-up
-      let updated = false;
+      // 4. Auto-sync 1:1 com orçamentos emitidos e atualiza existentes quando editados
+      let updated = currentItems.length !== mergedFup.length;
       mergedOrcs.forEach((orc) => {
-        const exists = currentItems.some(
-          (it) => it.orcamentoId === orc.id || it.id === `fup_${orc.id}` || it.id === orc.id
-        );
+        if (!orc || !orc.id) return;
+        const existingIdx = findMatchingFollowUpIndex(currentItems, String(orc.id));
         const creationDate =
           orc.savedAt || orc.createdAt || orc.dataCriacao || orc.data || new Date().toISOString();
         const isSold = isSoldStatus(orc.status);
@@ -760,25 +790,26 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           !isLost &&
           isFollowUpAtrasado({
             id: orc.id,
-            cliente: orc.clienteNome || 'Cliente',
-            valor: orc.totalGeral || 0,
+            cliente: orc.clienteNome || orc.clientName || 'Cliente',
+            valor: orc.totalFinal || orc.totalGeral || 0,
             status: orc.status || 'Orçamento Enviado',
             dataEntradaFollowUp: creationDate,
           } as any);
 
-        const sellerName =
-          orc.consultoraName ||
-          orc.vendedor ||
-          orc.registeredBy ||
-          currentUserName ||
-          'Consultora Fênix';
+        const sellerName = resolveOrcamentoResponsible(orc, currentUserName || 'Consultora Fênix');
         const sellerId =
           orc.vendedorId ||
+          orc.responsavelId ||
           orc.consultoraId ||
           getUserIdByName(sellerName) ||
           getSellerIdForUser(sellerName);
 
-        if (!exists) {
+        const orcValue = parseMonetaryValue(orc.totalFinal) || parseMonetaryValue(orc.valor) || 0;
+        const orcClient = (orc.clientName || orc.cliente || 'Cliente Sem Nome').trim();
+        const orcTitle = (orc.nomeOrcamento || orc.items?.[0]?.descricao || 'Orçamento de Materiais').trim();
+        const orcPhone = (orc.clientContact || orc.telefone || '').trim();
+
+        if (existingIdx < 0) {
           const initialStatus: FollowUpStatus = isSold
             ? 'Vendido'
             : isLost
@@ -789,17 +820,15 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
 
           const newItem: FollowUpItem = {
             id: `fup_${orc.id}`,
-            pedido:
-              orc.id.replace('orc_', '').slice(-4) ||
-              String(Math.floor(1000 + Math.random() * 9000)),
+            pedido: orc.pedido || orc.orderNum || '',
             orcamentoId: orc.id,
             clientId: orc.clientId,
-            cliente: orc.clientName || orc.cliente || 'Cliente Sem Nome',
+            cliente: orcClient,
             clientType: orc.clientType || 'Cliente Final',
-            nomeOrcamento: orc.nomeOrcamento || 'Orçamento de Materiais',
-            produto: orc.items?.[0]?.descricao || 'Pisos e Revestimentos Fênix',
-            telefone: orc.clientContact || orc.telefone || '',
-            valor: Number(orc.totalFinal) || Number(orc.valor) || 0,
+            nomeOrcamento: orcTitle,
+            produto: orc.items?.[0]?.descricao || orcTitle || 'Pisos e Revestimentos Fênix',
+            telefone: orcPhone,
+            valor: orcValue,
             dataCriacao: creationDate.includes('T') ? creationDate.split('T')[0] : creationDate,
             dataEntradaFollowUp: creationDate,
             dataAtualizacao: new Date().toISOString(),
@@ -821,6 +850,10 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             responsavel: sellerName,
             responsavelId: sellerId,
             createdAt: creationDate,
+            lembretesAtivos: !isSold && !isLost,
+            frete: orc.freteAtivo ? orc.freteValor : 0,
+            desconto: orc.descontoValor,
+            produtos: orc.items,
             historico: [
               {
                 id: `h_init_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
@@ -843,41 +876,78 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           currentItems = [newItem, ...currentItems];
           updated = true;
         } else {
-          // Se já existe, mas o orçamento foi vendido no histórico e o item ainda não estava como Vendido
-          if (isSold) {
-            currentItems = currentItems.map((it) => {
-              if (
-                (it.orcamentoId === orc.id || it.id === `fup_${orc.id}` || it.id === orc.id) &&
-                !isSoldStatus(it.status)
-              ) {
-                updated = true;
-                return {
-                  ...it,
-                  status: 'Vendido',
-                  valor: parseMonetaryValue(it.valor) || parseMonetaryValue(orc.totalFinal) || parseMonetaryValue(orc.valor) || 0,
-                  dataAtualizacao: new Date().toISOString(),
-                };
-              }
-              return it;
-            });
+          const existing = currentItems[existingIdx];
+          const orcUpdatedTs = new Date(orc.updatedAt || orc.savedAt || 0).getTime() || 0;
+          const fupUpdatedTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+          const orcIsNewer = orcUpdatedTs > fupUpdatedTs + 1000;
+
+          const targetStatus: FollowUpStatus = isSold
+            ? 'Vendido'
+            : isLost
+            ? 'Perdido'
+            : existing.status;
+          const nextValor =
+            orcIsNewer || !parseMonetaryValue(existing.valor)
+              ? orcValue || parseMonetaryValue(existing.valor)
+              : parseMonetaryValue(existing.valor);
+          const nextCliente = orcIsNewer || !existing.cliente ? orcClient : existing.cliente;
+          const nextTitle = orcIsNewer || !existing.nomeOrcamento ? orcTitle : existing.nomeOrcamento;
+          const nextPhone = orcPhone || existing.telefone || '';
+          const nextResp =
+            orcIsNewer || (!existing.responsavel && !existing.vendedor)
+              ? sellerName
+              : existing.responsavel || existing.vendedor || sellerName;
+
+          const hasChanges =
+            existing.orcamentoId !== orc.id ||
+            existing.status !== targetStatus ||
+            Math.abs(parseMonetaryValue(existing.valor) - nextValor) > 0.01 ||
+            existing.cliente !== nextCliente ||
+            existing.nomeOrcamento !== nextTitle ||
+            existing.telefone !== nextPhone ||
+            existing.responsavel !== nextResp;
+
+          if (hasChanges) {
+            updated = true;
+            currentItems[existingIdx] = {
+              ...existing,
+              orcamentoId: orc.id,
+              status: targetStatus,
+              clientId: orc.clientId || existing.clientId,
+              cliente: existing.trackingOverrides?.cliente ? existing.cliente : nextCliente,
+              clientType: orc.clientType || existing.clientType,
+              nomeOrcamento: existing.trackingOverrides?.nomeOrcamento
+                ? existing.nomeOrcamento
+                : nextTitle,
+              telefone: existing.trackingOverrides?.telefone ? existing.telefone : nextPhone,
+              valor: existing.trackingOverrides?.valor ? existing.valor : nextValor,
+              vendedor: nextResp,
+              responsavel: nextResp,
+              vendedorId: sellerId || existing.vendedorId,
+              responsavelId: sellerId || existing.responsavelId,
+              produtos: orc.items || existing.produtos,
+              frete: orc.freteAtivo ? orc.freteValor || 0 : existing.frete,
+              desconto: orc.descontoValor ?? existing.desconto,
+              lembretesAtivos:
+                targetStatus === 'Vendido' || targetStatus === 'Perdido'
+                  ? false
+                  : existing.lembretesAtivos,
+              dataAtualizacao: orcIsNewer ? orc.updatedAt || new Date().toISOString() : existing.dataAtualizacao,
+            };
           }
         }
       });
 
+      currentItems = deduplicateFollowUpList(currentItems);
+
       // 5. Salva estado sincronizado
       localStorage.setItem(STORAGE_KEY, JSON.stringify(currentItems));
       localStorage.setItem(ORCAMENTOS_HISTORY_KEY, JSON.stringify(mergedOrcs));
+      setAllOrcamentos(mergedOrcs);
       setItems(currentItems);
 
       if (updated && client) {
-        executeWithRetry(async () => {
-          await client.from('fenix_kv_store').upsert({
-            key: STORAGE_KEY,
-            data: currentItems,
-            updated_at: new Date().toISOString(),
-            updated_by: currentUserName,
-          });
-        }).catch(() => {});
+        saveWholeCollectionToSupabase(STORAGE_KEY, currentItems, currentUserName).catch(() => {});
       }
     } catch (err) {
       console.error('Erro na sincronização de dados:', err);
@@ -895,12 +965,14 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
 
     window.addEventListener('fenix_followup_updated', handleSync);
     window.addEventListener('fenix_orcamentos_updated', handleSync);
+    window.addEventListener('fenix_clients_updated', handleSync);
     window.addEventListener('storage', handleSync);
     window.addEventListener('focus', handleSync);
 
     return () => {
       window.removeEventListener('fenix_followup_updated', handleSync);
       window.removeEventListener('fenix_orcamentos_updated', handleSync);
+      window.removeEventListener('fenix_clients_updated', handleSync);
       window.removeEventListener('storage', handleSync);
       window.removeEventListener('focus', handleSync);
     };
@@ -909,42 +981,47 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
   // Salva no localStorage e central Supabase quando itens atualizam
   const persistItems = (newItems: FollowUpItem[], singleItemToSave?: FollowUpItem) => {
     isPersistingRef.current = true;
-    setItems(newItems);
+    const dedupedNewItems = deduplicateFollowUpList(newItems);
+    setItems(dedupedNewItems);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(newItems));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(dedupedNewItems));
       if (singleItemToSave) {
         saveItemToSupabase(STORAGE_KEY, singleItemToSave, 'id', currentUserName).catch(() => {});
 
-        // Sincroniza bidirecionalmente no histórico de orçamentos se possuir orcamentoId
+        // Sincroniza bidirecionalmente com os orçamentos salvos mantendo vínculo de status e pedido
         if (singleItemToSave.orcamentoId) {
           const orcId = singleItemToSave.orcamentoId;
+          const bareOrcId = orcId.replace(/^orc_/, '');
           const isSold = isSoldStatus(singleItemToSave.status);
-          const rawOrcs = localStorage.getItem(ORCAMENTOS_HISTORY_KEY);
-          if (rawOrcs) {
+          const syncOrcKey = (key: string) => {
+            const rawOrcs = localStorage.getItem(key);
+            if (!rawOrcs) return;
             try {
               const orcs: any[] = JSON.parse(rawOrcs);
-              if (Array.isArray(orcs)) {
-                const updatedOrcs = orcs.map((o) =>
-                  o.id === orcId || o.id === orcId.replace('orc_', '')
-                    ? {
-                        ...o,
-                        status: isSold ? 'Vendido' : singleItemToSave.status,
-                        updatedAt: new Date().toISOString(),
-                      }
-                    : o
-                );
-                localStorage.setItem(ORCAMENTOS_HISTORY_KEY, JSON.stringify(updatedOrcs));
-                const targetOrc = updatedOrcs.find(
-                  (o) => o.id === orcId || o.id === orcId.replace('orc_', '')
-                );
-                if (targetOrc) {
-                  saveItemToSupabase(ORCAMENTOS_HISTORY_KEY, targetOrc, 'id', currentUserName).catch(
-                    () => {}
-                  );
+              if (!Array.isArray(orcs)) return;
+              let matchedOrc: any = null;
+              const updatedOrcs = orcs.map((o) => {
+                if (o && (o.id === orcId || o.id === bareOrcId || String(o.id).replace(/^orc_/, '') === bareOrcId)) {
+                  matchedOrc = {
+                    ...o,
+                    status: isSold ? 'Vendido' : singleItemToSave.status,
+                    ...(isSold && singleItemToSave.pedido ? { pedido: singleItemToSave.pedido } : {}),
+                    followUpId: singleItemToSave.id,
+                    updatedAt: new Date().toISOString(),
+                  };
+                  return matchedOrc;
                 }
+                return o;
+              });
+              if (matchedOrc) {
+                localStorage.setItem(key, JSON.stringify(updatedOrcs));
+                saveItemToSupabase(key, matchedOrc, 'id', currentUserName).catch(() => {});
               }
             } catch {}
-          }
+          };
+
+          syncOrcKey(ORCAMENTOS_HISTORY_KEY);
+          syncOrcKey(ORCAMENTOS_SAVED_KEY);
           window.dispatchEvent(new Event('fenix_orcamentos_updated'));
         }
       }
@@ -954,8 +1031,159 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     } finally {
       setTimeout(() => {
         isPersistingRef.current = false;
-      }, 1200);
+      }, 2500);
     }
+  };
+
+  // Persiste alterações exclusivas da Lista de Acompanhamento no Supabase (fenix_followup_cards_v2)
+  // REGRA ESTRITA: Não modifica nem apaga o orçamento original em fenix_orcamentos_history / fenix_saved_orcamentos
+  const persistTrackingOnlyItem = async (updatedItem: FollowUpItem) => {
+    isPersistingRef.current = true;
+    try {
+      const idx = findMatchingFollowUpIndex(items, updatedItem.orcamentoId || updatedItem.id);
+      const nextList =
+        idx >= 0
+          ? items.map((it, i) => (i === idx ? updatedItem : it))
+          : [updatedItem, ...items];
+      const deduped = deduplicateFollowUpList(nextList);
+      setItems(deduped);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(deduped));
+      } catch {}
+      await saveItemToSupabase(STORAGE_KEY, updatedItem, 'id', currentUserName);
+      window.dispatchEvent(new Event('fenix_followup_updated'));
+    } finally {
+      setTimeout(() => {
+        isPersistingRef.current = false;
+      }, 2000);
+    }
+  };
+
+  const buildBaseFollowUpFromRow = (row: TrackingOrcamentoRow): FollowUpItem => {
+    if (row.sourceFollowUp) return row.sourceFollowUp;
+    const nowIso = new Date().toISOString();
+    const mappedStatus: FollowUpStatus =
+      row.status === 'Vendido'
+        ? 'Vendido'
+        : row.status === 'Não vendido'
+        ? 'Perdido'
+        : 'Orçamento Enviado';
+    const sellerId =
+      row.responsavelId || getUserIdByName(row.responsavel) || getSellerIdForUser(row.responsavel);
+    return {
+      id: `fup_${row.orcamentoId}`,
+      pedido: row.pedido || '',
+      orcamentoId: row.orcamentoId,
+      clientId: row.clientId,
+      cliente: row.cliente,
+      clientType: row.clientType,
+      nomeOrcamento: row.nomeOrcamento,
+      produto: row.nomeOrcamento,
+      telefone: row.telefone,
+      valor: row.valor,
+      dataCriacao: row.creationDateStr || row.creationDisplayDate,
+      dataEntradaFollowUp: row.sourceOrcamento.savedAt || nowIso,
+      dataAtualizacao: nowIso,
+      status: mappedStatus,
+      observacao: row.observacao,
+      vendedor: row.responsavel,
+      vendedorId: sellerId,
+      criadoPor: row.responsavel,
+      criadoPorId: sellerId,
+      creatorId: sellerId,
+      responsavel: row.responsavel,
+      responsavelId: sellerId,
+      createdAt: row.sourceOrcamento.savedAt || nowIso,
+      updatedAt: nowIso,
+      lembretesAtivos: mappedStatus === 'Orçamento Enviado',
+      produtos: row.sourceOrcamento.items,
+      historico: [],
+    };
+  };
+
+  const handleTrackingStatusUpdate = async (
+    row: TrackingOrcamentoRow,
+    newStatus: TrackingListStatus
+  ) => {
+    const base = buildBaseFollowUpFromRow(row);
+    const nowIso = new Date().toISOString();
+    const updatedItem: FollowUpItem = {
+      ...base,
+      trackingStatus: newStatus,
+      trackingUpdatedAt: nowIso,
+      dataAtualizacao: nowIso,
+      updatedAt: nowIso,
+    };
+    await persistTrackingOnlyItem(updatedItem);
+    showToast(`✓ Status atualizado para "${newStatus}" na Lista de Acompanhamento.`);
+  };
+
+  const handleSaveTrackingEdit = async (
+    row: TrackingOrcamentoRow,
+    edited: {
+      cliente: string;
+      telefone: string;
+      nomeOrcamento: string;
+      sqm: number;
+      valor: number;
+      status: TrackingListStatus;
+      observacao: string;
+      restoreOriginal?: boolean;
+    }
+  ) => {
+    const base = buildBaseFollowUpFromRow(row);
+    const nowIso = new Date().toISOString();
+    const updatedItem: FollowUpItem = {
+      ...base,
+      cliente: edited.cliente,
+      telefone: edited.telefone,
+      nomeOrcamento: edited.nomeOrcamento,
+      customSqm: edited.restoreOriginal ? undefined : edited.sqm,
+      valor: edited.valor,
+      observacao: edited.observacao,
+      trackingStatus: edited.status,
+      trackingUpdatedAt: nowIso,
+      dataAtualizacao: nowIso,
+      updatedAt: nowIso,
+      trackingOverrides: edited.restoreOriginal
+        ? undefined
+        : {
+            cliente: true,
+            telefone: true,
+            nomeOrcamento: true,
+            sqm: true,
+            valor: true,
+            observacao: true,
+          },
+    };
+    await persistTrackingOnlyItem(updatedItem);
+    showToast(
+      edited.restoreOriginal
+        ? '✓ Dados restaurados conforme o orçamento original.'
+        : '✓ Informações da Lista de Acompanhamento atualizadas com sucesso.'
+    );
+  };
+
+  const handleRemoveFromTrackingList = async (row: TrackingOrcamentoRow) => {
+    const base = buildBaseFollowUpFromRow(row);
+    const nowIso = new Date().toISOString();
+    const updatedItem: FollowUpItem = {
+      ...base,
+      hiddenFromTrackingList: true,
+      trackingUpdatedAt: nowIso,
+      updatedAt: nowIso,
+    };
+    await persistTrackingOnlyItem(updatedItem);
+    showToast('✓ Registro removido da Lista de Acompanhamento. Orçamento original mantido intacto.');
+  };
+
+  const handleViewTrackingOrcamento = (row: TrackingOrcamentoRow) => {
+    const baseFollowUp = buildBaseFollowUpFromRow(row);
+    setViewingOrcamentoData({
+      followUp: baseFollowUp,
+      clientBudgets: [row.sourceOrcamento],
+      selectedOrcamento: row.sourceOrcamento,
+    });
   };
 
   // Helper to resolve client type accurately
@@ -1402,24 +1630,10 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     setSelectedNewStatus(budget.status);
     setStatusComment('');
     setStatusError('');
-    setNumeroPedidoInput(budget.pedido ? String(budget.pedido).replace(/^#+/, '') : '');
+    setNumeroPedidoInput(
+      budget.status === 'Vendido' && budget.pedido ? String(budget.pedido).replace(/^#+/, '') : ''
+    );
     setPedidoError('');
-    setFormaPagamentoInput(budget.formaPagamento || 'Pix');
-    setParcelasInput(budget.parcelas || '1x');
-
-    // Inicializa formas de pagamento (múltiplos pagamentos)
-    if (budget.formasPagamento && budget.formasPagamento.length > 0) {
-      setStatusPayments(budget.formasPagamento);
-    } else {
-      const budgetVal = Number(budget.valor) || 0;
-      setStatusPayments([
-        {
-          id: `pay_fup_${Date.now()}`,
-          forma: budget.formaPagamento || 'Pix',
-          valor: budgetVal,
-        },
-      ]);
-    }
   };
 
   // Save Status Change
@@ -1427,16 +1641,11 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     if (!transitioningBudget) return;
 
     const cleanPedido = numeroPedidoInput.trim().replace(/^#+/, '');
-    const budgetVal = Number(transitioningBudget.valor) || 0;
 
-    // Se o status for Vendido, o número do pedido e divisão exata de pagamentos são obrigatórios
+    // Se o status for Vendido, solicitar somente o número do pedido
     if (selectedNewStatus === 'Vendido') {
       if (!cleanPedido) {
-        setPedidoError('Informe o número do pedido para registrar a venda.');
-        return;
-      }
-      if (!isPaymentSplitComplete(statusPayments, budgetVal)) {
-        setStatusError('A soma das formas de pagamento deve ser exatamente igual ao valor da venda.');
+        setPedidoError('Informe o número do pedido para confirmar a venda.');
         return;
       }
     }
@@ -1448,11 +1657,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     const hora = String(now.getHours()).padStart(2, '0');
     const min = String(now.getMinutes()).padStart(2, '0');
 
-    const commentText = statusComment.trim();
-    const paymentSummary =
-      selectedNewStatus === 'Vendido'
-        ? summarizePayments(statusPayments)
-        : transitioningBudget.formaPagamento || 'Pix';
+    const commentText = selectedNewStatus === 'Vendido' ? '' : statusComment.trim();
 
     const newHistoryEntry: FollowUpHistoryEntry = {
       id: `h_${Date.now()}`,
@@ -1462,32 +1667,24 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
       novoStatus: selectedNewStatus,
       observacao:
         selectedNewStatus === 'Vendido'
-          ? `Venda confirmada. Pedido #${cleanPedido} • ${paymentSummary}${commentText ? ` — ${commentText}` : ''}`
+          ? `Venda confirmada. Pedido #${cleanPedido}`
           : commentText || `Status alterado para ${selectedNewStatus}`,
       usuario: currentUserName,
       timestamp: now.getTime(),
     };
 
     const isFinished = selectedNewStatus === 'Vendido' || selectedNewStatus === 'Perdido';
-
-    // Se for Cartão de Crédito, obtém as parcelas do split de pagamento ou do input
-    const cardPay = statusPayments.find((p) => isFormaCartaoCredito(p.forma));
-    const resolvedParcelas =
-      selectedNewStatus === 'Vendido'
-        ? cardPay?.parcelas || (formaPagamentoInput === 'Cartão' ? parcelasInput : undefined)
-        : transitioningBudget.parcelas;
+    const wasPreviouslySold = isSoldStatus(transitioningBudget.status);
 
     const updatedBudget: FollowUpItem = {
       ...transitioningBudget,
       status: selectedNewStatus,
       lembretesAtivos: isFinished ? false : (transitioningBudget.lembretesAtivos ?? true),
       pedido: selectedNewStatus === 'Vendido' ? cleanPedido : transitioningBudget.pedido,
-      formaPagamento: selectedNewStatus === 'Vendido' ? paymentSummary : transitioningBudget.formaPagamento,
-      formasPagamento: selectedNewStatus === 'Vendido' ? statusPayments : transitioningBudget.formasPagamento,
-      parcelas: resolvedParcelas,
       dataUltimoContato: isFinished ? transitioningBudget.dataUltimoContato : now.toISOString(),
       dataCicloAtual: isFinished ? transitioningBudget.dataCicloAtual : now.toISOString(),
       dataAtualizacao: now.toISOString(),
+      updatedAt: now.toISOString(),
       observacao: commentText || transitioningBudget.observacao,
       historico: [newHistoryEntry, ...(transitioningBudget.historico || [])],
     };
@@ -1497,93 +1694,19 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
     );
     persistItems(updatedItems, updatedBudget);
 
-    // 1. FOLLOW-UP + META + VENDAS DO DIRETOR ÉDER:
-    // Sincronização automática bidirecional com remoção ao desmarcar de Vendido e prevenção de duplicatas
+    // Sincroniza automaticamente a venda na Meta da consultora responsável vinculada ao orçamento
     syncFollowUpStatusWithMetasAndVendas(
       updatedBudget,
       selectedNewStatus,
       currentUserName,
       {
         pedido: cleanPedido,
-        formasPagamento: statusPayments,
-        formaPagamento: paymentSummary,
-        parcelas: resolvedParcelas,
+        wasPreviouslySold,
       }
     );
 
-    // VENDIDO ACTIONS:
     if (selectedNewStatus === 'Vendido') {
-      const clientPhone = resolveBudgetPhone(transitioningBudget);
-      const saleId = `v_orc_${transitioningBudget.id}`;
-
-      // 1. Enviar esse orçamento/cliente para Pós-Vendas (Evitar duplicidade)
-      try {
-        const storedPosVendas = localStorage.getItem(POS_VENDAS_STORAGE_KEY);
-        let posVendasList: PosVendaItem[] = [];
-        if (storedPosVendas) {
-          posVendasList = JSON.parse(storedPosVendas);
-        }
-
-        const nextFollowUp = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-        const nextDia = String(nextFollowUp.getDate()).padStart(2, '0');
-        const nextMes = String(nextFollowUp.getMonth() + 1).padStart(2, '0');
-        const nextAno = nextFollowUp.getFullYear();
-
-        const pvId = `pv_orc_${transitioningBudget.id}`;
-        const newPosVenda: PosVendaItem = {
-          id: pvId,
-          orderNumber: cleanPedido,
-          clientId: transitioningBudget.clientId,
-          clientName: transitioningBudget.cliente,
-          clientPhone: clientPhone || '(11) 98765-4321',
-          clientType: (transitioningBudget.clientType as any) || 'Cliente Final',
-          valor: Number(transitioningBudget.valor) || 0,
-          origem: 'followup',
-          orcamentoId: transitioningBudget.id,
-          projectDescription:
-            transitioningBudget.nomeOrcamento ||
-            transitioningBudget.produto ||
-            'Orçamento Aprovado',
-          installerName: 'A Definir',
-          completionDate: `${ano}-${mes}-${dia}`,
-          satisfactionRating: 0,
-          status: 'Aguardando Contato',
-          type: 'Contato de Satisfação',
-          feedback: '',
-          nextFollowUpDate: `${nextAno}-${nextMes}-${nextDia}`,
-          notes: `Venda concluída no Follow-up Comercial. Pedido #${cleanPedido}. Valor: ${formatCurrency(
-            transitioningBudget.valor
-          )}${commentText ? `. Comentário: ${commentText}` : ''}`,
-          createdAt: now.toISOString(),
-        };
-
-        const existingPvIndex = posVendasList.findIndex(
-          (pv) =>
-            pv.id === pvId ||
-            (pv.orcamentoId && pv.orcamentoId === transitioningBudget.id) ||
-            (cleanPedido && pv.orderNumber === cleanPedido)
-        );
-
-        let updatedPosVendas: PosVendaItem[];
-        if (existingPvIndex >= 0) {
-          updatedPosVendas = [...posVendasList];
-          updatedPosVendas[existingPvIndex] = {
-            ...updatedPosVendas[existingPvIndex],
-            ...newPosVenda,
-            id: posVendasList[existingPvIndex].id,
-          };
-        } else {
-          updatedPosVendas = [newPosVenda, ...posVendasList];
-        }
-
-        localStorage.setItem(POS_VENDAS_STORAGE_KEY, JSON.stringify(updatedPosVendas));
-        window.dispatchEvent(new Event('fenix_pos_vendas_updated'));
-
-        showToast(`✓ Venda confirmada! Pedido #${cleanPedido} enviado para Pós-Vendas e registrado em Metas.`);
-      } catch (err) {
-        console.error('Erro ao transferir para Pós-Vendas:', err);
-        showToast('✓ Status atualizado para Vendido com sucesso.');
-      }
+      showToast(`✓ Venda confirmada! Pedido #${cleanPedido} contabilizado na Meta da consultora responsável.`);
     } else {
       showToast(`✓ Status atualizado para "${selectedNewStatus}" com sucesso.`);
     }
@@ -1976,6 +2099,36 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
         <ProspeccaoView currentUserName={currentUserName} />
       ) : (
         <>
+          {/* Sub-abas dentro de ORÇAMENTOS: VISÃO GERAL | LISTA DE ACOMPANHAMENTO */}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="inline-flex items-center gap-1 p-1 bg-white rounded-xl border border-slate-200/90 shadow-2xs">
+              <button
+                type="button"
+                onClick={() => setOrcamentosSubView('visao_geral')}
+                className={`inline-flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-extrabold uppercase tracking-wide transition-all cursor-pointer ${
+                  orcamentosSubView === 'visao_geral'
+                    ? 'bg-[#0B2D59] text-white shadow-2xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                }`}
+              >
+                <BarChart2 className="w-3.5 h-3.5" />
+                <span>Visão Geral</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setOrcamentosSubView('lista_acompanhamento')}
+                className={`inline-flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-extrabold uppercase tracking-wide transition-all cursor-pointer ${
+                  orcamentosSubView === 'lista_acompanhamento'
+                    ? 'bg-[#0B2D59] text-white shadow-2xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Lista de Acompanhamento</span>
+              </button>
+            </div>
+          </div>
+
           {/* Toast Notification */}
           {toastMessage && (
             <div className="p-4 rounded-2xl bg-white border border-blue-200 text-slate-800 shadow-md flex items-center gap-3.5 animate-in fade-in duration-200">
@@ -1986,6 +2139,20 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
             </div>
           )}
 
+          {orcamentosSubView === 'lista_acompanhamento' ? (
+            <ListaAcompanhamentoOrcamentos
+              followUpItems={items}
+              allOrcamentos={allOrcamentos}
+              clients={clients}
+              currentUserName={currentUserName}
+              isDirector={isDirector}
+              onViewOrcamento={handleViewTrackingOrcamento}
+              onUpdateTrackingStatus={handleTrackingStatusUpdate}
+              onSaveTrackingEdit={handleSaveTrackingEdit}
+              onRemoveFromTrackingList={handleRemoveFromTrackingList}
+            />
+          ) : (
+            <>
       {/* Visão da Diretoria: Separação por Responsável (Éder | Vanessa | Jhessica | demais usuários) */}
       {isDirector && (
         <ResponsibleFilterTabs
@@ -2709,30 +2876,16 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                                 </p>
                               )}
 
-                              {/* Follow-up "Vendido": Pedido, Pagamento e Parcelas, mantendo campos editáveis */}
+                              {/* Follow-up "Vendido": exibe apenas o número do pedido vinculado */}
                               {budget.status === 'Vendido' && (
                                 <div className="flex items-center gap-2 mt-2 flex-wrap">
                                   <button
                                     type="button"
                                     onClick={(e) => handleOpenStatusModal(budget, e)}
                                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-300/80 text-emerald-900 text-xs font-bold transition-colors shadow-2xs cursor-pointer group"
-                                    title="Clique para editar número do pedido, pagamento ou parcelas"
+                                    title="Clique para editar o número do pedido"
                                   >
                                     <span>Pedido #{budget.pedido || '—'}</span>
-                                    <Pencil className="w-2.5 h-2.5 text-emerald-600 group-hover:text-emerald-800 transition-colors" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleOpenStatusModal(budget, e)}
-                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-semibold transition-colors shadow-2xs cursor-pointer group"
-                                    title="Clique para editar forma de pagamento ou parcelas"
-                                  >
-                                    <span>
-                                      {budget.formaPagamento || 'Pix'}
-                                      {budget.parcelas && budget.formaPagamento === 'Cartão'
-                                        ? ` (${budget.parcelas})`
-                                        : ''}
-                                    </span>
                                     <Pencil className="w-2.5 h-2.5 text-emerald-600 group-hover:text-emerald-800 transition-colors" />
                                   </button>
                                 </div>
@@ -2960,6 +3113,8 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           })}
         </div>
       )}
+            </>
+          )}
 
       {/* MODAL: ALTERAR STATUS DO ORÇAMENTO:
           "Ao alterar o status, abrir uma caixa pequena para adicionar um comentário.
@@ -2970,21 +3125,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
           - se houver comentário, salvar;
           - registrar no histórico do orçamento." */}
       {/* MODAL: ALTERAR STATUS DO ORÇAMENTO (DESIGN PROFISSIONAL E MODERNO FÊNIX WORLD) */}
-      {transitioningBudget && (() => {
-        const linkedOrc = getAllSavedOrcamentos().find(
-          (o) =>
-            (transitioningBudget.orcamentoId && o.id === transitioningBudget.orcamentoId) ||
-            o.id === transitioningBudget.id.replace('fup_', '') ||
-            o.id === transitioningBudget.id
-        );
-        const freteNum = (linkedOrc?.freteAtivo && linkedOrc?.freteValor)
-          ? Number(linkedOrc.freteValor)
-          : Number(transitioningBudget.frete) || 0;
-        const produtosValor = freteNum > 0
-          ? Math.max(0, Number(transitioningBudget.valor) - freteNum)
-          : Number(transitioningBudget.valor);
-
-        return (
+      {transitioningBudget && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/75 backdrop-blur-xs animate-in fade-in duration-200">
             <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl max-w-xl w-full max-h-[92vh] flex flex-col animate-in zoom-in-95 duration-200 overflow-hidden text-slate-800">
               {/* Cabeçalho Fixo Moderno */}
@@ -3035,16 +3176,11 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                     </div>
                     <div className="sm:text-right flex-shrink-0 bg-white sm:bg-transparent p-2.5 sm:p-0 rounded-xl border sm:border-0 border-slate-200/60">
                       <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider block sm:text-right">
-                        Valor Total da Venda
+                        Valor do Orçamento
                       </span>
                       <span className="font-black text-[#0052cc] text-lg sm:text-xl block sm:text-right">
                         {formatCurrency(transitioningBudget.valor)}
                       </span>
-                      {freteNum > 0 && (
-                        <span className="text-[10.5px] text-emerald-700 font-bold block sm:text-right mt-0.5">
-                          Produtos: {formatCurrency(produtosValor)} • Frete: {formatCurrency(freteNum)}
-                        </span>
-                      )}
                     </div>
                   </div>
                 </div>
@@ -3076,6 +3212,7 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                           onClick={() => {
                             setSelectedNewStatus(st.value);
                             if (statusError) setStatusError('');
+                            if (pedidoError) setPedidoError('');
                           }}
                           className={`p-3 rounded-2xl text-xs font-bold flex flex-col items-center justify-center gap-1.5 transition-all cursor-pointer border text-center ${
                             isSelected
@@ -3104,93 +3241,32 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                   </div>
                 </div>
 
-                {/* 3. Seção Estruturada de Venda Fechada (VENDIDO) */}
+                {/* 3. Confirmação Simplificada de Venda (VENDIDO): solicita somente o Número do Pedido */}
                 {selectedNewStatus === 'Vendido' && (
-                  <div className="space-y-4 p-4.5 bg-gradient-to-br from-emerald-50/80 via-emerald-50/30 to-white border border-emerald-200/90 rounded-2xl shadow-xs animate-in fade-in duration-200">
-                    <div className="flex items-center justify-between border-b border-emerald-200/70 pb-3">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-7 h-7 rounded-xl bg-emerald-500 text-white flex items-center justify-center shadow-2xs">
-                          <CheckCircle2 className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <span className="text-xs font-black text-emerald-950 uppercase tracking-wider block">
-                            Dados de Fechamento da Venda
-                          </span>
-                          <span className="text-[10px] text-emerald-700">
-                            Preencha o pedido e formas de pagamento
-                          </span>
-                        </div>
-                      </div>
-                      <span className="text-[10px] font-extrabold text-emerald-800 bg-emerald-100/90 px-2.5 py-1 rounded-full border border-emerald-200 shadow-2xs">
-                        Metas & Pós-Vendas
-                      </span>
+                  <div className="p-4.5 bg-gradient-to-br from-emerald-50/80 via-emerald-50/30 to-white border border-emerald-200/90 rounded-2xl shadow-xs animate-in fade-in duration-200">
+                    <label className="block text-xs font-bold text-emerald-950 mb-1.5">
+                      Número do Pedido <span className="text-rose-500">*</span>
+                    </label>
+                    <div className="relative">
+                      <Hash className="w-4 h-4 text-emerald-600 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        autoFocus
+                        value={numeroPedidoInput}
+                        onChange={(e) => {
+                          setNumeroPedidoInput(e.target.value.replace(/^#+/, ''));
+                          if (pedidoError) setPedidoError('');
+                        }}
+                        placeholder="Ex: 1052"
+                        className="w-full h-11 pl-10 pr-4 bg-white border border-emerald-300/90 focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 rounded-xl text-sm font-bold text-slate-900 outline-none transition-all shadow-2xs"
+                      />
                     </div>
-
-                    {/* Número do Pedido */}
-                    <div>
-                      <label className="block text-xs font-bold text-emerald-950 mb-1.5">
-                        Número do Pedido <span className="text-rose-500">*</span>
-                      </label>
-                      <div className="relative">
-                        <Hash className="w-4 h-4 text-emerald-600 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="text"
-                          autoFocus
-                          value={numeroPedidoInput}
-                          onChange={(e) => {
-                            setNumeroPedidoInput(e.target.value.replace(/^#+/, ''));
-                            if (pedidoError) setPedidoError('');
-                          }}
-                          placeholder="Ex: 1052"
-                          className="w-full h-11 pl-10 pr-4 bg-white border border-emerald-300/90 focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 rounded-xl text-sm font-bold text-slate-900 outline-none transition-all shadow-2xs"
-                        />
-                      </div>
-                      <span className="text-[10.5px] text-emerald-800/80 mt-1 block">
-                        Apenas os dígitos do pedido (sem caracteres especiais).
-                      </span>
-                      {pedidoError && (
-                        <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1.5 animate-in fade-in duration-150">
-                          <AlertCircle className="w-3.5 h-3.5" />
-                          <span>{pedidoError}</span>
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Formas de Pagamento */}
-                    <div>
-                      <label className="block text-xs font-bold text-emerald-950 mb-1.5 uppercase tracking-wider">
-                        Formas e Condições de Pagamento
-                      </label>
-                      <div className="bg-white p-3.5 rounded-xl border border-emerald-200/70 shadow-2xs">
-                        <PaymentSplitManager
-                          totalVenda={Number(transitioningBudget.valor) || 0}
-                          payments={statusPayments}
-                          onChange={setStatusPayments}
-                          compact={true}
-                        />
-                      </div>
-                    </div>
-
-                    {/* Resumo e Confirmação de Totais */}
-                    <div className="text-xs text-emerald-950 bg-white/95 p-3.5 rounded-xl border border-emerald-200/90 space-y-1.5 shadow-2xs">
-                      <div className="flex items-center justify-between border-b border-emerald-100 pb-1.5">
-                        <span className="text-slate-600 font-medium">Cliente:</span>
-                        <span className="font-bold text-slate-900">{transitioningBudget.cliente}</span>
-                      </div>
-                      <div className="flex items-center justify-between border-b border-emerald-100 pb-1.5">
-                        <span className="text-slate-600 font-medium">Valor Total Fechado:</span>
-                        <span className="font-black text-emerald-800 text-sm">{formatCurrency(transitioningBudget.valor)}</span>
-                      </div>
-                      {freteNum > 0 && (
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 border-b border-emerald-100 pb-1.5">
-                          <span>Produtos: {formatCurrency(produtosValor)}</span>
-                          <span>Frete: {formatCurrency(freteNum)} (não entra na Meta)</span>
-                        </div>
-                      )}
-                      <p className="text-[11px] text-emerald-700 pt-0.5">
-                        ✓ O valor dos produtos será creditado nas Metas do mês e integrado automaticamente na esteira de Pós-Vendas.
+                    {pedidoError && (
+                      <p className="text-[11px] font-bold text-rose-600 mt-1.5 flex items-center gap-1.5 animate-in fade-in duration-150">
+                        <AlertCircle className="w-3.5 h-3.5" />
+                        <span>{pedidoError}</span>
                       </p>
-                    </div>
+                    )}
                   </div>
                 )}
 
@@ -3202,22 +3278,24 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                   </div>
                 )}
 
-                {/* Comentário da Atualização (Opcional) */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wider">
-                    Comentário / Observação <span className="text-slate-400 font-normal normal-case">(opcional)</span>
-                  </label>
-                  <textarea
-                    rows={2}
-                    value={statusComment}
-                    onChange={(e) => {
-                      setStatusComment(e.target.value);
-                      if (statusError) setStatusError('');
-                    }}
-                    placeholder="Observação rápida sobre este contato ou negociação..."
-                    className="w-full p-3.5 bg-slate-50 border border-slate-200 focus:border-[#0052cc] focus:bg-white rounded-xl text-xs text-slate-800 outline-none transition-all shadow-2xs resize-none"
-                  />
-                </div>
+                {/* Comentário da Atualização (apenas para status diferentes de Vendido) */}
+                {selectedNewStatus !== 'Vendido' && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wider">
+                      Comentário / Observação <span className="text-slate-400 font-normal normal-case">(opcional)</span>
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={statusComment}
+                      onChange={(e) => {
+                        setStatusComment(e.target.value);
+                        if (statusError) setStatusError('');
+                      }}
+                      placeholder="Observação rápida sobre este contato ou negociação..."
+                      className="w-full p-3.5 bg-slate-50 border border-slate-200 focus:border-[#0052cc] focus:bg-white rounded-xl text-xs text-slate-800 outline-none transition-all shadow-2xs resize-none"
+                    />
+                  </div>
+                )}
               </div>
 
               {/* Rodapé Fixo */}
@@ -3235,13 +3313,12 @@ export const FollowUpScreen: React.FC<FollowUpScreenProps> = ({
                   className="h-10 px-6 rounded-xl bg-gradient-to-r from-[#0B2046] to-[#0052cc] hover:from-[#081733] hover:to-[#0041a8] text-white font-bold text-xs shadow-sm hover:shadow transition-all cursor-pointer flex items-center gap-2"
                 >
                   <Check className="w-3.5 h-3.5" />
-                  <span>Salvar Atualização</span>
+                  <span>{selectedNewStatus === 'Vendido' ? 'Confirmar Venda' : 'Salvar Atualização'}</span>
                 </button>
               </div>
             </div>
           </div>
-        );
-      })()}
+      )}
 
       {/* MODAL: HISTÓRICO DO ORÇAMENTO */}
       {viewingHistoryBudget && (

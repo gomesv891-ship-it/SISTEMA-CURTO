@@ -287,8 +287,6 @@ export const SYNC_COLLECTIONS: { key: string; label: string; description: string
   { key: 'fenix_estoque_movimentacoes', label: 'Movimentações de Estoque', description: 'Entradas, Saídas - Venda e Saídas - Outro' },
   { key: 'fenix_estoque_insumos_v1', label: 'Insumos de Loja', description: 'Materiais de consumo e ferramentas' },
   { key: 'fenix_vendas_gerencial', label: 'Gestão de Vendas (Diretoria)', description: 'Vendas, custos, lucros e margens' },
-  { key: 'fenix_chat_messages', label: 'Chat Interno (Mensagens)', description: 'Mensagens de chat em tempo real da equipe' },
-  { key: 'fenix_user_presence', label: 'Chat Interno (Presença)', description: 'Status Online/Offline e batimentos de presença' },
   { key: 'fenix_marketplace_sales_db', label: 'Vendas Marketplace (Jeferson)', description: 'Lançamentos de vendas marketplace' },
   { key: 'fenix_estoque_insumos_movs_v1', label: 'Insumos de Loja (Movimentações)', description: 'Entradas e saídas de insumos' },
   { key: 'fenix_product_costs_db', label: 'Custos dos Produtos (Diretoria)', description: 'Tabela oficial de custos' },
@@ -302,6 +300,7 @@ export const SYNC_COLLECTIONS: { key: string; label: string; description: string
   { key: 'fenix_custos_variaveis_v1', label: 'Custos Variáveis', description: 'Configuração de custos variáveis' },
   { key: 'fenix_whatsapp_templates_by_category', label: 'Modelos WhatsApp', description: 'Modelos de mensagens do WhatsApp por categoria' },
   { key: 'fenix_metas_config_data', label: 'Configurações de Metas', description: 'Parâmetros e metas mensais' },
+  { key: 'fenix_promocoes_ativas_db', label: 'Promoções Ativas', description: 'Campanhas promocionais, lotes compartilhados e tabelas por modalidade' },
 ];
 
 // Registro de timestamps locais para supressão de eco no Realtime (evita re-renderizações e loops)
@@ -658,8 +657,6 @@ export function dispatchCollectionEvents(collectionKey: string) {
     window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
   }
   if (collectionKey.includes('marketplace')) window.dispatchEvent(new Event('fenix_marketplace_sales_updated'));
-  if (collectionKey.includes('chat')) window.dispatchEvent(new Event('fenix_chat_updated'));
-  if (collectionKey.includes('presence')) window.dispatchEvent(new Event('fenix_presence_updated'));
   if (collectionKey.includes('rendimentos')) window.dispatchEvent(new Event('fenix_rendimentos_updated'));
   if (collectionKey.includes('custos')) {
     window.dispatchEvent(new Event('fenix_custos_config_updated'));
@@ -671,6 +668,7 @@ export function dispatchCollectionEvents(collectionKey: string) {
     window.dispatchEvent(new Event('fenix_custos_tarkett_updated'));
   }
   if (collectionKey.includes('whatsapp') || collectionKey.includes('msg')) window.dispatchEvent(new Event('fenix_orcamento_msg_updated'));
+  if (collectionKey.includes('promoc')) window.dispatchEvent(new Event('fenix_promocoes_updated'));
 }
 
 /**
@@ -847,12 +845,15 @@ export function initSupabaseRealtimeSubscription(): (() => void) | null {
               return;
             }
 
-            // Presença de usuários: despacha evento específico sem re-renderizar todo o CRM
-            if (key === 'fenix_user_presence') {
-              try {
-                localStorage.setItem(key, typeof payload.new.data === 'string' ? payload.new.data : JSON.stringify(payload.new.data));
-                window.dispatchEvent(new Event('fenix_presence_updated'));
-              } catch {}
+            // A coleção fenix_anotacoes_db é gerenciada diretamente via Supabase sem localStorage
+            if (key === 'fenix_anotacoes_db') {
+              window.dispatchEvent(new CustomEvent('fenix_anotacoes_realtime_updated', { detail: payload.new }));
+              return;
+            }
+
+            // A coleção fenix_promocoes_ativas_db é sincronizada via promocoesService
+            if (key === 'fenix_promocoes_ativas_db') {
+              window.dispatchEvent(new CustomEvent('fenix_promocoes_realtime_updated', { detail: payload.new }));
               return;
             }
 
@@ -921,7 +922,7 @@ export const TAB_COLLECTIONS_MAP: Record<string, string[]> = {
   'Clientes': ['fenix_clients_db'],
   'Cadastro': ['fenix_clients_db'],
   'Calculadora': ['fenix_clients_db', 'fenix_product_items_data', 'fenix_product_categories_data', 'fenix_product_groups_data', 'fenix_calculadora_rendimentos'],
-  'Orçamentos': ['fenix_clients_db', 'fenix_saved_orcamentos', 'fenix_orcamentos_history'],
+  'Orçamentos': ['fenix_clients_db', 'fenix_saved_orcamentos', 'fenix_orcamentos_history', 'fenix_product_items_data', 'fenix_product_categories_data'],
   'Agenda': ['fenix_tarefas_db', 'fenix_clients_db'],
   'Tarefas': ['fenix_tarefas_db', 'fenix_clients_db'],
   'Follow-up': ['fenix_followup_cards_v2', 'fenix_clients_db', 'fenix_saved_orcamentos', 'fenix_orcamentos_history', 'fenix_metas_sales_db'],
@@ -934,9 +935,11 @@ export const TAB_COLLECTIONS_MAP: Record<string, string[]> = {
   'Pendências': ['fenix_pendencias_v1'],
   'Pendencias': ['fenix_pendencias_v1'],
   'Notas': ['fenix_notes_db'],
-  'Metas': ['fenix_metas_sales_db', 'fenix_followup_cards_v2', 'fenix_clients_db', 'fenix_pos_vendas_db', 'fenix_deleted_vendas_ids', 'fenix_vendas_gerencial', 'fenix_metas_config_data'],
-  'Meta': ['fenix_metas_sales_db', 'fenix_followup_cards_v2', 'fenix_clients_db', 'fenix_pos_vendas_db', 'fenix_deleted_vendas_ids', 'fenix_vendas_gerencial', 'fenix_metas_config_data'],
+  'Metas': ['fenix_metas_sales_db', 'fenix_followup_cards_v2', 'fenix_orcamentos_history', 'fenix_saved_orcamentos', 'fenix_clients_db', 'fenix_pos_vendas_db', 'fenix_deleted_vendas_ids', 'fenix_vendas_gerencial', 'fenix_metas_config_data'],
+  'Meta': ['fenix_metas_sales_db', 'fenix_followup_cards_v2', 'fenix_orcamentos_history', 'fenix_saved_orcamentos', 'fenix_clients_db', 'fenix_pos_vendas_db', 'fenix_deleted_vendas_ids', 'fenix_vendas_gerencial', 'fenix_metas_config_data'],
   'Produtos': ['fenix_product_items_data', 'fenix_product_categories_data', 'fenix_product_groups_data', 'fenix_product_costs_db', 'fenix_custos_tarkett_itens_v1', 'fenix_tarkett_produtos_catalogo'],
+  'Promoções Ativas': ['fenix_promocoes_ativas_db', 'fenix_product_items_data', 'fenix_product_categories_data'],
+  'Promocoes Ativas': ['fenix_promocoes_ativas_db', 'fenix_product_items_data', 'fenix_product_categories_data'],
   'Configurações': ['fenix_usuarios_v2', 'fenix_auth_users_v2', 'fenix_custos_estrutura_v1', 'fenix_custos_rateio_v1', 'fenix_custos_comissoes_v1', 'fenix_custos_nota_fiscal_v1', 'fenix_custos_tarkett_itens_v1', 'fenix_tarkett_produtos_catalogo', 'fenix_custos_variaveis_v1', 'fenix_whatsapp_templates_by_category', 'fenix_metas_config_data'],
   'Configuracoes': ['fenix_usuarios_v2', 'fenix_auth_users_v2', 'fenix_custos_estrutura_v1', 'fenix_custos_rateio_v1', 'fenix_custos_comissoes_v1', 'fenix_custos_nota_fiscal_v1', 'fenix_custos_tarkett_itens_v1', 'fenix_tarkett_produtos_catalogo', 'fenix_custos_variaveis_v1', 'fenix_whatsapp_templates_by_category', 'fenix_metas_config_data'],
   'Settings': ['fenix_usuarios_v2', 'fenix_auth_users_v2', 'fenix_custos_estrutura_v1', 'fenix_custos_rateio_v1', 'fenix_custos_comissoes_v1', 'fenix_custos_nota_fiscal_v1', 'fenix_custos_tarkett_itens_v1', 'fenix_tarkett_produtos_catalogo', 'fenix_custos_variaveis_v1', 'fenix_whatsapp_templates_by_category', 'fenix_metas_config_data'],
@@ -1094,57 +1097,98 @@ export async function pullDataFromSupabase(specificKeys?: string[]): Promise<{
               saveWholeCollectionToSupabase(item.key, localList).catch(() => {});
             } else if (parsedData.length > 0) {
               if (item.key === 'fenix_metas_sales_db') {
-                const salesMap = new Map<string, any>();
-                const seenSalesKeys = new Set<string>();
+                const salesList: any[] = [];
+                const findMatchingSaleIdx = (candidate: any): number => {
+                  const id = String(candidate.id || '').trim();
+                  const fupId = candidate.followUpId ? String(candidate.followUpId).trim() : '';
+                  const orcId = candidate.orcamentoId ? String(candidate.orcamentoId).trim() : '';
+                  const bareOrc = orcId.replace(/^orc_/, '');
+                  const cleanPed = candidate.pedido ? String(candidate.pedido).replace(/^#+/, '').trim() : '';
+                  const clientNorm = (candidate.cliente || candidate.clientName || '').trim().toLowerCase();
 
-                // Remote parsedData from Supabase is authoritative
+                  return salesList.findIndex((existing) => {
+                    const eId = String(existing.id || '').trim();
+                    const eFupId = existing.followUpId ? String(existing.followUpId).trim() : '';
+                    const eOrcId = existing.orcamentoId ? String(existing.orcamentoId).trim() : '';
+                    const eBareOrc = eOrcId.replace(/^orc_/, '');
+
+                    if (id && eId && id === eId) return true;
+                    if (fupId && eFupId && fupId === eFupId) return true;
+                    if (bareOrc && eBareOrc && bareOrc === eBareOrc) return true;
+                    if (fupId && eOrcId && (fupId === eOrcId || fupId === `fup_${eBareOrc}`)) return true;
+                    if (orcId && eFupId && (eFupId === orcId || eFupId === `fup_${bareOrc}`)) return true;
+
+                    const ePed = existing.pedido ? String(existing.pedido).replace(/^#+/, '').trim() : '';
+                    const eCli = (existing.cliente || existing.clientName || '').trim().toLowerCase();
+                    const bothHaveDiffOrcs = Boolean(bareOrc && eBareOrc && bareOrc !== eBareOrc);
+                    if (!bothHaveDiffOrcs && cleanPed && ePed && cleanPed === ePed && clientNorm && eCli && clientNorm === eCli) {
+                      return true;
+                    }
+                    return false;
+                  });
+                };
+
+                // Remote parsedData from Supabase enters first
                 for (const p of parsedData) {
                   if (!p) continue;
-                  const id = String(p.id || '').trim();
-                  const cleanPed = p.pedido ? String(p.pedido).replace(/^#+/, '').trim() : '';
-                  const clientNorm = (p.cliente || p.clientName || '').trim().toLowerCase();
-                  const fupId = p.followUpId ? String(p.followUpId) : '';
-                  const orcId = p.orcamentoId ? String(p.orcamentoId) : '';
-                  const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-                  const primaryKey = id || (cleanPed ? `ped_${cleanPed}` : `sale_${Math.random()}`);
-                  salesMap.set(primaryKey, p);
-                  if (id) seenSalesKeys.add(id);
-                  if (fupId) seenSalesKeys.add(fupId);
-                  if (orcId) seenSalesKeys.add(orcId);
-                  if (dedupKey) seenSalesKeys.add(dedupKey);
-                  if (cleanPed) seenSalesKeys.add(`ped_${cleanPed}`);
+                  const idx = findMatchingSaleIdx(p);
+                  if (idx < 0) salesList.push(p);
                 }
 
-                // Preserve local sales that are not yet in remote
+                // Merge local and pending items, preferring whichever has a newer updatedAt timestamp
                 for (const loc of [...localList, ...pendingItems]) {
                   if (!loc) continue;
-                  const id = String(loc.id || '').trim();
-                  const cleanPed = loc.pedido ? String(loc.pedido).replace(/^#+/, '').trim() : '';
-                  const clientNorm = (loc.cliente || loc.clientName || '').trim().toLowerCase();
-                  const fupId = loc.followUpId ? String(loc.followUpId) : '';
-                  const orcId = loc.orcamentoId ? String(loc.orcamentoId) : '';
-                  const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-                  if (
-                    (id && seenSalesKeys.has(id)) ||
-                    (fupId && seenSalesKeys.has(fupId)) ||
-                    (orcId && seenSalesKeys.has(orcId)) ||
-                    (dedupKey && seenSalesKeys.has(dedupKey)) ||
-                    (cleanPed && seenSalesKeys.has(`ped_${cleanPed}`))
-                  ) {
-                    continue;
+                  const idx = findMatchingSaleIdx(loc);
+                  if (idx < 0) {
+                    salesList.push(loc);
+                  } else {
+                    const existing = salesList[idx];
+                    const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+                    const locTs = new Date(loc.updatedAt || loc.dataAtualizacao || 0).getTime() || 0;
+                    if (locTs > existingTs) {
+                      salesList[idx] = { ...existing, ...loc, id: existing.id || loc.id };
+                    }
                   }
-
-                  const primaryKey = id || (cleanPed ? `ped_${cleanPed}` : `sale_${Math.random()}`);
-                  salesMap.set(primaryKey, loc);
-                  if (id) seenSalesKeys.add(id);
-                  if (fupId) seenSalesKeys.add(fupId);
-                  if (orcId) seenSalesKeys.add(orcId);
-                  if (dedupKey) seenSalesKeys.add(dedupKey);
-                  if (cleanPed) seenSalesKeys.add(`ped_${cleanPed}`);
                 }
-                finalData = Array.from(salesMap.values());
+                finalData = salesList;
+              } else if (item.key === 'fenix_followup_cards_v2') {
+                // Follow-up: manter 1 registro por orcamentoId, preservando edições locais mais recentes (ex: Vendido)
+                const fupByRef = new Map<string, any>();
+                for (const p of [...parsedData, ...localList, ...pendingItems]) {
+                  if (!p) continue;
+                  const pId = String(p.id ?? '').trim();
+                  const bareOrc = String(p.orcamentoId || (pId.startsWith('fup_') ? pId.slice(4) : ''))
+                    .trim()
+                    .replace(/^orc_/, '');
+                  const refKey = bareOrc ? `orc_${bareOrc}` : pId;
+                  if (!refKey) continue;
+
+                  const existing = fupByRef.get(refKey);
+                  if (!existing) {
+                    fupByRef.set(refKey, p);
+                  } else {
+                    const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+                    const incomingTs = new Date(p.updatedAt || p.dataAtualizacao || 0).getTime() || 0;
+                    const mergedHistMap = new Map<string, any>();
+                    [...(existing.historico || []), ...(p.historico || [])].forEach((h: any) => {
+                      if (h && h.id) mergedHistMap.set(h.id, h);
+                    });
+                    const mergedHist = Array.from(mergedHistMap.values()).sort(
+                      (a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0)
+                    );
+                    const primary = incomingTs > existingTs ? p : existing;
+                    const secondary = primary === p ? existing : p;
+                    fupByRef.set(refKey, {
+                      ...secondary,
+                      ...primary,
+                      id: existing.id || primary.id,
+                      orcamentoId: primary.orcamentoId || secondary.orcamentoId,
+                      pedido: primary.pedido || secondary.pedido,
+                      ...(mergedHist.length > 0 ? { historico: mergedHist } : {}),
+                    });
+                  }
+                }
+                finalData = Array.from(fupByRef.values());
               } else {
                 // Supabase parsedData é a fonte oficial permanente dos dados
                 const map = new Map<string, any>();
@@ -1301,22 +1345,51 @@ export async function saveItemToSupabase<T extends Record<string, any>>(
       }
       const cleanBaseList: T[] = deduplicateListById(Array.from(baseMap.values()), idField);
 
-      // 4. Atualiza ou insere o item com correspondência rigorosa de ID
+      // 4. Atualiza ou insere o item com correspondência rigorosa de ID e chaves de vínculo (1:1 Follow-up / Metas)
       const cleanItemId = String(itemId).trim();
+      const itemOrcId = (item as any).orcamentoId ? String((item as any).orcamentoId).trim() : '';
+      const itemFupId = (item as any).followUpId ? String((item as any).followUpId).trim() : '';
+      const itemPed = (item as any).pedido ? String((item as any).pedido).replace(/^#+/, '').trim() : '';
+      const itemCli = ((item as any).cliente || (item as any).clientName || '').trim().toLowerCase();
+
       const existingIndex = cleanBaseList.findIndex((x: any) => {
         if (!x) return false;
         const xId = String(x[idField] ?? x.id ?? x._id ?? x.idOrcamento ?? x.pedido ?? '').trim();
-        return xId === cleanItemId;
+        if (xId === cleanItemId) return true;
+
+        if (collectionKey === 'fenix_followup_cards_v2' && itemOrcId) {
+          const itemBareOrc = itemOrcId.replace(/^orc_/, '');
+          const xOrcId = x.orcamentoId ? String(x.orcamentoId).trim() : '';
+          const xBareOrc = xOrcId.replace(/^orc_/, '');
+          if (xOrcId && (xOrcId === itemOrcId || (itemBareOrc && xBareOrc === itemBareOrc))) return true;
+          if (xId === `fup_${itemOrcId}` || xId === itemOrcId || (itemBareOrc && (xId === `fup_${itemBareOrc}` || xId === itemBareOrc || xId === `fup_orc_${itemBareOrc}`))) return true;
+        }
+
+        if (collectionKey === 'fenix_metas_sales_db') {
+          const itemBareOrc = itemOrcId.replace(/^orc_/, '');
+          const xFupId = x.followUpId ? String(x.followUpId).trim() : '';
+          const xOrcId = x.orcamentoId ? String(x.orcamentoId).trim() : '';
+          const xBareOrc = xOrcId.replace(/^orc_/, '');
+          if (itemFupId && (xFupId === itemFupId || xOrcId === itemFupId || xId === `v_orc_${itemFupId}`)) return true;
+          if (itemOrcId && (xOrcId === itemOrcId || (itemBareOrc && xBareOrc === itemBareOrc) || xFupId === `fup_${itemOrcId}` || xId === `v_orc_${itemOrcId}` || (itemBareOrc && xId === `v_orc_${itemBareOrc}`))) return true;
+          const xPed = x.pedido ? String(x.pedido).replace(/^#+/, '').trim() : '';
+          const xCli = (x.cliente || x.clientName || '').trim().toLowerCase();
+          const bothHaveDiffOrcs = Boolean(itemBareOrc && xBareOrc && itemBareOrc !== xBareOrc);
+          if (!bothHaveDiffOrcs && itemPed && xPed && itemPed === xPed && (!itemCli || !xCli || itemCli === xCli)) return true;
+        }
+
+        return false;
       });
 
       let updatedList: T[];
       if (existingIndex >= 0) {
-        // Atualização em lote preservando o registro existente e suas chaves
-        const existingItem = cleanBaseList[existingIndex];
+        // Atualização em lote preservando o registro existente e seu ID canônico
+        const existingItem = cleanBaseList[existingIndex] as any;
+        const canonicalId = existingItem[idField] ?? itemId;
         const updatedItem = {
           ...existingItem,
           ...item,
-          [idField]: itemId,
+          [idField]: canonicalId,
           updatedAt: (item as any).updatedAt || new Date().toISOString(),
         };
         updatedList = cleanBaseList.map((x: any, idx: number) => {
@@ -1569,56 +1642,58 @@ export async function saveWholeCollectionToSupabase(
 
         if (remoteRow && Array.isArray(remoteRow.data) && remoteRow.data.length > 0) {
           const remoteList = remoteRow.data;
-          const salesMap = new Map<string, any>();
-          const seenKeys = new Set<string>();
+          const mergedSales: any[] = [];
+          const findIdx = (candidate: any): number => {
+            const id = String(candidate.id || '').trim();
+            const fupId = candidate.followUpId ? String(candidate.followUpId).trim() : '';
+            const orcId = candidate.orcamentoId ? String(candidate.orcamentoId).trim() : '';
+            const bareOrc = orcId.replace(/^orc_/, '');
+            const cleanPed = candidate.pedido ? String(candidate.pedido).replace(/^#+/, '').trim() : '';
+            const clientNorm = (candidate.cliente || candidate.clientName || '').trim().toLowerCase();
+
+            return mergedSales.findIndex((existing) => {
+              const eId = String(existing.id || '').trim();
+              const eFupId = existing.followUpId ? String(existing.followUpId).trim() : '';
+              const eOrcId = existing.orcamentoId ? String(existing.orcamentoId).trim() : '';
+              const eBareOrc = eOrcId.replace(/^orc_/, '');
+
+              if (id && eId && id === eId) return true;
+              if (fupId && eFupId && fupId === eFupId) return true;
+              if (bareOrc && eBareOrc && bareOrc === eBareOrc) return true;
+              if (fupId && eOrcId && (fupId === eOrcId || fupId === `fup_${eBareOrc}`)) return true;
+              if (orcId && eFupId && (eFupId === orcId || eFupId === `fup_${bareOrc}`)) return true;
+
+              const ePed = existing.pedido ? String(existing.pedido).replace(/^#+/, '').trim() : '';
+              const eCli = (existing.cliente || existing.clientName || '').trim().toLowerCase();
+              const bothHaveDiffOrcs = Boolean(bareOrc && eBareOrc && bareOrc !== eBareOrc);
+              if (!bothHaveDiffOrcs && cleanPed && ePed && cleanPed === ePed && clientNorm && eCli && clientNorm === eCli) {
+                return true;
+              }
+              return false;
+            });
+          };
 
           remoteList.forEach((s: any) => {
             if (!s) return;
-            const id = String(s.id || '').trim();
-            const cleanPed = s.pedido ? String(s.pedido).replace(/^#+/, '').trim() : '';
-            const clientNorm = (s.cliente || s.clientName || '').trim().toLowerCase();
-            const fupId = s.followUpId ? String(s.followUpId) : '';
-            const orcId = s.orcamentoId ? String(s.orcamentoId) : '';
-            const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-            const k = id || (cleanPed ? `ped_${cleanPed}` : `sale_${Math.random()}`);
-            salesMap.set(k, s);
-            if (id) seenKeys.add(id);
-            if (fupId) seenKeys.add(fupId);
-            if (orcId) seenKeys.add(orcId);
-            if (dedupKey) seenKeys.add(dedupKey);
-            if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
+            if (findIdx(s) < 0) mergedSales.push(s);
           });
 
           data.forEach((s: any) => {
             if (!s) return;
-            const id = String(s.id || '').trim();
-            const cleanPed = s.pedido ? String(s.pedido).replace(/^#+/, '').trim() : '';
-            const clientNorm = (s.cliente || s.clientName || '').trim().toLowerCase();
-            const fupId = s.followUpId ? String(s.followUpId) : '';
-            const orcId = s.orcamentoId ? String(s.orcamentoId) : '';
-            const dedupKey = cleanPed && clientNorm ? `${cleanPed}_${clientNorm}` : '';
-
-            if (
-              (id && seenKeys.has(id)) ||
-              (fupId && seenKeys.has(fupId)) ||
-              (orcId && seenKeys.has(orcId)) ||
-              (dedupKey && seenKeys.has(dedupKey)) ||
-              (cleanPed && seenKeys.has(`ped_${cleanPed}`))
-            ) {
-              return;
+            const idx = findIdx(s);
+            if (idx < 0) {
+              mergedSales.push(s);
+            } else {
+              const existing = mergedSales[idx];
+              const existingTs = new Date(existing.updatedAt || existing.dataAtualizacao || 0).getTime() || 0;
+              const incomingTs = new Date(s.updatedAt || s.dataAtualizacao || 0).getTime() || 0;
+              if (incomingTs >= existingTs) {
+                mergedSales[idx] = { ...existing, ...s, id: existing.id || s.id };
+              }
             }
-
-            const k = id || (cleanPed ? `ped_${cleanPed}` : `sale_${Math.random()}`);
-            salesMap.set(k, s);
-            if (id) seenKeys.add(id);
-            if (fupId) seenKeys.add(fupId);
-            if (orcId) seenKeys.add(orcId);
-            if (dedupKey) seenKeys.add(dedupKey);
-            if (cleanPed) seenKeys.add(`ped_${cleanPed}`);
           });
 
-          dataToSave = Array.from(salesMap.values());
+          dataToSave = mergedSales;
         }
       } catch {}
     }

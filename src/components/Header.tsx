@@ -38,11 +38,9 @@ import {
   BookOpen,
   User,
   LogOut,
-  MessageSquare,
   Trash2,
   EyeOff,
   Square,
-  MessageCircle,
   Table,
   BellOff,
 } from 'lucide-react';
@@ -70,8 +68,6 @@ import {
 } from '../utils/userNotificationPreferences';
 import { UserAvatar } from './UserAvatar';
 import { ProfileModal } from './ProfileModal';
-import { ChatPanel } from './chat/ChatPanel';
-import { initChatService, getTotalUnreadChatCount, sendUserHeartbeat, normalizeChatUserName } from '../utils/chatService';
 import { getDailyBibleVerse, BibleVerse } from '../data/dailyBibleVerses';
 
 interface HeaderProps {
@@ -252,7 +248,6 @@ export const Header: React.FC<HeaderProps> = ({
     try {
       localStorage.setItem(`fenix_user_status_${userName || 'default'}`, status);
       localStorage.setItem('fenix_vanessa_status', status);
-      sendUserHeartbeat(userName, status);
       window.dispatchEvent(
         new CustomEvent('fenix_user_status_changed', {
           detail: { user: userName, status },
@@ -261,95 +256,6 @@ export const Header: React.FC<HeaderProps> = ({
     } catch {}
   };
 
-  // Estados do Chat Interno Fênix World (acessível em todas as abas)
-  const [isChatOpen, setIsChatOpen] = useState(false);
-  const [isChatMinimized, setIsChatMinimized] = useState(false);
-  const [chatUnreadCount, setChatUnreadCount] = useState(() => getTotalUnreadChatCount(userName));
-
-  useEffect(() => {
-    const cleanup = initChatService(userName);
-
-    const updateChatUnread = () => {
-      setChatUnreadCount(getTotalUnreadChatCount(userName));
-    };
-
-    const handleChatMessageReceived = (e: Event) => {
-      updateChatUnread();
-      // Atualiza também as notificações no sino para refletir a mensagem recebida
-      setNotifications(getUserNotifications(userName));
-      try {
-        const customEvent = e as CustomEvent;
-        const msg = customEvent.detail;
-        const normCurrent = normalizeChatUserName(userName);
-        const normSender = msg?.senderName ? normalizeChatUserName(msg.senderName) : '';
-        // Só toca o som se a mensagem foi enviada por outra pessoa
-        if (normSender && normSender !== normCurrent) {
-          const playedKey = msg?.id ? `fenix_sound_played_notif_chat_${msg.id}` : null;
-          if (!playedKey || !sessionStorage.getItem(playedKey)) {
-            if (playedKey) {
-              try {
-                sessionStorage.setItem(playedKey, 'true');
-              } catch {}
-            }
-            playUserCustomSoundForCategory(userName, 'chat');
-
-            // Dispara notificação externa para nova mensagem de chat se ativada
-            const prefs = getUserNotificationPreferences(userName);
-            if (
-              prefs.enabled !== false &&
-              prefs.externalAlerts?.chat !== false &&
-              isWithinNotificationSchedule(prefs)
-            ) {
-              sendExternalNotification(
-                `Mensagem de ${msg?.senderName || 'Chat Fênix'}`,
-                {
-                  body: msg?.text || 'Nova mensagem no chat corporativo',
-                  targetTab: 'Chat',
-                  metadata: { conversationId: msg?.conversationId },
-                  tag: `fenix_chat_${msg?.id || Date.now()}`,
-                }
-              );
-            }
-          }
-        }
-      } catch (err) {
-        console.warn('Erro ao tocar som do chat no Header:', err);
-      }
-    };
-
-    // Listener para abrir chat se solicitado externamente
-    const handleOpenTabForChat = (e: Event) => {
-      try {
-        const customEvent = e as CustomEvent;
-        if (customEvent.detail?.tab === 'Chat') {
-          setIsChatOpen(true);
-          setIsChatMinimized(false);
-          const convId = customEvent.detail?.metadata?.conversationId;
-          if (convId) {
-            setTimeout(() => {
-              window.dispatchEvent(
-                new CustomEvent('fenix_select_chat_conversation', {
-                  detail: { conversationId: convId },
-                })
-              );
-            }, 50);
-          }
-        }
-      } catch {}
-    };
-
-    updateChatUnread();
-    window.addEventListener('fenix_chat_updated', updateChatUnread);
-    window.addEventListener('fenix_chat_message_received', handleChatMessageReceived);
-    window.addEventListener('fenix_open_tab', handleOpenTabForChat);
-
-    return () => {
-      cleanup();
-      window.removeEventListener('fenix_chat_updated', updateChatUnread);
-      window.removeEventListener('fenix_chat_message_received', handleChatMessageReceived);
-      window.removeEventListener('fenix_open_tab', handleOpenTabForChat);
-    };
-  }, [userName]);
 
   // Data atual e frase bíblica do dia com atualização automática à meia-noite
   const [currentDate, setCurrentDate] = useState<Date>(() => new Date());
@@ -711,22 +617,6 @@ export const Header: React.FC<HeaderProps> = ({
       return;
     }
 
-    // Se for notificação de Chat, abrir diretamente o chat e selecionar a conversa
-    if ((notif.category as any) === 'Chat' || notif.targetTab === 'Chat') {
-      setIsChatOpen(true);
-      setIsChatMinimized(false);
-      const convId = notif.metadata?.conversationId;
-      if (convId) {
-        setTimeout(() => {
-          window.dispatchEvent(
-            new CustomEvent('fenix_select_chat_conversation', {
-              detail: { conversationId: convId },
-            })
-          );
-        }, 50);
-      }
-      return;
-    }
 
     // Se for notificação de Tarefas, abrir a aba Tarefas e focar no item se houver ID
     if (notif.category === 'Tarefas' || notif.targetTab === 'Tarefas') {
@@ -1061,40 +951,10 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Right Side: Chat + Sino de Notificações + BUSCA GLOBAL + Perfil da Usuária */}
+          {/* Right Side: Sino de Notificações + BUSCA GLOBAL + Perfil da Usuária */}
           <div className="flex items-center gap-2 sm:gap-2.5 lg:gap-3 flex-shrink-0">
           {/* ==========================================
-              1. ÍCONE DE CHAT INTERNO (ao lado do Sino)
-              [ 💬 Chat ] [ 🔔 Notificações ] [ Avatar ]
-             ========================================== */}
-          <div className="relative">
-            <button
-              type="button"
-              id="header-chat-button"
-              onClick={() => {
-                if (isChatMinimized) {
-                  setIsChatMinimized(false);
-                  setIsChatOpen(true);
-                } else {
-                  setIsChatOpen((prev) => !prev);
-                }
-              }}
-              className="relative w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 backdrop-blur-md border border-white/20 hover:border-white/30 flex items-center justify-center text-white/90 hover:text-white transition-all cursor-pointer shadow-sm"
-              aria-label="Chat interno"
-              title="Chat Fênix World"
-            >
-              <MessageSquare className="w-4 h-4 stroke-[2]" />
-              {/* Contador de mensagens não lidas no Chat (separado do sino de notificações) */}
-              {chatUnreadCount > 0 && (
-                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-rose-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center border-2 border-[#091122] shadow-sm animate-in zoom-in duration-150">
-                  {chatUnreadCount > 99 ? '99+' : chatUnreadCount}
-                </span>
-              )}
-            </button>
-          </div>
-
-          {/* ==========================================
-              2. SINO DE NOTIFICAÇÕES (com abas de categorias)
+              SINO DE NOTIFICAÇÕES (com abas de categorias)
               Todas | Tarefas | Boletos | Follow-up | Meta | Notas | Pendências
              ========================================== */}
           <div ref={notifContainerRef} className="relative">
@@ -1656,15 +1516,6 @@ export const Header: React.FC<HeaderProps> = ({
             onClose={() => setIsProfileModalOpen(false)}
             currentUserName={userName}
             onProfileUpdated={() => setAuthVersion((v) => v + 1)}
-          />
-
-          {/* Painel Flutuante do Chat Interno Fênix World (Acessível em qualquer aba) */}
-          <ChatPanel
-            isOpen={isChatOpen}
-            onClose={() => setIsChatOpen(false)}
-            currentUserName={userName}
-            isMinimized={isChatMinimized}
-            onToggleMinimize={() => setIsChatMinimized(!isChatMinimized)}
           />
         </div>
         </div>

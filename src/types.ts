@@ -517,6 +517,18 @@ export interface FollowUpItem {
   desconto?: number;
   produtos?: any[];
   historico?: FollowUpHistoryEntry[];
+  trackingStatus?: 'Pendente' | 'Vendido' | 'Não vendido';
+  customSqm?: number;
+  trackingUpdatedAt?: string;
+  trackingOverrides?: {
+    cliente?: boolean;
+    telefone?: boolean;
+    nomeOrcamento?: boolean;
+    sqm?: boolean;
+    valor?: boolean;
+    observacao?: boolean;
+  };
+  hiddenFromTrackingList?: boolean;
 }
 
 export type PendenciaStatus = 'Pendente' | 'Em andamento' | 'Resolvida';

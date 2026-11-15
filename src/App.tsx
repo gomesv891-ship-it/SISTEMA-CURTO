@@ -20,6 +20,8 @@ import { ConfiguracoesScreen } from './components/ConfiguracoesScreen';
 import { ControleEstoqueScreen } from './components/ControleEstoqueScreen';
 import { VendasScreen } from './components/VendasScreen';
 import { NotificacoesScreen } from './components/NotificacoesScreen';
+import { AnotacoesScreen } from './components/AnotacoesScreen';
+import { PromocoesAtivasScreen } from './components/PromocoesAtivasScreen';
 import { ClientRecord, SavedOrcamento } from './types';
 import { getStoredAccounts, isEderPerez, isUserRevoked } from './utils/auth';
 import { pullDataFromSupabase, initSupabaseRealtimeSubscription, syncModuleData } from './utils/supabaseClient';
@@ -118,6 +120,8 @@ export default function App() {
       'Pendencias',
       'Notas',
       'Vendas',
+      'Negociações',
+      'Negociacoes',
     ];
     if (!saved || removedTabs.includes(saved)) return 'Clientes';
     return saved;
@@ -204,7 +208,7 @@ export default function App() {
       try {
         const customEvent = e as CustomEvent;
         const target = customEvent.detail?.tab;
-        if (target && target !== 'Chat') {
+        if (target) {
           setCurrentTab(target);
         }
       } catch {}
@@ -352,6 +356,8 @@ export default function App() {
         'pos vendas',
         'pós vendas',
         'pós-vendas',
+        'negociacoes',
+        'negociações',
       ];
       if (removedHashes.includes(hash)) {
         window.location.hash = 'clientes';
@@ -363,13 +369,22 @@ export default function App() {
         clientes: 'Clientes',
         calculadora: 'Calculadora',
         orcamentos: 'Orçamentos',
+        'orçamentos': 'Orçamentos',
         agenda: 'Agenda',
         'follow-up': 'Follow-up',
         followup: 'Follow-up',
+        promocoes: 'Promoções Ativas',
+        'promoções': 'Promoções Ativas',
+        'promocoes-ativas': 'Promoções Ativas',
+        'promoções-ativas': 'Promoções Ativas',
+        promocoesativas: 'Promoções Ativas',
         metas: 'Metas',
         produtos: 'Produtos',
         tarefas: 'Tarefas',
+        anotacoes: 'Anotações',
+        'anotações': 'Anotações',
         configuracoes: 'Configurações',
+        'configurações': 'Configurações',
       };
 
       if (map[hash]) {
@@ -398,9 +413,11 @@ export default function App() {
       'Calculadora',
       'Orçamentos',
       'Follow-up',
+      'Promoções Ativas',
       'Metas',
       'Produtos',
       'Tarefas',
+      'Anotações',
       'Configurações',
       'Notificações',
     ];
@@ -427,6 +444,7 @@ export default function App() {
       'vendas',
       'controle de estoque',
       'documentos',
+      'negociacoes',
     ]);
 
     if (userAccount && Array.isArray(userAccount.modulos)) {
@@ -438,6 +456,15 @@ export default function App() {
           .replace(/[-_\s]/g, '');
         return !removedSet.has(norm);
       });
+      if (!clean.some((m) => {
+        const nm = m.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[-_\s]/g, '');
+        return nm === 'promocoesativas';
+      })) {
+        clean.push('Promoções Ativas');
+      }
+      if (!clean.some((m) => m.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim() === 'anotacoes')) {
+        clean.push('Anotações');
+      }
       if (!clean.includes('Notificações')) {
         clean.push('Notificações');
       }
@@ -665,6 +692,10 @@ export default function App() {
                 currentUserName={currentUserName}
                 onNavigateTab={(tab) => setCurrentTab(tab as any)}
               />
+            ) : currentTab === 'Anotações' || currentTab === 'Anotacoes' ? (
+              <AnotacoesScreen currentUserName={currentUserName} />
+            ) : currentTab === 'Promoções Ativas' || currentTab === 'Promocoes Ativas' ? (
+              <PromocoesAtivasScreen currentUserName={currentUserName} />
             ) : currentTab === 'Follow-up' || currentTab === 'FollowUp' ? (
               <FollowUpScreen
                 currentUserName={currentUserName}

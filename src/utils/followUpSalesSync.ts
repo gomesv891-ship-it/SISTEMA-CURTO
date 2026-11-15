@@ -1,7 +1,9 @@
 import { FollowUpItem, FollowUpStatus, VendaGerencial } from '../types';
-import { saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase } from './supabaseClient';
+import { getSupabaseClient, saveItemToSupabase, deleteItemFromSupabase, saveWholeCollectionToSupabase } from './supabaseClient';
 import { calcularCustosVariaveis, calcularLucroEMargem } from './custosVariaveis';
-import { findMatchingVendaIndex, deduplicateVendasList, syncSingleMetaSaleToVendas } from './vendasService';
+import { findMatchingVendaIndex, deduplicateVendasList, syncSingleMetaSaleToVendas, DELETED_VENDAS_KEY } from './vendasService';
+import { getUserIdByName, isUserRevoked } from './auth';
+import { getSellerIdForUser } from './userDataFilter';
 
 export const METAS_SALES_STORAGE_KEY = 'fenix_metas_sales_db';
 export const VENDAS_GERENCIAL_STORAGE_KEY = 'fenix_vendas_gerencial';
@@ -9,19 +11,159 @@ export const FOLLOWUP_STORAGE_KEY_V2 = 'fenix_followup_cards_v2';
 export const FOLLOWUP_STORAGE_KEY_LEGACY = 'fenix_followup_db';
 
 /**
+ * Converte valores numéricos ou strings em formato BRL ("R$ 10.000,00") para number.
+ */
+function parseMonetaryValue(raw: string | number | undefined | null): number {
+  if (raw === undefined || raw === null || raw === '') return 0;
+  if (typeof raw === 'number') return isNaN(raw) ? 0 : raw;
+  const str = String(raw).trim();
+  if (!str) return 0;
+  if (/^-?\d+(\.\d+)?$/.test(str)) {
+    const n = parseFloat(str);
+    return isNaN(n) ? 0 : n;
+  }
+  const cleaned = str.replace(/[^\d.,-]/g, '');
+  if (!cleaned) return 0;
+  if (cleaned.includes('.') && cleaned.includes(',')) {
+    const n = parseFloat(cleaned.replace(/\./g, '').replace(',', '.'));
+    return isNaN(n) ? 0 : n;
+  }
+  if (cleaned.includes(',')) {
+    const n = parseFloat(cleaned.replace(',', '.'));
+    return isNaN(n) ? 0 : n;
+  }
+  if (cleaned.includes('.')) {
+    const parts = cleaned.split('.');
+    if (parts.length > 1 && parts[parts.length - 1].length === 3) {
+      const n = parseFloat(cleaned.replace(/\./g, ''));
+      return isNaN(n) ? 0 : n;
+    }
+    const n = parseFloat(cleaned);
+    return isNaN(n) ? 0 : n;
+  }
+  const n = parseFloat(cleaned.replace(/\D/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+
+/**
+ * Retorna a data local no formato YYYY-MM-DD (evita deslocamento de fuso horário UTC à noite).
+ */
+function getLocalDateISO(date: Date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Verifica se o nome informado é genérico/sistema ou pertence a usuário revogado.
+ */
+function isGenericOrRevokedSeller(name?: string | null): boolean {
+  if (!name) return true;
+  const norm = name
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  if (
+    !norm ||
+    norm === 'sistema' ||
+    norm === 'usuario fenix' ||
+    norm === 'consultora fenix' ||
+    norm === 'crm fenix' ||
+    norm === 'geral' ||
+    norm === 'todos'
+  ) {
+    return true;
+  }
+  return isUserRevoked(name);
+}
+
+/**
  * Normaliza número do pedido removendo caracteres especiais
  */
 export function extractCleanPedido(raw?: string | number): string {
   if (!raw) return '';
-  return String(raw).trim().replace(/^#+/, '').replace(/\D/g, '') || String(raw).trim().replace(/^#+/, '');
+  return String(raw).trim().replace(/^#+/, '');
+}
+
+/**
+ * Localiza o orçamento de origem salvo em fenix_orcamentos_history / fenix_saved_orcamentos
+ */
+function findOriginOrcamento(budget: FollowUpItem): any | null {
+  try {
+    const originOrcId = (budget.orcamentoId || budget.id.replace(/^fup_/, '')).trim();
+    const bareOrcId = originOrcId.replace(/^orc_/, '');
+
+    const sources = [
+      localStorage.getItem('fenix_orcamentos_history'),
+      localStorage.getItem('fenix_saved_orcamentos'),
+    ];
+
+    for (const raw of sources) {
+      if (!raw) continue;
+      const list = JSON.parse(raw);
+      if (!Array.isArray(list)) continue;
+      const found = list.find((o: any) => {
+        if (!o || !o.id) return false;
+        const oId = String(o.id).trim();
+        return (
+          oId === originOrcId ||
+          oId === budget.id ||
+          oId.replace(/^orc_/, '') === bareOrcId
+        );
+      });
+      if (found) return found;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Remove IDs relacionados à venda reconfirmada da lista de vendas excluídas para nunca ocultar em Metas.
+ */
+function clearDeletedIdsForConfirmedSale(idsToRestore: string[], user: string): void {
+  try {
+    const rawDel = localStorage.getItem(DELETED_VENDAS_KEY);
+    if (!rawDel) return;
+    const parsedDel = JSON.parse(rawDel);
+    if (!Array.isArray(parsedDel) || parsedDel.length === 0) return;
+
+    const restoreSet = new Set(idsToRestore.filter(Boolean).map((x) => String(x).trim()));
+    if (restoreSet.size === 0) return;
+
+    const filteredDel = parsedDel.filter((d: any) => !restoreSet.has(String(d).trim()));
+    if (filteredDel.length === parsedDel.length) return;
+
+    localStorage.setItem(DELETED_VENDAS_KEY, JSON.stringify(filteredDel));
+    if (filteredDel.length > 0) {
+      saveWholeCollectionToSupabase(DELETED_VENDAS_KEY, filteredDel, user).catch(() => {});
+    } else {
+      const client = getSupabaseClient();
+      if (client) {
+        client
+          .from('fenix_kv_store')
+          .upsert(
+            {
+              key: DELETED_VENDAS_KEY,
+              data: [],
+              updated_at: new Date().toISOString(),
+              updated_by: user,
+            },
+            { onConflict: 'key' }
+          )
+          .then(() => {}, () => {});
+      }
+    }
+  } catch {}
 }
 
 /**
  * 1. FOLLOW-UP + META + VENDAS
- * Sincroniza a transição de status do Follow-up com a META do responsável e VENDAS do Diretor Éder.
- * - Se VENDIDO: Adiciona ou atualiza na META do responsável e em VENDAS do Diretor Éder.
- * - Se mudar de VENDIDO para qualquer outro status: remove automaticamente da META e das Vendas do Diretor.
- * - Impede duplicações usando o ID único do Follow-up / Orçamento / Pedido.
+ * Sincroniza a transição de status do Follow-up com a META da consultora responsável vinculada ao orçamento.
+ * - Se VENDIDO: Adiciona ou atualiza na META usando o valor e a responsável vinculados ao orçamento.
+ * - Mantém vínculo explícito entre orçamento (orcamentoId), Follow-up (followUpId) e venda (pedido).
+ * - Impede duplicações usando ID do orçamento, ID do Follow-up e número do pedido.
  */
 export function syncFollowUpStatusWithMetasAndVendas(
   budget: FollowUpItem,
@@ -32,145 +174,228 @@ export function syncFollowUpStatusWithMetasAndVendas(
     formasPagamento?: any[];
     formaPagamento?: string;
     parcelas?: string;
+    wasPreviouslySold?: boolean;
   }
 ): void {
   if (typeof window === 'undefined' || !budget || !budget.id) return;
 
   const cleanPedido = extractCleanPedido(extraData?.pedido || budget.pedido);
-  const saleId = `v_orc_${budget.id}`;
+  const originOrc = findOriginOrcamento(budget);
+  const originOrcId = String(
+    originOrc?.id || budget.orcamentoId || budget.id.replace(/^fup_/, '')
+  ).trim();
+  const bareOrcId = originOrcId.replace(/^orc_/, '');
+  const followUpId = String(budget.id).trim();
+  const saleId = `v_orc_${originOrcId || followUpId}`;
   const now = new Date();
-  const dateStr = now.toISOString().split('T')[0];
+  const dateStr = getLocalDateISO(now);
+  const nowIso = now.toISOString();
 
+  // Responsável vinculado ao orçamento de origem (ignora genéricos e contas revogadas)
+  const sellerCandidates = [
+    originOrc?.consultoraName,
+    originOrc?.responsavel,
+    originOrc?.vendedor,
+    originOrc?.registeredBy,
+    originOrc?.criadoPor,
+    budget.responsavel,
+    budget.vendedor,
+    (budget as any).consultoraName,
+    (budget as any).vendedorNome,
+    budget.criadoPor,
+    currentUserName,
+    'Vanessa Gomes',
+  ];
   const responsibleUser = (
-    budget.responsavel ||
-    budget.vendedor ||
-    (budget as any).consultoraName ||
-    (budget as any).vendedorNome ||
-    budget.criadoPor ||
-    currentUserName ||
-    'Vanessa Gomes'
+    sellerCandidates.find((c) => typeof c === 'string' && !isGenericOrRevokedSeller(c)) ||
+    (!isGenericOrRevokedSeller(currentUserName) ? currentUserName : 'Vanessa Gomes')
   ).trim();
 
-  const saleValue = Number(budget.valor) || 0;
-  const clientName = (budget.cliente || 'Cliente').trim();
-  const clientPhone = budget.telefone || (budget as any).clienteWhatsapp || (budget as any).clientPhone || (budget as any).whatsapp || '';
-  const clientType = budget.clientType || 'Cliente Final';
+  const resolvedSellerId =
+    getUserIdByName(responsibleUser) ||
+    getSellerIdForUser(responsibleUser) ||
+    originOrc?.vendedorId ||
+    originOrc?.responsavelId ||
+    budget.vendedorId ||
+    budget.responsavelId ||
+    null;
+
+  // Valor vinculado ao orçamento de origem
+  const originValor =
+    parseMonetaryValue(originOrc?.totalFinal) ||
+    parseMonetaryValue(originOrc?.valor) ||
+    parseMonetaryValue(originOrc?.totalGeral);
+  const budgetValor = parseMonetaryValue(budget.valor);
+  const saleValue = originValor > 0 ? originValor : budgetValor;
+
+  const clientName = (originOrc?.clientName || budget.cliente || 'Cliente').trim();
+  const clientPhone =
+    originOrc?.clientContact ||
+    budget.telefone ||
+    (budget as any).clienteWhatsapp ||
+    (budget as any).clientPhone ||
+    (budget as any).whatsapp ||
+    '';
+  const clientType = originOrc?.clientType || budget.clientType || 'Cliente Final';
 
   // Resgata frete, desconto e produtos vinculados ao orçamento original
-  let freteVal = Number(budget.frete) || 0;
-  let descontoVal = Number(budget.desconto) || 0;
+  let freteVal =
+    originOrc?.freteAtivo && originOrc?.freteValor
+      ? parseMonetaryValue(originOrc.freteValor)
+      : parseMonetaryValue(budget.frete);
+  let descontoVal =
+    originOrc?.descontoValor !== undefined
+      ? parseMonetaryValue(originOrc.descontoValor)
+      : parseMonetaryValue(budget.desconto);
   let orcProdutos: any[] | undefined = budget.produtos;
-  try {
-    if (!freteVal || !orcProdutos) {
-      const rawOrcs = localStorage.getItem('fenix_orcamentos_history') || localStorage.getItem('fenix_saved_orcamentos');
-      if (rawOrcs) {
-        const list = JSON.parse(rawOrcs);
-        if (Array.isArray(list)) {
-          const match = list.find((o: any) => o && (o.id === budget.orcamentoId || o.id === budget.id || o.id === budget.id.replace('fup_', '')));
-          if (match) {
-            if (!freteVal && match.freteAtivo && match.freteValor) {
-              freteVal = Number(match.freteValor) || 0;
-            }
-            if (!descontoVal && match.descontoValor) {
-              descontoVal = Number(match.descontoValor) || 0;
-            }
-            if (!orcProdutos && Array.isArray(match.items)) {
-              orcProdutos = match.items.map((it: any) => ({
-                id: it.id || `p_${Math.random()}`,
-                nome: it.descricao || 'Produto',
-                detalhe: it.subtitulo,
-                unidade: it.unidade || 'un',
-                quantidade: parseFloat(it.qtd) || 1,
-                valorUnitario: Number(it.precoUnitario) || 0,
-                subtotal: Number(it.total) || 0,
-              }));
-            }
-          }
-        }
-      }
-    }
-  } catch {}
+  if ((!orcProdutos || orcProdutos.length === 0) && Array.isArray(originOrc?.items)) {
+    orcProdutos = originOrc.items.map((it: any) => ({
+      id: it.id || `p_${Math.random()}`,
+      nome: it.descricao || 'Produto',
+      detalhe: it.subtitulo,
+      unidade: it.unidade || 'un',
+      quantidade: parseFloat(it.qtd) || 1,
+      valorUnitario: parseMonetaryValue(it.precoUnitario),
+      subtotal: parseMonetaryValue(it.total),
+    }));
+  }
 
   // ----------------------------------------------------
   // CASO 1: MARCADO COMO VENDIDO -> ADICIONAR / ATUALIZAR
   // ----------------------------------------------------
   if (newStatus === 'Vendido') {
-    // 1.1 Atualizar META DO RESPONSÁVEL
+    // Garante que uma reconfirmação no Follow-up não fique oculta por exclusões anteriores
+    clearDeletedIdsForConfirmedSale(
+      [
+        saleId,
+        `v_orc_${followUpId}`,
+        `v_orc_${bareOrcId}`,
+        `v_orc_orc_${bareOrcId}`,
+        `v_orc_fup_${originOrcId}`,
+        followUpId,
+        originOrcId,
+        bareOrcId,
+        `orc_${bareOrcId}`,
+        `fup_${bareOrcId}`,
+        cleanPedido,
+        cleanPedido ? `ped_${cleanPedido}` : '',
+      ],
+      responsibleUser
+    );
+
+    // 1.1 Atualizar META DA CONSULTORA RESPONSÁVEL
     try {
       const rawMetas = localStorage.getItem(METAS_SALES_STORAGE_KEY);
       let metasSales: any[] = rawMetas ? JSON.parse(rawMetas) : [];
       if (!Array.isArray(metasSales)) metasSales = [];
 
-      const orcId = budget.orcamentoId ? String(budget.orcamentoId) : undefined;
       const clientNameNorm = clientName.toLowerCase().trim();
 
+      const isMatchingMetaSale = (s: any): boolean => {
+        if (!s) return false;
+        const sId = String(s.id || '').trim();
+        const sFupId = s.followUpId ? String(s.followUpId).trim() : '';
+        const sOrcId = s.orcamentoId ? String(s.orcamentoId).trim() : '';
+        const sBareOrc = sOrcId.replace(/^orc_/, '');
+
+        if (
+          sId === saleId ||
+          sId === `v_orc_${followUpId}` ||
+          sId === `v_orc_${originOrcId}` ||
+          sId === `v_orc_fup_${originOrcId}` ||
+          (bareOrcId && (sId === `v_orc_${bareOrcId}` || sId === `v_orc_orc_${bareOrcId}`))
+        ) {
+          return true;
+        }
+        if (
+          sFupId &&
+          (sFupId === followUpId ||
+            sFupId === `fup_${originOrcId}` ||
+            (bareOrcId && sFupId === `fup_${bareOrcId}`))
+        ) {
+          return true;
+        }
+        if (
+          sOrcId &&
+          (sOrcId === originOrcId ||
+            sOrcId === followUpId ||
+            sOrcId === `fup_${originOrcId}` ||
+            (bareOrcId && sBareOrc === bareOrcId))
+        ) {
+          return true;
+        }
+        const sPed = extractCleanPedido(s.pedido);
+        const sCli = (s.cliente || '').trim().toLowerCase();
+        const bothHaveDifferentOrcs = Boolean(bareOrcId && sBareOrc && bareOrcId !== sBareOrc);
+        if (
+          !bothHaveDifferentOrcs &&
+          cleanPedido &&
+          sPed &&
+          cleanPedido === sPed &&
+          (!clientNameNorm || !sCli || clientNameNorm === sCli)
+        ) {
+          return true;
+        }
+        return false;
+      };
+
+      const existingIndices: number[] = [];
+      metasSales.forEach((s, idx) => {
+        if (isMatchingMetaSale(s)) existingIndices.push(idx);
+      });
+
+      const primaryExisting = existingIndices.length > 0 ? metasSales[existingIndices[0]] : null;
+      const resolvedData =
+        extraData?.wasPreviouslySold && primaryExisting?.data ? primaryExisting.data : dateStr;
+
       const metaSaleRecord = {
-        id: saleId,
-        orcamentoId: budget.id,
-        followUpId: budget.id,
+        id: primaryExisting?.id || saleId,
+        orcamentoId: originOrcId,
+        followUpId: followUpId,
         pedido: cleanPedido,
         valor: saleValue,
         frete: freteVal > 0 ? freteVal : undefined,
         desconto: descontoVal > 0 ? descontoVal : undefined,
         produtos: orcProdutos,
         cliente: clientName,
-        clienteId: budget.clientId,
+        clienteId: originOrc?.clientId || budget.clientId,
         whatsapp: clientPhone,
         tipoCliente: clientType,
-        formaPagamento: extraData?.formaPagamento || budget.formaPagamento || 'Pix',
-        formasPagamento: extraData?.formasPagamento || budget.formasPagamento || [],
-        parcelas: extraData?.parcelas || budget.parcelas,
-        data: dateStr,
+        ...(extraData?.formaPagamento || primaryExisting?.formaPagamento
+          ? { formaPagamento: extraData?.formaPagamento || primaryExisting?.formaPagamento }
+          : {}),
+        ...(extraData?.formasPagamento?.length || primaryExisting?.formasPagamento?.length
+          ? { formasPagamento: extraData?.formasPagamento || primaryExisting?.formasPagamento }
+          : {}),
+        ...(extraData?.parcelas || primaryExisting?.parcelas
+          ? { parcelas: extraData?.parcelas || primaryExisting?.parcelas }
+          : {}),
+        data: resolvedData,
+        updatedAt: nowIso,
         responsavel: responsibleUser,
         vendedor: responsibleUser,
         consultoraName: responsibleUser,
-        vendedorId: budget.vendedorId || null,
-        responsavelId: budget.responsavelId || null,
-        criadoPor: budget.criadoPor || responsibleUser,
-        registeredBy: currentUserName || responsibleUser,
+        vendedorId: resolvedSellerId,
+        responsavelId: resolvedSellerId,
+        criadoPor: responsibleUser,
+        registeredBy: responsibleUser,
         origem: 'followup',
       };
 
-      // REGRA: Evitar duplicação caso o Follow-up seja editado novamente
-      const existingIndex = metasSales.findIndex((s: any) => {
-        if (!s) return false;
-        if (s.id === saleId) return true;
-        if (s.followUpId && String(s.followUpId) === String(budget.id)) return true;
-        if (s.orcamentoId && String(s.orcamentoId) === String(budget.id)) return true;
-        if (orcId && (s.orcamentoId === orcId || s.followUpId === orcId || s.id === `v_orc_${orcId}`)) return true;
-        const sPed = extractCleanPedido(s.pedido);
-        const sCli = (s.cliente || '').trim().toLowerCase();
-        if (cleanPedido && sPed && cleanPedido === sPed && (!clientNameNorm || !sCli || clientNameNorm === sCli)) {
-          return true;
-        }
-        return false;
-      });
-
-      let updatedMetas: any[];
-      if (existingIndex >= 0) {
-        // Atualiza a venda existente sem recriar ou duplicar
-        updatedMetas = [...metasSales];
-        const existingItem = updatedMetas[existingIndex];
-        updatedMetas[existingIndex] = {
-          ...existingItem,
-          ...metaSaleRecord,
-          id: existingItem.id || saleId,
-        };
-      } else {
-        // Adiciona a nova venda preservando integralmente todas as anteriores
-        updatedMetas = [metaSaleRecord, ...metasSales];
-      }
+      // Atualiza in-place o registro existente e remove eventuais duplicatas antigas da mesma venda
+      const withoutDuplicates = metasSales.filter((s) => !isMatchingMetaSale(s));
+      const updatedMetas = [metaSaleRecord, ...withoutDuplicates];
 
       localStorage.setItem(METAS_SALES_STORAGE_KEY, JSON.stringify(updatedMetas));
-      // Salva de forma atômica no Supabase sem sobrescrever outras vendas
-      saveItemToSupabase(METAS_SALES_STORAGE_KEY, metaSaleRecord, 'id', currentUserName).catch(() => {});
-      syncSingleMetaSaleToVendas(metaSaleRecord, currentUserName).catch(() => {});
+      // Salva de forma atômica no Supabase garantindo deduplicação
+      saveItemToSupabase(METAS_SALES_STORAGE_KEY, metaSaleRecord, 'id', responsibleUser).catch(() => {});
+      syncSingleMetaSaleToVendas(metaSaleRecord, responsibleUser).catch(() => {});
       window.dispatchEvent(new Event('fenix_metas_updated'));
     } catch (err) {
       console.error('Erro ao sincronizar venda na Meta:', err);
     }
 
-    // 1.2 Atualizar VENDAS DO DIRETOR ÉDER
+    // 1.2 Atualizar registro gerencial (mantido internamente em sync sem impactar layout)
     try {
       const rawVendas = localStorage.getItem(VENDAS_GERENCIAL_STORAGE_KEY);
       let gerencialSales: VendaGerencial[] = rawVendas ? JSON.parse(rawVendas) : [];
@@ -181,11 +406,11 @@ export function syncFollowUpStatusWithMetasAndVendas(
       const { lucro, margem } = calcularLucroEMargem(saleValue, custoProdutos, custosAdic);
 
       const vendaGerencialRecord: VendaGerencial = {
-        id: `vnd-fup-${budget.id}`,
-        numeroPedido: cleanPedido || String(budget.id).replace(/\D/g, '').slice(-4),
+        id: `vnd-fup-${originOrcId || followUpId}`,
+        numeroPedido: cleanPedido || String(originOrcId || followUpId).replace(/\D/g, '').slice(-4),
         data: dateStr,
         cliente: clientName,
-        clienteId: budget.clientId,
+        clienteId: originOrc?.clientId || budget.clientId,
         tipoCliente: clientType,
         vendedor: responsibleUser,
         valorVenda: saleValue,
@@ -199,16 +424,16 @@ export function syncFollowUpStatusWithMetasAndVendas(
         observacoes: `Venda confirmada no Follow-up Comercial por ${responsibleUser}.`,
         itensResumo: budget.produto || budget.nomeOrcamento || 'Piso Vinílico e Acessórios Fênix',
         metaId: saleId,
-        followUpId: budget.id,
-        orcamentoId: budget.id,
+        followUpId: followUpId,
+        orcamentoId: originOrcId,
         createdAt: now.toISOString(),
-        criadoPor: currentUserName,
+        criadoPor: responsibleUser,
       };
 
       const existingIndex = findMatchingVendaIndex(gerencialSales, {
-        id: `vnd-fup-${budget.id}`,
-        followUpId: budget.id,
-        orcamentoId: budget.id,
+        id: vendaGerencialRecord.id,
+        followUpId: followUpId,
+        orcamentoId: originOrcId,
         pedido: cleanPedido,
         numeroPedido: cleanPedido,
         cliente: clientName,
@@ -228,8 +453,8 @@ export function syncFollowUpStatusWithMetasAndVendas(
           ...vendaGerencialRecord,
           id: gerencialSales[existingIndex].id || vendaGerencialRecord.id,
           metaId: gerencialSales[existingIndex].metaId || saleId,
-          followUpId: budget.id,
-          orcamentoId: gerencialSales[existingIndex].orcamentoId || budget.id,
+          followUpId: followUpId,
+          orcamentoId: originOrcId,
         };
       } else {
         updatedVendas = [vendaGerencialRecord, ...gerencialSales];
@@ -241,7 +466,7 @@ export function syncFollowUpStatusWithMetasAndVendas(
       window.dispatchEvent(new Event('fenix_vendas_gerencial_updated'));
       window.dispatchEvent(new Event('fenix_vendas_updated'));
     } catch (err) {
-      console.error('Erro ao sincronizar Vendas do Diretor:', err);
+      console.error('Erro ao sincronizar Vendas Gerencial:', err);
     }
   } else {
     // REGRA: Nunca apagar, substituir ou zerar vendas já existentes em Metas.

@@ -116,4 +116,136 @@
   overflow: visible;
 }
 
+/* Caderno Digital Fênix World — alinhamento sincronizado ao espaçamento real (32px) */
+.anotacao-rich-content {
+  font-size: 15px !important;
+  line-height: 32px !important;
+}
+
+.anotacao-rich-content p,
+.anotacao-rich-content div,
+.anotacao-rich-content blockquote,
+.anotacao-rich-content h1,
+.anotacao-rich-content h2,
+.anotacao-rich-content h3,
+.anotacao-rich-content h4,
+.anotacao-rich-content pre {
+  margin: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  min-height: 32px;
+  font-size: 15px !important;
+  line-height: 32px !important;
+  font-weight: inherit;
+}
+
+.anotacao-rich-content ul {
+  list-style-type: disc !important;
+  padding-left: 1.5rem !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin: 0 !important;
+}
+
+.anotacao-rich-content ol {
+  list-style-type: decimal !important;
+  padding-left: 1.65rem !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin: 0 !important;
+}
+
+.anotacao-rich-content li {
+  margin: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  min-height: 32px;
+  font-size: 15px !important;
+  line-height: 32px !important;
+}
+
+.anotacao-rich-content mark,
+.anotacao-rich-content span,
+.anotacao-rich-content b,
+.anotacao-rich-content strong,
+.anotacao-rich-content i,
+.anotacao-rich-content em,
+.anotacao-rich-content u,
+.anotacao-rich-content font,
+.anotacao-rich-content a {
+  line-height: inherit !important;
+  font-size: inherit !important;
+  vertical-align: baseline;
+}
+
+.anotacao-rich-content mark {
+  border-radius: 3px;
+  padding: 0 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.anotacao-rich-content strong,
+.anotacao-rich-content b {
+  font-weight: 700 !important;
+}
+
+.anotacao-rich-content em,
+.anotacao-rich-content i {
+  font-style: italic;
+}
+
+.anotacao-rich-content u {
+  text-decoration: underline;
+}
+
+.anotacao-checklist-editable {
+  font-size: 15px !important;
+  line-height: 32px !important;
+  min-height: 32px;
+}
+
+.anotacao-checklist-editable:empty:before {
+  content: attr(data-placeholder);
+  color: #94a3b8;
+  pointer-events: none;
+  display: block;
+}
+
+#fenix-anotacao-print-root {
+  position: fixed;
+  left: -99999px;
+  top: 0;
+  width: 794px;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
+@media print {
+  body.printing-anotacao-a4 > *:not(#fenix-anotacao-print-root) {
+    display: none !important;
+  }
+
+  body.printing-anotacao-a4 #fenix-anotacao-print-root {
+    display: block !important;
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    visibility: visible !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    z-index: auto !important;
+  }
+
+  body.printing-anotacao-a4 #fenix-anotacao-print-root * {
+    visibility: visible !important;
+  }
+
+  body.printing-anotacao-a4 #fenix-anotacao-print-root .anotacao-checkbox-box {
+    display: inline-flex !important;
+  }
+}
 

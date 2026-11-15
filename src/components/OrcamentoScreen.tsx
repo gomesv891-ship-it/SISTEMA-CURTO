@@ -70,7 +70,54 @@ import {
 import {
   isRodapeProduct,
   convertMetrosToBarras,
+  calculateRodapeBarras,
+  extractBarLengthFromProductName,
+  parseBarCountFromInput,
+  formatRodapeDetailText,
+  parseRodapeDetails,
+  isRodapeColaCatalogProduct,
+  isRodapeCalafetarCatalogProduct,
+  calculateRodapeInsumosForOrcamento,
+  formatMlPtBr,
+  RodapeInsumosPlan,
 } from '../utils/rodapeCalculator';
+import { ModalIncluirInsumosPiso } from './ModalIncluirInsumosPiso';
+import {
+  ModalIncluirInsumosRodape,
+  RodapeInsumosConfirmSelection,
+} from './ModalIncluirInsumosRodape';
+import {
+  calculatePisoInsumosForOrcamento,
+  convertBoxesToPisoSqm,
+  convertSqmToPisoBoxes,
+  extractPisoBoxYield,
+  formatBoxesDetail,
+  formatSqmPtBr,
+  getQuickBudgetPisoCandidates,
+  getQuickBudgetRodapeCandidates,
+  isPisoVinilicoColado,
+  isPisoVinilicoProduct,
+  isSquareMeterUnit,
+  parseBoxesFromDetail,
+  parsePtBrNumeric,
+  PisoInsumosPlan,
+  QuickBudgetRodapeHeight,
+} from '../utils/pisoInsumosCalculator';
+import {
+  applyPisoTableQuantityChange,
+  applyRodapeTableQuantityChange,
+  classifyPisoInsumoGroup,
+  classifyRodapeInsumoGroup,
+  ensurePisoLinkForExistingBudget,
+  ensureRodapeLinkForExistingBudgetList,
+  getPisoInsumoGroupFromKind,
+  PisoInsumoGroup,
+  PisoInsumoLink,
+  RodapeInsumoGroup,
+  RodapeInsumoLink,
+  syncPisoInsumosInItemsList,
+  syncRodapeInsumosInItemsList,
+} from '../utils/orcamentoSync';
 
 interface OrcamentoScreenProps {
   client: ClientRecord | null;
@@ -249,6 +296,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   useEffect(() => {
     if (client?.id) {
       if (selectedClientId && selectedClientId !== client.id && !initialOrcamento) {
+        pisoInsumoLinksRef.current.clear();
+        lockedPisoInsumoGroupsRef.current.clear();
+        removedPisoInsumoGroupsRef.current.clear();
+        rodapeInsumoLinksRef.current.clear();
+        lockedRodapeInsumoGroupsRef.current.clear();
+        removedRodapeInsumoGroupsRef.current.clear();
         setItems([]);
         setNomeOrcamento('');
         setObservacoes('');
@@ -300,6 +353,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     if (c.id !== selectedClientId) {
       // Ao selecionar o Cliente B e clicar em "Novo Orçamento", iniciar exclusivamente com os dados do Cliente B
       if (!initialOrcamento) {
+        resetAllInsumoLinks();
         setItems([]);
         setNomeOrcamento('');
         setObservacoes('');
@@ -502,9 +556,24 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   });
 
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
+  const [catalogRevision, setCatalogRevision] = useState(0);
+
+  // Atualiza automaticamente opções e preços quando o cadastro oficial de produtos for alterado (CRM / Supabase)
+  useEffect(() => {
+    const handleProductsUpdated = () => {
+      setCatalogRevision((r) => r + 1);
+    };
+    window.addEventListener('fenix_products_updated', handleProductsUpdated);
+    return () => {
+      window.removeEventListener('fenix_products_updated', handleProductsUpdated);
+    };
+  }, []);
 
   // Dynamic catalog directly from official PRODUTOS database
-  const dynamicCatalog = useMemo(() => getDynamicProductCatalog(), [isProductModalOpen]);
+  const dynamicCatalog = useMemo(
+    () => getDynamicProductCatalog(),
+    [isProductModalOpen, catalogRevision]
+  );
 
   // Form states for adding new product
   const [selectedProductCatalog, setSelectedProductCatalog] = useState<string>(
@@ -530,30 +599,484 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   }, [selectedProductCatalog, newCategoria]);
 
   // Controle de conversão direta de metros lineares para barras no campo Quantidade
-  const rodapeConvertedRef = useRef(false);
+  // Guarda separadamente o ML solicitado e a última quantidade de barras convertida (evita reconverter barras como ML)
+  const rodapeRequestedMlRef = useRef<number | null>(null);
+  const rodapeLastBarrasRef = useRef<number | null>(null);
   const rodapeDebounceTimerRef = useRef<any>(null);
 
-  const triggerRodapeQuantityConversion = (valToConvert?: string) => {
-    if (!isCurrentProductRodape) return;
-    if (rodapeConvertedRef.current) return;
+  const resetRodapeConversionRefs = () => {
+    if (rodapeDebounceTimerRef.current) {
+      clearTimeout(rodapeDebounceTimerRef.current);
+      rodapeDebounceTimerRef.current = null;
+    }
+    rodapeRequestedMlRef.current = null;
+    rodapeLastBarrasRef.current = null;
+  };
 
-    const rawVal = valToConvert !== undefined ? valToConvert : newQtd;
-    const result = convertMetrosToBarras(rawVal, selectedProductCatalog);
+  const triggerRodapeQuantityConversion = (valToConvert?: string): {
+    barras: number;
+    barLen: number;
+    requestedMl: number;
+    detailText: string;
+  } | null => {
+    if (!isCurrentProductRodape) return null;
+
+    const rawVal = (valToConvert !== undefined ? valToConvert : newQtd).trim();
+    if (!rawVal) return null;
+
+    const barLen = extractBarLengthFromProductName(selectedProductCatalog, 2.4);
+
+    const explicitBars = parseBarCountFromInput(rawVal);
+    if (explicitBars && explicitBars > 0) {
+      const requestedMl = Math.round(explicitBars * barLen * 100) / 100;
+      const detailText = formatRodapeDetailText({
+        requestedMl,
+        barCount: explicitBars,
+        barLengthMeters: barLen,
+        existingDetail: newSubtitulo,
+      });
+      rodapeRequestedMlRef.current = requestedMl;
+      rodapeLastBarrasRef.current = explicitBars;
+      setNewQtd(String(explicitBars));
+      setNewUnid('barras');
+      setNewSubtitulo(detailText);
+      return { barras: explicitBars, barLen, requestedMl, detailText };
+    }
+
+    const parsedNum = parsePtBrNumeric(rawVal);
+    if (parsedNum <= 0) return null;
+
+    // Se já corresponde às barras convertidas anteriormente, preserva o ML solicitado original sem reinterpretar
+    if (
+      rodapeLastBarrasRef.current !== null &&
+      Math.abs(parsedNum - rodapeLastBarrasRef.current) <= 0.005
+    ) {
+      const bars = rodapeLastBarrasRef.current;
+      const preservedMl =
+        rodapeRequestedMlRef.current && rodapeRequestedMlRef.current > 0
+          ? rodapeRequestedMlRef.current
+          : Math.round(bars * barLen * 100) / 100;
+      const detailText = formatRodapeDetailText({
+        requestedMl: preservedMl,
+        barCount: bars,
+        barLengthMeters: barLen,
+        existingDetail: newSubtitulo,
+      });
+      setNewUnid('barras');
+      setNewSubtitulo(detailText);
+      return { barras: bars, barLen, requestedMl: preservedMl, detailText };
+    }
+
+    const result = convertMetrosToBarras(rawVal, selectedProductCatalog, barLen);
     if (result && result.barras > 0) {
+      const detailText = formatRodapeDetailText({
+        requestedMl: result.metros,
+        barCount: result.barras,
+        barLengthMeters: result.barLen,
+        existingDetail: newSubtitulo,
+      });
+      rodapeRequestedMlRef.current = result.metros;
+      rodapeLastBarrasRef.current = result.barras;
       setNewQtd(String(result.barras));
       setNewUnid('barras');
-      rodapeConvertedRef.current = true;
+      setNewSubtitulo(detailText);
+      return {
+        barras: result.barras,
+        barLen: result.barLen,
+        requestedMl: result.metros,
+        detailText,
+      };
+    }
+
+    return null;
+  };
+
+  // Controle de conversão bidirecional (m² <-> Caixas) para Pisos Vinílicos
+  const isCurrentProductPiso = useMemo(() => {
+    return isPisoVinilicoProduct(selectedProductCatalog, newCategoria);
+  }, [selectedProductCatalog, newCategoria]);
+
+  const isCurrentProductPisoColado = useMemo(() => {
+    return isPisoVinilicoColado(selectedProductCatalog, newCategoria);
+  }, [selectedProductCatalog, newCategoria]);
+
+  const currentPisoBoxYield = useMemo(() => {
+    if (!isCurrentProductPiso) return null;
+    return extractPisoBoxYield(selectedProductCatalog);
+  }, [isCurrentProductPiso, selectedProductCatalog]);
+
+  // Guarda separadamente a metragem originalmente solicitada e a última metragem efetiva convertida (anti-loop)
+  const pisoRequestedSqmRef = useRef<number | null>(null);
+  const pisoLastRealSqmRef = useRef<number | null>(null);
+  const pisoQtdDebounceRef = useRef<any>(null);
+
+  const resetPisoConversionRefs = () => {
+    if (pisoQtdDebounceRef.current) {
+      clearTimeout(pisoQtdDebounceRef.current);
+      pisoQtdDebounceRef.current = null;
+    }
+    pisoRequestedSqmRef.current = null;
+    pisoLastRealSqmRef.current = null;
+  };
+
+  const applyPisoFromQuantity = (rawQty: string, updateQtyField: boolean) => {
+    if (!isCurrentProductPiso || !isSquareMeterUnit(newUnid) || !currentPisoBoxYield) {
+      return null;
+    }
+    const parsedNum = parsePtBrNumeric(rawQty);
+    if (parsedNum <= 0) return null;
+
+    // Se a Quantidade já corresponde à metragem efetiva arredondada previamente, preserva a metragem original solicitada
+    const isAlreadyEffective =
+      pisoLastRealSqmRef.current !== null &&
+      Math.abs(parsedNum - pisoLastRealSqmRef.current) <= 0.009;
+
+    const requestedSqm = isAlreadyEffective
+      ? (pisoRequestedSqmRef.current ?? parsedNum)
+      : parsedNum;
+
+    pisoRequestedSqmRef.current = requestedSqm;
+
+    const conv = convertSqmToPisoBoxes(requestedSqm, currentPisoBoxYield, newSubtitulo);
+    setNewSubtitulo(conv.detailText);
+    if (updateQtyField) {
+      setNewQtd(conv.realSqmDisplay);
+      pisoLastRealSqmRef.current = conv.realSqm;
+    }
+    return conv;
+  };
+
+  const handlePisoQuantityInputChange = (val: string) => {
+    if (pisoQtdDebounceRef.current) {
+      clearTimeout(pisoQtdDebounceRef.current);
+      pisoQtdDebounceRef.current = null;
+    }
+    if (!isCurrentProductPiso || !isSquareMeterUnit(newUnid) || !currentPisoBoxYield) {
+      return;
+    }
+
+    const parsedNum = parsePtBrNumeric(val);
+    if (parsedNum <= 0) {
+      pisoRequestedSqmRef.current = null;
+      pisoLastRealSqmRef.current = null;
+      return;
+    }
+
+    if (
+      pisoLastRealSqmRef.current !== null &&
+      Math.abs(parsedNum - pisoLastRealSqmRef.current) <= 0.009
+    ) {
+      return;
+    }
+
+    pisoRequestedSqmRef.current = parsedNum;
+    pisoLastRealSqmRef.current = null;
+
+    // Atualiza Detalhe imediatamente com a quantidade de caixas arredondada para cima
+    const conv = convertSqmToPisoBoxes(parsedNum, currentPisoBoxYield, newSubtitulo);
+    setNewSubtitulo(conv.detailText);
+
+    // Atualiza Quantidade com a metragem real das caixas sem interromper digitação de múltiplos dígitos
+    pisoQtdDebounceRef.current = setTimeout(() => {
+      setNewQtd(conv.realSqmDisplay);
+      pisoLastRealSqmRef.current = conv.realSqm;
+      pisoQtdDebounceRef.current = null;
+    }, 550);
+  };
+
+  const handlePisoDetalheInputChange = (val: string) => {
+    setNewSubtitulo(val);
+    if (!isCurrentProductPiso || !isSquareMeterUnit(newUnid) || !currentPisoBoxYield) {
+      return;
+    }
+    if (pisoQtdDebounceRef.current) {
+      clearTimeout(pisoQtdDebounceRef.current);
+      pisoQtdDebounceRef.current = null;
+    }
+
+    const boxes = parseBoxesFromDetail(val);
+    if (boxes !== null && boxes > 0) {
+      const conv = convertBoxesToPisoSqm(boxes, currentPisoBoxYield);
+      setNewQtd(conv.realSqmDisplay);
+      pisoLastRealSqmRef.current = conv.realSqm;
+      pisoRequestedSqmRef.current = conv.realSqm;
+    }
+  };
+
+  const handlePisoDetalheInputBlur = () => {
+    if (!isCurrentProductPiso || !isSquareMeterUnit(newUnid) || !currentPisoBoxYield) {
+      return;
+    }
+    const boxes = parseBoxesFromDetail(newSubtitulo);
+    if (boxes !== null && boxes > 0) {
+      const conv = convertBoxesToPisoSqm(boxes, currentPisoBoxYield);
+      setNewQtd(conv.realSqmDisplay);
+      pisoLastRealSqmRef.current = conv.realSqm;
+      pisoRequestedSqmRef.current = conv.realSqm;
+      if (/^\d+$/.test(newSubtitulo.trim())) {
+        setNewSubtitulo(formatBoxesDetail(boxes));
+      }
     }
   };
 
   // Sub-abas do fluxo de seleção de produtos solicitado:
+  // 'rapido' = Orçamento Rápido (cálculo instantâneo de piso + rodapé + insumos do catálogo)
   // 'buscar' = Barra de busca com lista/dropdown de resultados embaixo
   // 'categorias' = Escolher Categoria (ex: Piso -> mostra só os pisos cadastrados -> puxar)
   // 'produtos' = Aba Produtos (produto puxado, campo Detalhe, Quantidade, Unidade auto, Preço Unitário editável)
-  const [productSubTab, setProductSubTab] = useState<'buscar' | 'categorias' | 'produtos'>('buscar');
+  const [productSubTab, setProductSubTab] = useState<'rapido' | 'buscar' | 'categorias' | 'produtos'>('rapido');
   const [searchProductQuery, setSearchProductQuery] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
   const [categoryFilterQuery, setCategoryFilterQuery] = useState('');
+
+  // Estados do Orçamento Rápido
+  const [quickPisoSqm, setQuickPisoSqm] = useState<string>('');
+  const [quickRodapeMl, setQuickRodapeMl] = useState<string>('');
+  const quickRodapeRequestedMlRef = useRef<number | null>(null);
+  const quickRodapeLastBarrasRef = useRef<number | null>(null);
+  const quickRodapeDebounceRef = useRef<any>(null);
+  const [quickPisoType, setQuickPisoType] = useState<'colado' | 'clicado'>('colado');
+  const [quickRodapeHeight, setQuickRodapeHeight] = useState<QuickBudgetRodapeHeight>('07cm');
+  const [quickIncluirInsumosPiso, setQuickIncluirInsumosPiso] = useState<'sim' | 'nao'>('sim');
+  const [quickIncluirInsumosRodape, setQuickIncluirInsumosRodape] = useState<'sim' | 'nao'>('sim');
+  // Padrão obrigatório: "Não" sempre selecionado em "O ambiente é térreo?"
+  const [quickIsGroundFloor, setQuickIsGroundFloor] = useState<'sim' | 'nao'>('nao');
+
+  const resetQuickRodapeConversionRefs = () => {
+    if (quickRodapeDebounceRef.current) {
+      clearTimeout(quickRodapeDebounceRef.current);
+      quickRodapeDebounceRef.current = null;
+    }
+    quickRodapeRequestedMlRef.current = null;
+    quickRodapeLastBarrasRef.current = null;
+  };
+
+  const [quickSelectedPisoByType, setQuickSelectedPisoByType] = useState<
+    Record<'colado' | 'clicado', string>
+  >(() => {
+    try {
+      const saved = localStorage.getItem('fenix_quick_budget_piso_cfg_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          colado: typeof parsed?.colado === 'string' ? parsed.colado : '',
+          clicado: typeof parsed?.clicado === 'string' ? parsed.clicado : '',
+        };
+      }
+    } catch {}
+    return { colado: '', clicado: '' };
+  });
+
+  const [quickSelectedRodapeByHeight, setQuickSelectedRodapeByHeight] = useState<
+    Record<QuickBudgetRodapeHeight, string>
+  >(() => {
+    try {
+      const saved = localStorage.getItem('fenix_quick_budget_rodape_cfg_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          '07cm': typeof parsed?.['07cm'] === 'string' ? parsed['07cm'] : '',
+          '10cm': typeof parsed?.['10cm'] === 'string' ? parsed['10cm'] : '',
+          '12cm': typeof parsed?.['12cm'] === 'string' ? parsed['12cm'] : '',
+          '15cm': typeof parsed?.['15cm'] === 'string' ? parsed['15cm'] : '',
+        };
+      }
+    } catch {}
+    return { '07cm': '', '10cm': '', '12cm': '', '15cm': '' };
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'fenix_quick_budget_piso_cfg_v1',
+        JSON.stringify(quickSelectedPisoByType)
+      );
+    } catch {}
+  }, [quickSelectedPisoByType]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'fenix_quick_budget_rodape_cfg_v1',
+        JSON.stringify(quickSelectedRodapeByHeight)
+      );
+    } catch {}
+  }, [quickSelectedRodapeByHeight]);
+
+  const quickPisoCandidates = useMemo(
+    () => getQuickBudgetPisoCandidates(quickPisoType, dynamicCatalog),
+    [quickPisoType, dynamicCatalog]
+  );
+
+  const quickRodapeCandidates = useMemo(
+    () => getQuickBudgetRodapeCandidates(quickRodapeHeight, dynamicCatalog),
+    [quickRodapeHeight, dynamicCatalog]
+  );
+
+  const activeQuickPisoProduct = useMemo(() => {
+    if (quickPisoCandidates.length === 0) return null;
+    const configuredId = quickSelectedPisoByType[quickPisoType];
+    return (
+      quickPisoCandidates.find((p) => p.id === configuredId) ||
+      quickPisoCandidates[0]
+    );
+  }, [quickPisoCandidates, quickSelectedPisoByType, quickPisoType]);
+
+  const activeQuickRodapeProduct = useMemo(() => {
+    if (quickRodapeCandidates.length === 0) return null;
+    const configuredId = quickSelectedRodapeByHeight[quickRodapeHeight];
+    return (
+      quickRodapeCandidates.find((p) => p.id === configuredId) ||
+      quickRodapeCandidates[0]
+    );
+  }, [quickRodapeCandidates, quickSelectedRodapeByHeight, quickRodapeHeight]);
+
+  const resolveQuickRodapeConversion = (
+    rawVal: string,
+    updateField: boolean,
+    prodOverride?: CatalogProduct | null
+  ): {
+    requestedMl: number;
+    barras: number;
+    barLen: number;
+    effectiveMl: number;
+  } => {
+    const prod = prodOverride !== undefined ? prodOverride : activeQuickRodapeProduct;
+    const barLen = prod ? extractBarLengthFromProductName(prod.name, 2.4) : 2.4;
+    const trimmed = (rawVal || '').trim();
+    if (!trimmed) {
+      return { requestedMl: 0, barras: 0, barLen, effectiveMl: 0 };
+    }
+
+    const explicitBars = parseBarCountFromInput(trimmed);
+    if (explicitBars && explicitBars > 0) {
+      const effectiveMl = Math.round(explicitBars * barLen * 100) / 100;
+      if (updateField) {
+        quickRodapeRequestedMlRef.current = effectiveMl;
+        quickRodapeLastBarrasRef.current = explicitBars;
+        setQuickRodapeMl(String(explicitBars));
+      }
+      return { requestedMl: effectiveMl, barras: explicitBars, barLen, effectiveMl };
+    }
+
+    const parsedNum = parsePtBrNumeric(trimmed);
+    if (parsedNum <= 0) {
+      return { requestedMl: 0, barras: 0, barLen, effectiveMl: 0 };
+    }
+
+    // Evita reinterpretar quantidade de barras já convertida como metros lineares
+    if (
+      quickRodapeLastBarrasRef.current !== null &&
+      Math.abs(parsedNum - quickRodapeLastBarrasRef.current) <= 0.005
+    ) {
+      const bars = quickRodapeLastBarrasRef.current;
+      const requestedMl =
+        quickRodapeRequestedMlRef.current && quickRodapeRequestedMlRef.current > 0
+          ? quickRodapeRequestedMlRef.current
+          : Math.round(bars * barLen * 100) / 100;
+      const effectiveMl = Math.round(bars * barLen * 100) / 100;
+      if (updateField) {
+        setQuickRodapeMl(String(bars));
+      }
+      return { requestedMl, barras: bars, barLen, effectiveMl };
+    }
+
+    const calc = calculateRodapeBarras(parsedNum, barLen, 0);
+    if (updateField && calc.barrasNecessarias > 0) {
+      quickRodapeRequestedMlRef.current = parsedNum;
+      quickRodapeLastBarrasRef.current = calc.barrasNecessarias;
+      setQuickRodapeMl(String(calc.barrasNecessarias));
+    }
+    return {
+      requestedMl: parsedNum,
+      barras: calc.barrasNecessarias,
+      barLen,
+      effectiveMl: calc.metragemTotalFornecida,
+    };
+  };
+
+  // Se o usuário trocar a altura/produto do rodapé após já ter convertido para barras, recalcula a partir do ML solicitado original
+  useEffect(() => {
+    if (
+      quickRodapeRequestedMlRef.current &&
+      quickRodapeRequestedMlRef.current > 0 &&
+      quickRodapeLastBarrasRef.current !== null &&
+      activeQuickRodapeProduct
+    ) {
+      const barLen = extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4);
+      const calc = calculateRodapeBarras(quickRodapeRequestedMlRef.current, barLen, 0);
+      if (calc.barrasNecessarias > 0) {
+        quickRodapeLastBarrasRef.current = calc.barrasNecessarias;
+        setQuickRodapeMl(String(calc.barrasNecessarias));
+      }
+    }
+  }, [activeQuickRodapeProduct?.id]);
+
+  const quickBudgetPreview = useMemo(() => {
+    const reqPiso = parsePtBrNumeric(quickPisoSqm);
+    const parsedRodapeInput = parsePtBrNumeric(quickRodapeMl);
+    const isUsingConvertedQuickBarras =
+      parsedRodapeInput > 0 &&
+      quickRodapeLastBarrasRef.current !== null &&
+      Math.abs(parsedRodapeInput - quickRodapeLastBarrasRef.current) <= 0.005;
+    const reqRodape =
+      isUsingConvertedQuickBarras && quickRodapeRequestedMlRef.current
+        ? quickRodapeRequestedMlRef.current
+        : parsedRodapeInput;
+
+    const pisoYield = activeQuickPisoProduct
+      ? extractPisoBoxYield(activeQuickPisoProduct.name)
+      : null;
+    const pisoUnitPrice = activeQuickPisoProduct
+      ? getProductTierPrice(activeQuickPisoProduct, priceTable)
+      : 0;
+    const pisoConv =
+      reqPiso > 0 && pisoYield
+        ? convertSqmToPisoBoxes(reqPiso, pisoYield)
+        : null;
+    const pisoEffectiveSqm =
+      reqPiso > 0
+        ? pisoConv
+          ? pisoConv.realSqm
+          : Math.round(reqPiso * 100) / 100
+        : 0;
+    const pisoTotal = Math.round(pisoEffectiveSqm * pisoUnitPrice * 100) / 100;
+
+    const rodapeBarLen = activeQuickRodapeProduct
+      ? extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4)
+      : 2.4;
+    const rodapeUnitPrice = activeQuickRodapeProduct
+      ? getProductTierPrice(activeQuickRodapeProduct, priceTable)
+      : 0;
+    const rodapeCalc =
+      reqRodape > 0
+        ? calculateRodapeBarras(reqRodape, rodapeBarLen, rodapeUnitPrice)
+        : null;
+
+    return {
+      reqPiso,
+      reqRodape,
+      reqRodapeDisplay: formatMlPtBr(reqRodape),
+      pisoYield,
+      pisoUnitPrice,
+      pisoBoxes: pisoConv?.boxes || null,
+      pisoEffectiveSqm,
+      pisoEffectiveDisplay: formatSqmPtBr(pisoEffectiveSqm),
+      pisoTotal,
+      rodapeBarLen,
+      rodapeUnitPrice,
+      rodapeBarras: rodapeCalc?.barrasNecessarias || 0,
+      rodapeEffectiveMl: rodapeCalc?.metragemTotalFornecida || 0,
+      rodapeEffectiveMlDisplay: formatMlPtBr(rodapeCalc?.metragemTotalFornecida || 0),
+      rodapeTotal: rodapeCalc?.valorTotal || 0,
+    };
+  }, [
+    quickPisoSqm,
+    quickRodapeMl,
+    activeQuickPisoProduct,
+    activeQuickRodapeProduct,
+    priceTable,
+  ]);
 
   // Categorias oficiais da base
   const categoriesList = useMemo(() => getOfficialCategories(), [isProductModalOpen]);
@@ -581,8 +1104,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     return getUserShortcuts(currentUserName);
   }, [currentUserName, shortcutsRefreshCounter, dynamicCatalog]);
 
-  // Drafts para edição direta do preço unitário na tabela do orçamento
+  // Drafts para edição direta do preço unitário e quantidade na tabela do orçamento
   const [itemPrecoDrafts, setItemPrecoDrafts] = useState<Record<string, string>>({});
+  const [itemQtdDrafts, setItemQtdDrafts] = useState<Record<string, string>>({});
+  const tableRodapeDebounceMapRef = useRef<Map<string, any>>(new Map());
 
   // Objeto da categoria ativa
   const activeCategoryObj = useMemo(() => {
@@ -615,6 +1140,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
   // Puxar produto selecionado para a aba Produtos
   const handleSelectAndPullProduct = (prod: CatalogProduct) => {
+    resetPisoConversionRefs();
+    resetRodapeConversionRefs();
     setSelectedProductCatalog(prod.name);
     setNewCategoria(prod.category || 'Geral');
     const price = getProductTierPrice(prod, priceTable);
@@ -624,12 +1151,9 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     if (isRodape) {
       setNewUnid('barras');
       setNewQtd('1');
-      rodapeConvertedRef.current = false;
     } else {
       setNewUnid(prod.unit || 'unidades');
-      if (!newQtd || newQtd === '0') {
-        setNewQtd('1');
-      }
+      setNewQtd('1');
     }
 
     setNewSubtitulo(prod.defaultSubtitle || '');
@@ -780,6 +1304,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
   // Handle product catalog change
   const handleProductCatalogSelect = (productName: string, tier: PriceTableTier = priceTable) => {
+    resetPisoConversionRefs();
+    resetRodapeConversionRefs();
     setSelectedProductCatalog(productName);
     const details = getProductDetailsFromCatalog(productName, tier);
     setNewCategoria(details.category || 'Geral');
@@ -798,35 +1324,152 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     setNewPrecoUnitario(formatPriceToBrl(details.price));
   };
 
-  // Handle selection from ProductSelectionModal
-  const handleSelectProductFromModal = (prod: {
-    name: string;
+  const [pendingPisoPrompt, setPendingPisoPrompt] = useState<{
+    plan: PisoInsumosPlan;
     category: string;
     unit: string;
-    price: number;
-    quantity: string;
+    unitPrice: number;
     subtitulo?: string;
-  }) => {
-    const numQtd = parseFloat(prod.quantity.replace(/\./g, '').replace(',', '.')) || 1;
-    const safeProdPrice = parsePriceToNumber(prod.price);
-    const itemTotal = Math.round(numQtd * safeProdPrice * 100) / 100;
+    customToast?: string;
+    preserveQuickTab?: boolean;
+    onAfterCommit?: () => void;
+  } | null>(null);
 
-    const newItem: EspelhoItem = {
-      id: `item_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      qtd: prod.quantity,
-      descricao: prod.name,
-      subtitulo: prod.subtitulo,
-      unidade: prod.unit,
-      precoUnitario: safeProdPrice,
-      total: itemTotal,
-    };
+  const [pendingRodapePrompt, setPendingRodapePrompt] = useState<{
+    plan: RodapeInsumosPlan;
+    category: string;
+    unit: string;
+    unitPrice: number;
+    subtitulo?: string;
+    customToast?: string;
+    preserveQuickTab?: boolean;
+  } | null>(null);
 
-    setItems((prev) => [...prev, newItem]);
-    recordProductUsage(currentUserName, { name: prod.name, category: prod.category });
-    setShortcutsRefreshCounter((c) => c + 1);
-    showToast(`"${prod.name}" adicionado ao orçamento.`);
+  // Vínculo de insumos por item (piso e rodapé) e controle de edições/exclusões manuais
+  const pisoInsumoLinksRef = useRef<Map<string, PisoInsumoLink>>(new Map());
+  const lockedPisoInsumoGroupsRef = useRef<Set<PisoInsumoGroup>>(new Set());
+  const removedPisoInsumoGroupsRef = useRef<Set<PisoInsumoGroup>>(new Set());
 
-    // Limpa o formulário e deixa pronto para pesquisar outro produto
+  const rodapeInsumoLinksRef = useRef<Map<string, RodapeInsumoLink>>(new Map());
+  const lockedRodapeInsumoGroupsRef = useRef<Set<RodapeInsumoGroup>>(new Set());
+  const removedRodapeInsumoGroupsRef = useRef<Set<RodapeInsumoGroup>>(new Set());
+
+  const resetAllInsumoLinks = () => {
+    pisoInsumoLinksRef.current.clear();
+    lockedPisoInsumoGroupsRef.current.clear();
+    removedPisoInsumoGroupsRef.current.clear();
+    rodapeInsumoLinksRef.current.clear();
+    lockedRodapeInsumoGroupsRef.current.clear();
+    removedRodapeInsumoGroupsRef.current.clear();
+    setItemQtdDrafts({});
+  };
+
+  // Hidrata vínculos de rascunho em memória caso existam no initialDraft
+  const hydratedDraftLinksRef = useRef(false);
+  useEffect(() => {
+    if (hydratedDraftLinksRef.current || initialOrcamento || !initialDraft) return;
+    hydratedDraftLinksRef.current = true;
+    try {
+      if (initialDraft.pisoLinks && typeof initialDraft.pisoLinks === 'object') {
+        Object.entries(initialDraft.pisoLinks).forEach(([k, v]: [string, any]) => {
+          if (v && typeof v === 'object') {
+            pisoInsumoLinksRef.current.set(k, v as PisoInsumoLink);
+          }
+        });
+      }
+      if (initialDraft.rodapeLinks && typeof initialDraft.rodapeLinks === 'object') {
+        Object.entries(initialDraft.rodapeLinks).forEach(([k, v]: [string, any]) => {
+          if (v && typeof v === 'object') {
+            rodapeInsumoLinksRef.current.set(k, v as RodapeInsumoLink);
+          }
+        });
+      }
+      if (Array.isArray(initialDraft.lockedPisoGroups)) {
+        initialDraft.lockedPisoGroups.forEach((g: PisoInsumoGroup) =>
+          lockedPisoInsumoGroupsRef.current.add(g)
+        );
+      }
+      if (Array.isArray(initialDraft.removedPisoGroups)) {
+        initialDraft.removedPisoGroups.forEach((g: PisoInsumoGroup) =>
+          removedPisoInsumoGroupsRef.current.add(g)
+        );
+      }
+      if (Array.isArray(initialDraft.lockedRodapeGroups)) {
+        initialDraft.lockedRodapeGroups.forEach((g: RodapeInsumoGroup) =>
+          lockedRodapeInsumoGroupsRef.current.add(g)
+        );
+      }
+      if (Array.isArray(initialDraft.removedRodapeGroups)) {
+        initialDraft.removedRodapeGroups.forEach((g: RodapeInsumoGroup) =>
+          removedRodapeInsumoGroupsRef.current.add(g)
+        );
+      }
+    } catch {
+      // ignore hydration errors
+    }
+  }, [initialDraft, initialOrcamento]);
+
+  // Atualiza plano do modal de rodapé automaticamente caso o catálogo seja sincronizado enquanto aberto
+  useEffect(() => {
+    if (!pendingRodapePrompt) return;
+    setPendingRodapePrompt((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        plan: calculateRodapeInsumosForOrcamento({
+          rodapeName: prev.plan.rodapeName,
+          barCount: prev.plan.barCount,
+          barLengthMeters: prev.plan.barLengthMeters,
+          requestedMl: prev.plan.insumoMl,
+          priceTable,
+          selectedCalafetarId: prev.plan.selectedCalafetarId,
+        }),
+      };
+    });
+  }, [catalogRevision, priceTable]);
+
+  const syncPisoInsumosInList = (currentItems: EspelhoItem[]): EspelhoItem[] => {
+    return syncPisoInsumosInItemsList({
+      currentItems,
+      pisoLinks: pisoInsumoLinksRef.current,
+      lockedGroups: lockedPisoInsumoGroupsRef.current,
+      removedGroups: removedPisoInsumoGroupsRef.current,
+      priceTable,
+      catalogOverride: dynamicCatalog,
+    });
+  };
+
+  const syncRodapeInsumosInList = (
+    currentItems: EspelhoItem[],
+    referenceRodapeName?: string
+  ): EspelhoItem[] => {
+    return syncRodapeInsumosInItemsList({
+      currentItems,
+      rodapeLinks: rodapeInsumoLinksRef.current,
+      lockedGroups: lockedRodapeInsumoGroupsRef.current,
+      removedGroups: removedRodapeInsumoGroupsRef.current,
+      priceTable,
+      referenceRodapeName,
+      catalogOverride: dynamicCatalog,
+    });
+  };
+
+  const ensureRodapeLinkForExistingBudget = (
+    itemsList: EspelhoItem[],
+    rodapeItem: EspelhoItem
+  ) => {
+    ensureRodapeLinkForExistingBudgetList({
+      itemsList,
+      rodapeItem,
+      rodapeLinks: rodapeInsumoLinksRef.current,
+      priceTable,
+      catalogOverride: dynamicCatalog,
+    });
+  };
+
+  const resetProductForm = () => {
+    resetPisoConversionRefs();
+    resetRodapeConversionRefs();
     setSelectedProductCatalog('');
     setNewCategoria('Geral');
     setNewUnid('unidades');
@@ -838,22 +1481,478 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     setProductSubTab('buscar');
   };
 
+  const tryOpenPisoInsumosPrompt = (params: {
+    name: string;
+    category: string;
+    unit: string;
+    unitPrice: number;
+    requestedSqm: number;
+    effectiveSqm?: number;
+    boxes?: number | null;
+    subtitulo?: string;
+    customToast?: string;
+  }): boolean => {
+    if (
+      params.requestedSqm > 0 &&
+      isPisoVinilicoColado(params.name, params.category) &&
+      isSquareMeterUnit(params.unit)
+    ) {
+      const plan = calculatePisoInsumosForOrcamento({
+        productName: params.name,
+        requestedSqm: params.requestedSqm,
+        effectiveSqm: params.effectiveSqm,
+        boxes: params.boxes,
+        priceTable,
+      });
+      const finalSubtitulo =
+        plan.boxes && plan.boxes > 0 && parseBoxesFromDetail(params.subtitulo) === null
+          ? formatBoxesDetail(plan.boxes, params.subtitulo)
+          : params.subtitulo;
+      setPendingPisoPrompt({
+        plan,
+        category: params.category,
+        unit: params.unit || 'm²',
+        unitPrice: params.unitPrice,
+        subtitulo: finalSubtitulo,
+        customToast: params.customToast,
+      });
+      return true;
+    }
+    return false;
+  };
+
+  const tryOpenRodapeInsumosPrompt = (params: {
+    name: string;
+    category: string;
+    unit: string;
+    unitPrice: number;
+    barCount: number;
+    barLengthMeters?: number;
+    requestedMl?: number;
+    subtitulo?: string;
+    customToast?: string;
+  }): boolean => {
+    if (params.barCount > 0 && isRodapeProduct(params.name, params.category)) {
+      const plan = calculateRodapeInsumosForOrcamento({
+        rodapeName: params.name,
+        barCount: params.barCount,
+        barLengthMeters: params.barLengthMeters,
+        requestedMl: params.requestedMl,
+        priceTable,
+        catalogOverride: dynamicCatalog,
+      });
+      setPendingRodapePrompt({
+        plan,
+        category: params.category,
+        unit: params.unit || 'barras',
+        unitPrice: params.unitPrice,
+        subtitulo: params.subtitulo,
+        customToast: params.customToast,
+      });
+      return true;
+    }
+    return false;
+  };
+
+  const commitRodapePrompt = (selection: RodapeInsumosConfirmSelection | null) => {
+    if (!pendingRodapePrompt) return;
+    const {
+      plan,
+      category,
+      unit,
+      unitPrice,
+      subtitulo,
+      customToast,
+      preserveQuickTab,
+    } = pendingRodapePrompt;
+    setPendingRodapePrompt(null);
+
+    const rodapeTotal = Math.round(plan.barCount * unitPrice * 100) / 100;
+    const baseTimestamp = Date.now();
+    const rodapeItem: EspelhoItem = {
+      id: `item_${baseTimestamp}_${Math.random().toString(36).substring(2, 6)}`,
+      qtd: String(plan.barCount),
+      descricao: plan.rodapeName,
+      subtitulo,
+      unidade: unit || 'barras',
+      precoUnitario: unitPrice,
+      total: rodapeTotal,
+    };
+
+    const includeColar = Boolean(selection?.includeColar);
+    const includeCalafetar = Boolean(selection?.includeCalafetar);
+
+    if (!selection || (!includeColar && !includeCalafetar)) {
+      rodapeInsumoLinksRef.current.set(rodapeItem.id, {
+        barLengthMeters: plan.barLengthMeters,
+        requestedMl: plan.insumoMl > 0 ? plan.insumoMl : undefined,
+        lastBarras: plan.barCount,
+        includeColar: false,
+        includeCalafetar: false,
+        calafetarProductId: '',
+      });
+      setItems((prev) => [...prev, rodapeItem]);
+      showToast(
+        customToast ||
+          `"${plan.rodapeName}" (${plan.barCount} ${plan.barCount === 1 ? 'barra' : 'barras'}) adicionado ao orçamento.`
+      );
+    } else {
+      if (includeColar) {
+        lockedRodapeInsumoGroupsRef.current.delete('colar');
+        removedRodapeInsumoGroupsRef.current.delete('colar');
+      }
+      if (includeCalafetar) {
+        lockedRodapeInsumoGroupsRef.current.delete('calafetar');
+        removedRodapeInsumoGroupsRef.current.delete('calafetar');
+      }
+      rodapeInsumoLinksRef.current.set(rodapeItem.id, {
+        barLengthMeters: plan.barLengthMeters,
+        requestedMl: plan.insumoMl > 0 ? plan.insumoMl : undefined,
+        lastBarras: plan.barCount,
+        includeColar,
+        includeCalafetar,
+        calafetarProductId: selection.selectedCalafetarId || plan.selectedCalafetarId,
+      });
+      setItems((prev) => syncRodapeInsumosInList([...prev, rodapeItem], plan.rodapeName));
+      showToast(
+        customToast ||
+          `"${plan.rodapeName}" (${plan.insumoMlDisplay || plan.effectiveMlDisplay} ml) e insumos selecionados incluídos no orçamento!`
+      );
+    }
+
+    recordProductUsage(currentUserName, { name: plan.rodapeName, category });
+    setShortcutsRefreshCounter((c) => c + 1);
+    if (!preserveQuickTab) {
+      resetProductForm();
+    }
+  };
+
+  const commitPisoPrompt = (includeInsumos: boolean) => {
+    if (!pendingPisoPrompt) return;
+    const {
+      plan,
+      category,
+      unit,
+      unitPrice,
+      subtitulo,
+      customToast,
+      preserveQuickTab,
+      onAfterCommit,
+    } = pendingPisoPrompt;
+    setPendingPisoPrompt(null);
+
+    const pisoTotal = Math.round(plan.realSqm * unitPrice * 100) / 100;
+    const baseTimestamp = Date.now();
+    const pisoItem: EspelhoItem = {
+      id: `item_${baseTimestamp}_${Math.random().toString(36).substring(2, 6)}`,
+      qtd: plan.realSqmDisplay,
+      descricao: plan.productName,
+      subtitulo,
+      unidade: unit || 'm²',
+      precoUnitario: unitPrice,
+      total: pisoTotal,
+    };
+
+    const skipCola = !isPisoVinilicoColado(plan.productName, category);
+    const includePrimerAntiumidade = plan.insumos.some(
+      (i) => i.kind === 'primer_antiumidade'
+    );
+
+    if (!includeInsumos) {
+      pisoInsumoLinksRef.current.set(pisoItem.id, {
+        hasInsumos: false,
+        requestedSqm: plan.requestedSqm,
+        lastEffectiveSqm: plan.realSqm,
+        skipCola,
+        includePrimerAntiumidade: false,
+      });
+      setItems((prev) => [...prev, pisoItem]);
+      showToast(
+        customToast ||
+          `"${plan.productName}" (${plan.realSqmDisplay} m²) adicionado ao orçamento.`
+      );
+    } else {
+      plan.insumos.forEach((insumo) => {
+        const grp = getPisoInsumoGroupFromKind(insumo.kind);
+        lockedPisoInsumoGroupsRef.current.delete(grp);
+        removedPisoInsumoGroupsRef.current.delete(grp);
+      });
+      pisoInsumoLinksRef.current.set(pisoItem.id, {
+        hasInsumos: true,
+        requestedSqm: plan.requestedSqm,
+        lastEffectiveSqm: plan.realSqm,
+        skipCola,
+        includePrimerAntiumidade,
+      });
+      setItems((prev) => syncPisoInsumosInList([...prev, pisoItem]));
+      showToast(
+        customToast ||
+          `"${plan.productName}" (${plan.realSqmDisplay} m²) e insumos incluídos no orçamento!`
+      );
+    }
+
+    recordProductUsage(currentUserName, { name: plan.productName, category });
+    setShortcutsRefreshCounter((c) => c + 1);
+    if (!preserveQuickTab) {
+      resetProductForm();
+    }
+    if (onAfterCommit) {
+      onAfterCommit();
+    }
+  };
+
+  // Handle selection from ProductSelectionModal
+  const handleSelectProductFromModal = (prod: {
+    name: string;
+    category: string;
+    unit: string;
+    price: number;
+    quantity: string;
+    subtitulo?: string;
+    requestedSqm?: number;
+    effectiveSqm?: number;
+    boxes?: number;
+    requestedRodapeMl?: number;
+  }) => {
+    const rawNumQtd = parsePtBrNumeric(prod.quantity) || 1;
+    const safeProdPrice = parsePriceToNumber(prod.price);
+    const isPiso = isPisoVinilicoProduct(prod.name, prod.category) && isSquareMeterUnit(prod.unit);
+    const boxYield = isPiso ? extractPisoBoxYield(prod.name) : null;
+    const isRodape = isRodapeProduct(prod.name, prod.category);
+
+    let finalQtyDisplay = prod.quantity;
+    let finalNumQtd = rawNumQtd;
+    let finalSubtitulo = prod.subtitulo;
+    let requestedSqm = prod.requestedSqm ?? rawNumQtd;
+    let effectiveSqm = prod.effectiveSqm ?? rawNumQtd;
+    let finalBoxes = prod.boxes ?? null;
+    let requestedRodapeMl = prod.requestedRodapeMl;
+
+    if (isPiso && boxYield) {
+      if (prod.effectiveSqm && prod.effectiveSqm > 0) {
+        effectiveSqm = prod.effectiveSqm;
+        finalNumQtd = effectiveSqm;
+      } else {
+        const boxesFromSub = parseBoxesFromDetail(prod.subtitulo);
+        if (boxesFromSub && boxesFromSub > 0 && !prod.requestedSqm) {
+          const boxConv = convertBoxesToPisoSqm(boxesFromSub, boxYield);
+          finalQtyDisplay = boxConv.realSqmDisplay;
+          finalNumQtd = boxConv.realSqm;
+          effectiveSqm = boxConv.realSqm;
+          requestedSqm = boxConv.realSqm;
+          finalBoxes = boxConv.boxes;
+          finalSubtitulo = formatBoxesDetail(boxConv.boxes, prod.subtitulo);
+        } else {
+          const sqmConv = convertSqmToPisoBoxes(requestedSqm, boxYield, prod.subtitulo);
+          finalQtyDisplay = sqmConv.realSqmDisplay;
+          finalNumQtd = sqmConv.realSqm;
+          effectiveSqm = sqmConv.realSqm;
+          finalBoxes = sqmConv.boxes;
+          finalSubtitulo = sqmConv.detailText;
+        }
+      }
+    } else if (isRodape) {
+      const barLen = extractBarLengthFromProductName(prod.name, 2.4);
+      const explicitBars = parseBarCountFromInput(prod.quantity);
+      const parsedFromSub = parseRodapeDetails(prod.subtitulo)?.metrosDesejados;
+      if (requestedRodapeMl && requestedRodapeMl > 0) {
+        const calc = calculateRodapeBarras(requestedRodapeMl, barLen, safeProdPrice);
+        finalNumQtd = calc.barrasNecessarias || 1;
+        finalQtyDisplay = String(finalNumQtd);
+        finalSubtitulo = formatRodapeDetailText({
+          requestedMl: requestedRodapeMl,
+          barCount: finalNumQtd,
+          barLengthMeters: barLen,
+          existingDetail: prod.subtitulo,
+        });
+      } else if (explicitBars && explicitBars > 0) {
+        finalNumQtd = explicitBars;
+        finalQtyDisplay = String(explicitBars);
+        requestedRodapeMl = Math.round(explicitBars * barLen * 100) / 100;
+        finalSubtitulo = formatRodapeDetailText({
+          requestedMl: requestedRodapeMl,
+          barCount: finalNumQtd,
+          barLengthMeters: barLen,
+          existingDetail: prod.subtitulo,
+        });
+      } else if (parsedFromSub && parsedFromSub > 0) {
+        requestedRodapeMl = parsedFromSub;
+      } else if (rawNumQtd > 0) {
+        const rodConv = convertMetrosToBarras(prod.quantity, prod.name, barLen);
+        if (rodConv && rodConv.barras > 0) {
+          finalNumQtd = rodConv.barras;
+          finalQtyDisplay = String(rodConv.barras);
+          requestedRodapeMl = rodConv.metros;
+          finalSubtitulo = formatRodapeDetailText({
+            requestedMl: rodConv.metros,
+            barCount: rodConv.barras,
+            barLengthMeters: rodConv.barLen,
+            existingDetail: prod.subtitulo,
+          });
+        }
+      }
+    }
+
+    if (
+      tryOpenPisoInsumosPrompt({
+        name: prod.name,
+        category: prod.category,
+        unit: prod.unit,
+        unitPrice: safeProdPrice,
+        requestedSqm,
+        effectiveSqm,
+        boxes: finalBoxes,
+        subtitulo: finalSubtitulo,
+      })
+    ) {
+      return;
+    }
+
+    if (
+      tryOpenRodapeInsumosPrompt({
+        name: prod.name,
+        category: prod.category,
+        unit: prod.unit,
+        unitPrice: safeProdPrice,
+        barCount: finalNumQtd,
+        requestedMl: requestedRodapeMl,
+        subtitulo: finalSubtitulo,
+      })
+    ) {
+      return;
+    }
+
+    const itemTotal = Math.round(finalNumQtd * safeProdPrice * 100) / 100;
+
+    const newItem: EspelhoItem = {
+      id: `item_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      qtd: finalQtyDisplay,
+      descricao: prod.name,
+      subtitulo: finalSubtitulo,
+      unidade: prod.unit,
+      precoUnitario: safeProdPrice,
+      total: itemTotal,
+    };
+
+    setItems((prev) => [...prev, newItem]);
+    recordProductUsage(currentUserName, { name: prod.name, category: prod.category });
+    setShortcutsRefreshCounter((c) => c + 1);
+    showToast(`"${prod.name}" adicionado ao orçamento.`);
+
+    // Limpa o formulário e deixa pronto para pesquisar outro produto
+    resetProductForm();
+  };
+
   // Callback de sucesso ao cadastrar novo produto diretamente pelo modal
   const handleCadastrarProdutoSuccess = (
     newProd: CatalogProduct,
     initialQty: string,
     initialDetail?: string
   ) => {
-    const numQtd = parseFloat(initialQty.replace(/\./g, '').replace(',', '.')) || 1;
+    const rawNumQtd = parsePtBrNumeric(initialQty) || 1;
     const tierPrice = getProductTierPrice(newProd, priceTable);
-    const itemTotal = Math.round(numQtd * tierPrice * 100) / 100;
+    const isPiso =
+      isPisoVinilicoProduct(newProd.name, newProd.category, newProd.categoryId) &&
+      isSquareMeterUnit(newProd.unit);
+    const boxYield = isPiso ? extractPisoBoxYield(newProd.name) : null;
+    const isRodape = isRodapeProduct(newProd.name, newProd.category, newProd.categoryId);
+
+    let finalQtyDisplay = initialQty || '1';
+    let finalNumQtd = rawNumQtd;
+    let finalUnit = newProd.unit;
+    let finalDetail = initialDetail || undefined;
+    let requestedSqm = rawNumQtd;
+    let effectiveSqm = rawNumQtd;
+    let finalBoxes: number | null = null;
+    let requestedRodapeMl: number | undefined;
+
+    if (isPiso && boxYield) {
+      const boxesFromDetail = parseBoxesFromDetail(initialDetail);
+      if (boxesFromDetail && boxesFromDetail > 0) {
+        const boxConv = convertBoxesToPisoSqm(boxesFromDetail, boxYield);
+        finalQtyDisplay = boxConv.realSqmDisplay;
+        finalNumQtd = boxConv.realSqm;
+        effectiveSqm = boxConv.realSqm;
+        requestedSqm = boxConv.realSqm;
+        finalBoxes = boxConv.boxes;
+        finalDetail = formatBoxesDetail(boxConv.boxes, initialDetail);
+      } else {
+        const sqmConv = convertSqmToPisoBoxes(rawNumQtd, boxYield, initialDetail);
+        finalQtyDisplay = sqmConv.realSqmDisplay;
+        finalNumQtd = sqmConv.realSqm;
+        effectiveSqm = sqmConv.realSqm;
+        finalBoxes = sqmConv.boxes;
+        finalDetail = sqmConv.detailText;
+      }
+    } else if (isRodape) {
+      const barLen = extractBarLengthFromProductName(newProd.name, 2.4);
+      const explicitBars = parseBarCountFromInput(initialQty) || parseBarCountFromInput(initialDetail);
+      if (explicitBars && explicitBars > 0) {
+        finalNumQtd = explicitBars;
+        finalQtyDisplay = String(explicitBars);
+        requestedRodapeMl = Math.round(explicitBars * barLen * 100) / 100;
+        finalDetail = formatRodapeDetailText({
+          requestedMl: requestedRodapeMl,
+          barCount: explicitBars,
+          barLengthMeters: barLen,
+          existingDetail: initialDetail,
+        });
+      } else {
+        const rodConv = convertMetrosToBarras(finalQtyDisplay, newProd.name, barLen);
+        if (rodConv && rodConv.barras > 0) {
+          finalNumQtd = rodConv.barras;
+          finalQtyDisplay = String(rodConv.barras);
+          requestedRodapeMl = rodConv.metros;
+          finalDetail = formatRodapeDetailText({
+            requestedMl: rodConv.metros,
+            barCount: rodConv.barras,
+            barLengthMeters: rodConv.barLen,
+            existingDetail: initialDetail,
+          });
+        }
+      }
+      finalUnit = 'barras';
+    }
+
+    if (
+      tryOpenPisoInsumosPrompt({
+        name: newProd.name,
+        category: newProd.category,
+        unit: finalUnit,
+        unitPrice: tierPrice,
+        requestedSqm,
+        effectiveSqm,
+        boxes: finalBoxes,
+        subtitulo: finalDetail,
+        customToast: `Produto "${newProd.name}" cadastrado no catálogo e inserido no orçamento!`,
+      })
+    ) {
+      return;
+    }
+
+    if (
+      tryOpenRodapeInsumosPrompt({
+        name: newProd.name,
+        category: newProd.category,
+        unit: finalUnit,
+        unitPrice: tierPrice,
+        barCount: finalNumQtd,
+        requestedMl: requestedRodapeMl,
+        subtitulo: finalDetail,
+        customToast: `Produto "${newProd.name}" cadastrado no catálogo e inserido no orçamento!`,
+      })
+    ) {
+      return;
+    }
+
+    const itemTotal = Math.round(finalNumQtd * tierPrice * 100) / 100;
 
     const newItem: EspelhoItem = {
       id: `item_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      qtd: initialQty || '1',
+      qtd: finalQtyDisplay,
       descricao: newProd.name,
-      subtitulo: initialDetail || undefined,
-      unidade: newProd.unit,
+      subtitulo: finalDetail,
+      unidade: finalUnit,
       precoUnitario: tierPrice,
       total: itemTotal,
     };
@@ -865,22 +1964,39 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
     setSelectedProductCatalog(newProd.name);
     setNewCategoria(newProd.category || 'Geral');
-    setNewUnid(newProd.unit || 'unidades');
+    setNewUnid(finalUnit || 'unidades');
     setNewPrecoUnitario(formatPriceToBrl(tierPrice));
-    setNewQtd(initialQty || '1');
-    setNewSubtitulo(initialDetail || '');
+    setNewQtd(finalQtyDisplay);
+    setNewSubtitulo(finalDetail || '');
     setProductSubTab('buscar');
   };
 
   // Carregar dados de produto já adicionado para edição
   const handleEditItem = (item: EspelhoItem) => {
+    resetPisoConversionRefs();
+    resetRodapeConversionRefs();
     setEditingItemId(item.id);
     setSelectedProductCatalog(item.descricao);
     setNewSubtitulo(item.subtitulo || '');
     setNewQtd(item.qtd);
     setNewUnid(item.unidade || 'unidades');
     setNewPrecoUnitario(formatPriceToBrl(item.precoUnitario));
-    rodapeConvertedRef.current = true;
+
+    const parsedQty = parsePtBrNumeric(item.qtd);
+    if (parsedQty > 0 && isPisoVinilicoProduct(item.descricao) && isSquareMeterUnit(item.unidade)) {
+      pisoLastRealSqmRef.current = parsedQty;
+      pisoRequestedSqmRef.current = parsedQty;
+    }
+    if (parsedQty > 0 && isRodapeProduct(item.descricao)) {
+      const barLen = extractBarLengthFromProductName(item.descricao, 2.4);
+      const existingLink = rodapeInsumoLinksRef.current.get(item.id);
+      const parsedDet = parseRodapeDetails(item.subtitulo);
+      rodapeLastBarrasRef.current = parsedQty;
+      rodapeRequestedMlRef.current =
+        existingLink?.requestedMl ||
+        parsedDet?.metrosDesejados ||
+        Math.round(parsedQty * barLen * 100) / 100;
+    }
 
     setProductSubTab('produtos');
     const formSection = document.getElementById('adicionar-produtos-container');
@@ -892,14 +2008,195 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
   // Cancelar edição
   const handleCancelEdit = () => {
+    resetPisoConversionRefs();
+    resetRodapeConversionRefs();
     setEditingItemId(null);
     setSelectedProductCatalog('');
     setNewSubtitulo('');
     setNewQtd('1');
     setNewUnid('unidades');
     setNewPrecoUnitario('0,00');
-    rodapeConvertedRef.current = false;
     setProductSubTab('buscar');
+  };
+
+  const handleGenerateQuickBudget = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (quickRodapeDebounceRef.current) {
+      clearTimeout(quickRodapeDebounceRef.current);
+      quickRodapeDebounceRef.current = null;
+    }
+
+    const reqPiso = parsePtBrNumeric(quickPisoSqm);
+    const rodapeConv = resolveQuickRodapeConversion(quickRodapeMl, true);
+    const reqRodape = rodapeConv.requestedMl;
+
+    if (reqPiso <= 0 && reqRodape <= 0) {
+      showToast('Informe a metragem do piso (m²) ou a metragem do rodapé (ml).');
+      return;
+    }
+
+    if (reqPiso > 0 && !activeQuickPisoProduct) {
+      showToast('Nenhum piso cadastrado encontrado no catálogo para o tipo selecionado.');
+      return;
+    }
+
+    if (reqRodape > 0 && !activeQuickRodapeProduct) {
+      showToast('Nenhum rodapé cadastrado encontrado no catálogo para a altura selecionada.');
+      return;
+    }
+
+    let pisoPlan: PisoInsumosPlan | null = null;
+    let pisoUnitPrice = 0;
+    let pisoSubtitulo: string | undefined;
+
+    if (reqPiso > 0 && activeQuickPisoProduct) {
+      const boxYield = extractPisoBoxYield(activeQuickPisoProduct.name);
+      const pisoConv = boxYield ? convertSqmToPisoBoxes(reqPiso, boxYield) : null;
+      const effectiveSqm = pisoConv
+        ? pisoConv.realSqm
+        : Math.round(reqPiso * 100) / 100;
+      const boxes = pisoConv ? pisoConv.boxes : null;
+      pisoSubtitulo = pisoConv ? pisoConv.detailText : undefined;
+      pisoUnitPrice = getProductTierPrice(activeQuickPisoProduct, priceTable);
+      pisoPlan = calculatePisoInsumosForOrcamento({
+        productName: activeQuickPisoProduct.name,
+        requestedSqm: reqPiso,
+        effectiveSqm,
+        boxes,
+        priceTable,
+        includePrimerAntiumidade: quickIsGroundFloor === 'sim',
+        skipCola: quickPisoType === 'clicado',
+        catalogOverride: dynamicCatalog,
+      });
+    }
+
+    let rodapePlan: RodapeInsumosPlan | null = null;
+    let rodapeUnitPrice = 0;
+    let rodapeSubtitulo: string | undefined;
+
+    if (reqRodape > 0 && activeQuickRodapeProduct) {
+      const barLen = extractBarLengthFromProductName(activeQuickRodapeProduct.name, 2.4);
+      rodapeUnitPrice = getProductTierPrice(activeQuickRodapeProduct, priceTable);
+      const rodapeCalc = calculateRodapeBarras(reqRodape, barLen, rodapeUnitPrice);
+      rodapeSubtitulo = formatRodapeDetailText({
+        requestedMl: reqRodape,
+        barCount: rodapeCalc.barrasNecessarias,
+        barLengthMeters: barLen,
+      });
+      rodapePlan = calculateRodapeInsumosForOrcamento({
+        rodapeName: activeQuickRodapeProduct.name,
+        barCount: rodapeCalc.barrasNecessarias,
+        barLengthMeters: barLen,
+        requestedMl: reqRodape,
+        priceTable,
+        catalogOverride: dynamicCatalog,
+      });
+    }
+
+    const appendQuickPisoDirect = () => {
+      if (!pisoPlan || !activeQuickPisoProduct) return;
+      const pisoTotal = Math.round(pisoPlan.realSqm * pisoUnitPrice * 100) / 100;
+      const pisoItem: EspelhoItem = {
+        id: `item_${Date.now()}_qp_${Math.random().toString(36).substring(2, 6)}`,
+        qtd: pisoPlan.realSqmDisplay,
+        descricao: pisoPlan.productName,
+        subtitulo: pisoSubtitulo,
+        unidade: activeQuickPisoProduct.unit || 'm²',
+        precoUnitario: pisoUnitPrice,
+        total: pisoTotal,
+      };
+      pisoInsumoLinksRef.current.set(pisoItem.id, {
+        hasInsumos: false,
+        requestedSqm: pisoPlan.requestedSqm,
+        lastEffectiveSqm: pisoPlan.realSqm,
+        skipCola: !isPisoVinilicoColado(pisoPlan.productName, activeQuickPisoProduct.category),
+        includePrimerAntiumidade: false,
+      });
+      setItems((prev) => [...prev, pisoItem]);
+      recordProductUsage(currentUserName, {
+        name: pisoPlan.productName,
+        category: activeQuickPisoProduct.category,
+      });
+      setShortcutsRefreshCounter((c) => c + 1);
+    };
+
+    const appendQuickRodapeDirect = () => {
+      if (!rodapePlan || !activeQuickRodapeProduct) return;
+      const rodapeTotal = Math.round(rodapePlan.barCount * rodapeUnitPrice * 100) / 100;
+      const rodapeItem: EspelhoItem = {
+        id: `item_${Date.now()}_qr_${Math.random().toString(36).substring(2, 6)}`,
+        qtd: String(rodapePlan.barCount),
+        descricao: rodapePlan.rodapeName,
+        subtitulo: rodapeSubtitulo,
+        unidade: activeQuickRodapeProduct.unit || 'barras',
+        precoUnitario: rodapeUnitPrice,
+        total: rodapeTotal,
+      };
+      rodapeInsumoLinksRef.current.set(rodapeItem.id, {
+        barLengthMeters: rodapePlan.barLengthMeters,
+        requestedMl: rodapePlan.insumoMl > 0 ? rodapePlan.insumoMl : undefined,
+        lastBarras: rodapePlan.barCount,
+        includeColar: false,
+        includeCalafetar: false,
+        calafetarProductId: '',
+      });
+      setItems((prev) => [...prev, rodapeItem]);
+      recordProductUsage(currentUserName, {
+        name: rodapePlan.rodapeName,
+        category: activeQuickRodapeProduct.category,
+      });
+      setShortcutsRefreshCounter((c) => c + 1);
+    };
+
+    const runRodapeStep = () => {
+      if (!rodapePlan || !activeQuickRodapeProduct || rodapePlan.barCount <= 0) return;
+      if (quickIncluirInsumosRodape === 'sim') {
+        setPendingRodapePrompt({
+          plan: rodapePlan,
+          category: activeQuickRodapeProduct.category,
+          unit: activeQuickRodapeProduct.unit || 'barras',
+          unitPrice: rodapeUnitPrice,
+          subtitulo: rodapeSubtitulo,
+          preserveQuickTab: true,
+        });
+      } else {
+        appendQuickRodapeDirect();
+        showToast(
+          `"${rodapePlan.rodapeName}" (${rodapePlan.barCount} ${rodapePlan.barCount === 1 ? 'barra' : 'barras'}) adicionado ao orçamento.`
+        );
+      }
+    };
+
+    if (pisoPlan && activeQuickPisoProduct) {
+      if (quickIncluirInsumosPiso === 'sim' && pisoPlan.insumos.length > 0) {
+        setPendingPisoPrompt({
+          plan: pisoPlan,
+          category: activeQuickPisoProduct.category,
+          unit: activeQuickPisoProduct.unit || 'm²',
+          unitPrice: pisoUnitPrice,
+          subtitulo: pisoSubtitulo,
+          preserveQuickTab: true,
+          onAfterCommit:
+            rodapePlan && rodapePlan.barCount > 0 ? runRodapeStep : undefined,
+        });
+      } else {
+        appendQuickPisoDirect();
+        if (rodapePlan && rodapePlan.barCount > 0) {
+          if (quickIncluirInsumosRodape === 'sim') {
+            runRodapeStep();
+          } else {
+            appendQuickRodapeDirect();
+            showToast('Orçamento rápido gerado com piso e rodapé!');
+          }
+        } else {
+          showToast(
+            `"${pisoPlan.productName}" (${pisoPlan.realSqmDisplay} m²) adicionado ao orçamento.`
+          );
+        }
+      }
+    } else if (rodapePlan && rodapePlan.barCount > 0) {
+      runRodapeStep();
+    }
   };
 
   // Salvar Produto (Adiciona novo ou Atualiza item existente sem duplicar)
@@ -907,6 +2204,10 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     e.preventDefault();
     if (rodapeDebounceTimerRef.current) {
       clearTimeout(rodapeDebounceTimerRef.current);
+    }
+    if (pisoQtdDebounceRef.current) {
+      clearTimeout(pisoQtdDebounceRef.current);
+      pisoQtdDebounceRef.current = null;
     }
     const cleanDesc = selectedProductCatalog.trim();
     if (!cleanDesc) {
@@ -916,16 +2217,46 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
     let finalQtd = newQtd.trim();
     let finalUnid = newUnid || 'unidades';
+    let finalSubtitulo = newSubtitulo.trim() || undefined;
 
-    // Se for rodapé e ainda não tiver sido convertido, converte os metros lineares digitados em barras
-    if (isCurrentProductRodape && !rodapeConvertedRef.current) {
-      const res = convertMetrosToBarras(finalQtd, cleanDesc);
-      if (res && res.barras > 0) {
-        finalQtd = String(res.barras);
+    let rodapeRequestedMl: number | undefined;
+    let rodapeBarLen: number | undefined;
+
+    // Se for rodapé, garante a conversão de ML para barras (sem reinterpretar barras já convertidas) e atualiza detalhe
+    if (isCurrentProductRodape) {
+      const rodConv = triggerRodapeQuantityConversion(finalQtd);
+      if (rodConv) {
+        finalQtd = String(rodConv.barras);
         finalUnid = 'barras';
-        setNewQtd(finalQtd);
-        setNewUnid(finalUnid);
-        rodapeConvertedRef.current = true;
+        finalSubtitulo = rodConv.detailText.trim() || undefined;
+        rodapeRequestedMl = rodConv.requestedMl;
+        rodapeBarLen = rodConv.barLen;
+      }
+    }
+
+    let pisoRequestedSqm = parsePtBrNumeric(finalQtd);
+    let pisoEffectiveSqm = pisoRequestedSqm;
+    let pisoBoxes: number | null = null;
+
+    // Se for Piso Vinílico, sincroniza metragem efetiva das caixas e preserva metragem originalmente solicitada
+    if (isCurrentProductPiso && isSquareMeterUnit(finalUnid) && currentPisoBoxYield) {
+      const conv = applyPisoFromQuantity(finalQtd, true);
+      if (conv) {
+        finalQtd = conv.realSqmDisplay;
+        finalSubtitulo = conv.detailText.trim() || undefined;
+        pisoRequestedSqm = conv.requestedSqm;
+        pisoEffectiveSqm = conv.realSqm;
+        pisoBoxes = conv.boxes;
+      } else {
+        const boxesFromSub = parseBoxesFromDetail(newSubtitulo);
+        if (boxesFromSub && boxesFromSub > 0) {
+          const boxConv = convertBoxesToPisoSqm(boxesFromSub, currentPisoBoxYield);
+          finalQtd = boxConv.realSqmDisplay;
+          finalSubtitulo = formatBoxesDetail(boxesFromSub, newSubtitulo).trim() || undefined;
+          pisoRequestedSqm = boxConv.realSqm;
+          pisoEffectiveSqm = boxConv.realSqm;
+          pisoBoxes = boxConv.boxes;
+        }
       }
     }
 
@@ -945,13 +2276,13 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     }
 
     const itemTotal = Math.round(numQtd * numPreco * 100) / 100;
-    const finalSubtitulo = newSubtitulo.trim() || undefined;
 
     if (editingItemId) {
-      // ATUALIZA O ITEM EXISTENTE SEM DUPLICAR
-      setItems((prev) =>
-        prev.map((it) =>
-          it.id === editingItemId
+      // ATUALIZA O ITEM EXISTENTE SEM DUPLICAR (e recalcula insumos se for piso ou rodapé vinculado)
+      const targetId = editingItemId;
+      setItems((prev) => {
+        const updatedList = prev.map((it) =>
+          it.id === targetId
             ? {
                 ...it,
                 qtd: finalQtd,
@@ -962,10 +2293,110 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                 total: itemTotal,
               }
             : it
-        )
-      );
+        );
+        const editedItem = updatedList.find((it) => it.id === targetId);
+        if (!editedItem) return updatedList;
+
+        if (isPisoVinilicoProduct(editedItem.descricao) && isSquareMeterUnit(editedItem.unidade)) {
+          ensurePisoLinkForExistingBudget({
+            itemsList: updatedList,
+            pisoItem: editedItem,
+            pisoLinks: pisoInsumoLinksRef.current,
+            removedGroups: removedPisoInsumoGroupsRef.current,
+            catalogOverride: dynamicCatalog,
+          });
+          const existingPisoLink = pisoInsumoLinksRef.current.get(targetId);
+          if (existingPisoLink) {
+            existingPisoLink.requestedSqm = pisoRequestedSqm;
+            existingPisoLink.lastEffectiveSqm = pisoEffectiveSqm;
+            existingPisoLink.skipCola = !isPisoVinilicoColado(editedItem.descricao);
+            if (existingPisoLink.hasInsumos) {
+              return syncPisoInsumosInList(updatedList);
+            }
+          }
+          return updatedList;
+        }
+
+        if (isRodapeProduct(editedItem.descricao)) {
+          ensureRodapeLinkForExistingBudget(updatedList, editedItem);
+          const resolvedBarLen =
+            rodapeBarLen ??
+            extractBarLengthFromProductName(editedItem.descricao, 2.4);
+          const existingLink = rodapeInsumoLinksRef.current.get(targetId);
+          const resolvedReqMl =
+            rodapeRequestedMl ??
+            parseRodapeDetails(editedItem.subtitulo)?.metrosDesejados ??
+            existingLink?.requestedMl ??
+            Math.round(numQtd * resolvedBarLen * 100) / 100;
+          if (existingLink) {
+            existingLink.requestedMl = resolvedReqMl;
+            existingLink.lastBarras = numQtd;
+            existingLink.barLengthMeters = resolvedBarLen;
+            if (existingLink.includeColar || existingLink.includeCalafetar) {
+              return syncRodapeInsumosInList(updatedList, editedItem.descricao);
+            }
+          } else {
+            rodapeInsumoLinksRef.current.set(targetId, {
+              barLengthMeters: resolvedBarLen,
+              requestedMl: resolvedReqMl,
+              lastBarras: numQtd,
+              includeColar: false,
+              includeCalafetar: false,
+              calafetarProductId: '',
+            });
+          }
+          return updatedList;
+        }
+
+        const editedPisoInsumoGrp = classifyPisoInsumoGroup(
+          editedItem.descricao,
+          dynamicCatalog
+        );
+        if (editedPisoInsumoGrp) {
+          lockedPisoInsumoGroupsRef.current.add(editedPisoInsumoGrp);
+        }
+        const editedRodapeInsumoGrp = classifyRodapeInsumoGroup(
+          editedItem.descricao,
+          editedItem.unidade,
+          dynamicCatalog
+        );
+        if (editedRodapeInsumoGrp) {
+          lockedRodapeInsumoGroupsRef.current.add(editedRodapeInsumoGrp);
+        }
+        return updatedList;
+      });
       showToast(`Item "${cleanDesc}" atualizado com sucesso!`);
     } else {
+      if (
+        tryOpenPisoInsumosPrompt({
+          name: cleanDesc,
+          category: newCategoria,
+          unit: finalUnid,
+          unitPrice: numPreco,
+          requestedSqm: pisoRequestedSqm,
+          effectiveSqm: pisoEffectiveSqm,
+          boxes: pisoBoxes,
+          subtitulo: finalSubtitulo,
+        })
+      ) {
+        return;
+      }
+
+      if (
+        tryOpenRodapeInsumosPrompt({
+          name: cleanDesc,
+          category: newCategoria,
+          unit: finalUnid,
+          unitPrice: numPreco,
+          barCount: numQtd,
+          barLengthMeters: rodapeBarLen,
+          requestedMl: rodapeRequestedMl,
+          subtitulo: finalSubtitulo,
+        })
+      ) {
+        return;
+      }
+
       // ADICIONA NOVO PRODUTO
       const newItem: EspelhoItem = {
         id: `item_${Date.now()}`,
@@ -984,15 +2415,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     }
 
     // LIMPAR AUTOMATICAMENTE O FORMULÁRIO e deixar pronto para pesquisar outro
-    setEditingItemId(null);
-    setSelectedProductCatalog('');
-    setNewSubtitulo('');
-    setNewQtd('1');
-    setNewUnid('unidades');
-    setNewPrecoUnitario('0,00');
-    rodapeConvertedRef.current = false;
-    setSearchProductQuery('');
-    setProductSubTab('buscar');
+    resetProductForm();
   };
 
   // Remove product from budget
@@ -1000,7 +2423,75 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     if (editingItemId === id) {
       handleCancelEdit();
     }
-    setItems((prev) => prev.filter((i) => i.id !== id));
+    setItemQtdDrafts((prev) => {
+      if (prev[id] === undefined) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    setItems((prev) => {
+      const removedItem = prev.find((i) => i.id === id);
+      const remaining = prev.filter((i) => i.id !== id);
+      if (!removedItem) return remaining;
+
+      const pisoLink = pisoInsumoLinksRef.current.get(id);
+      if (pisoLink) {
+        pisoInsumoLinksRef.current.delete(id);
+        if (pisoLink.hasInsumos) {
+          return syncPisoInsumosInList(remaining);
+        }
+        return remaining;
+      }
+
+      const wasLinkedRodape = rodapeInsumoLinksRef.current.has(id);
+      if (wasLinkedRodape) {
+        rodapeInsumoLinksRef.current.delete(id);
+        return syncRodapeInsumosInList(remaining);
+      }
+
+      // Se o usuário removeu manualmente um insumo de piso ou rodapé, respeita a exclusão
+      const pisoInsumoGrp = classifyPisoInsumoGroup(
+        removedItem.descricao,
+        dynamicCatalog
+      );
+      if (pisoInsumoGrp) {
+        const hasAnotherSameGroup = remaining.some(
+          (it) => classifyPisoInsumoGroup(it.descricao, dynamicCatalog) === pisoInsumoGrp
+        );
+        if (hasAnotherSameGroup) {
+          lockedPisoInsumoGroupsRef.current.add(pisoInsumoGrp);
+        } else {
+          removedPisoInsumoGroupsRef.current.add(pisoInsumoGrp);
+        }
+        return remaining;
+      }
+
+      const rodapeInsumoGrp = classifyRodapeInsumoGroup(
+        removedItem.descricao,
+        removedItem.unidade,
+        dynamicCatalog
+      );
+      if (rodapeInsumoGrp) {
+        const hasAnotherSameGroup = remaining.some(
+          (it) =>
+            classifyRodapeInsumoGroup(it.descricao, it.unidade, dynamicCatalog) ===
+            rodapeInsumoGrp
+        );
+        if (hasAnotherSameGroup) {
+          lockedRodapeInsumoGroupsRef.current.add(rodapeInsumoGrp);
+        } else {
+          removedRodapeInsumoGroupsRef.current.add(rodapeInsumoGrp);
+          rodapeInsumoLinksRef.current.forEach((lnk) => {
+            if (rodapeInsumoGrp === 'colar') lnk.includeColar = false;
+            if (rodapeInsumoGrp === 'calafetar') lnk.includeCalafetar = false;
+          });
+        }
+        return remaining;
+      }
+
+      return remaining;
+    });
   };
 
   // Move product up or down in budget
@@ -1024,21 +2515,110 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     }
   };
 
-  // Edit item quantity directly
+  // Edit item quantity directly (sincroniza Piso Vinílico, Rodapé e seus insumos vinculados)
   const handleItemQtdChange = (id: string, newQtdVal: string) => {
-    setItems((prev) =>
-      prev.map((item) => {
-        if (item.id !== id) return item;
-        const numQtd =
-          parseFloat(newQtdVal.replace(/\./g, '').replace(',', '.')) || 0;
-        const total = Math.round(numQtd * item.precoUnitario * 100) / 100;
-        return {
-          ...item,
-          qtd: newQtdVal,
-          total,
-        };
-      })
-    );
+    setItems((prev) => {
+      const targetItem = prev.find((it) => it.id === id);
+      if (!targetItem) return prev;
+
+      if (
+        isPisoVinilicoProduct(targetItem.descricao) &&
+        isSquareMeterUnit(targetItem.unidade)
+      ) {
+        ensurePisoLinkForExistingBudget({
+          itemsList: prev,
+          pisoItem: targetItem,
+          pisoLinks: pisoInsumoLinksRef.current,
+          removedGroups: removedPisoInsumoGroupsRef.current,
+          catalogOverride: dynamicCatalog,
+        });
+        const existingLink = pisoInsumoLinksRef.current.get(id);
+        const conv = applyPisoTableQuantityChange({
+          item: targetItem,
+          rawQtdVal: newQtdVal,
+          existingLink,
+        });
+
+        if (existingLink) {
+          existingLink.requestedSqm = conv.requestedSqm;
+          existingLink.lastEffectiveSqm = conv.effectiveSqm;
+        } else {
+          pisoInsumoLinksRef.current.set(id, {
+            hasInsumos: false,
+            requestedSqm: conv.requestedSqm,
+            lastEffectiveSqm: conv.effectiveSqm,
+            skipCola: !isPisoVinilicoColado(targetItem.descricao),
+            includePrimerAntiumidade: false,
+          });
+        }
+
+        const updated = prev.map((it) => (it.id === id ? conv.updatedItem : it));
+        return pisoInsumoLinksRef.current.get(id)?.hasInsumos
+          ? syncPisoInsumosInList(updated)
+          : updated;
+      }
+
+      if (isRodapeProduct(targetItem.descricao)) {
+        ensureRodapeLinkForExistingBudget(prev, targetItem);
+        const existingLink = rodapeInsumoLinksRef.current.get(id);
+        const conv = applyRodapeTableQuantityChange({
+          item: targetItem,
+          rawQtdVal: newQtdVal,
+          existingLink,
+          barLengthMeters: existingLink?.barLengthMeters,
+          forceTreatAsMl: true,
+        });
+        if (existingLink) {
+          existingLink.requestedMl = conv.requestedMl > 0 ? conv.requestedMl : undefined;
+          existingLink.lastBarras = conv.bars;
+          existingLink.barLengthMeters = conv.barLen;
+        } else {
+          rodapeInsumoLinksRef.current.set(id, {
+            barLengthMeters: conv.barLen,
+            requestedMl: conv.requestedMl > 0 ? conv.requestedMl : undefined,
+            lastBarras: conv.bars,
+            includeColar: false,
+            includeCalafetar: false,
+            calafetarProductId: '',
+          });
+        }
+        const updated = prev.map((it) => (it.id === id ? conv.updatedItem : it));
+        const activeLink = rodapeInsumoLinksRef.current.get(id);
+        return activeLink && (activeLink.includeColar || activeLink.includeCalafetar)
+          ? syncRodapeInsumosInList(updated, targetItem.descricao)
+          : updated;
+      }
+
+      // Edição manual direta de um insumo na tabela: respeita e trava aquele grupo contra sobrescritas
+      const pisoInsumoGrp = classifyPisoInsumoGroup(
+        targetItem.descricao,
+        dynamicCatalog
+      );
+      if (pisoInsumoGrp) {
+        lockedPisoInsumoGroupsRef.current.add(pisoInsumoGrp);
+      }
+      const rodapeInsumoGrp = classifyRodapeInsumoGroup(
+        targetItem.descricao,
+        targetItem.unidade,
+        dynamicCatalog
+      );
+      if (rodapeInsumoGrp) {
+        lockedRodapeInsumoGroupsRef.current.add(rodapeInsumoGrp);
+      }
+
+      const numQtd =
+        parseFloat(newQtdVal.replace(/\./g, '').replace(',', '.')) || 0;
+      const total = Math.round(numQtd * targetItem.precoUnitario * 100) / 100;
+      return prev.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              qtd: newQtdVal,
+              total,
+            }
+          : item
+      );
+    });
   };
 
   // Edit item unit price directly in the budget
@@ -1247,6 +2827,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
   // Sync initialOrcamento if changed
   useEffect(() => {
     if (initialOrcamento) {
+      resetAllInsumoLinks();
       if (initialOrcamento.clientId) {
         setSelectedClientId(initialOrcamento.clientId);
       }
@@ -1386,6 +2967,12 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         descontoInput,
         descontoTexto,
         hasDescontoEnabled,
+        pisoLinks: Object.fromEntries(pisoInsumoLinksRef.current.entries()),
+        rodapeLinks: Object.fromEntries(rodapeInsumoLinksRef.current.entries()),
+        lockedPisoGroups: Array.from(lockedPisoInsumoGroupsRef.current),
+        removedPisoGroups: Array.from(removedPisoInsumoGroupsRef.current),
+        lockedRodapeGroups: Array.from(lockedRodapeInsumoGroupsRef.current),
+        removedRodapeGroups: Array.from(removedRodapeInsumoGroupsRef.current),
         updatedAt: new Date().toISOString(),
       };
       localStorage.setItem(ACTIVE_DRAFT_KEY, JSON.stringify(draftPayload));
@@ -1530,6 +3117,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         localStorage.removeItem(ACTIVE_DRAFT_KEY);
         localStorage.removeItem('fenix_orcamento_in_progress_draft');
       } catch {}
+      resetAllInsumoLinks();
       setItems([]);
       setNomeOrcamento('');
       setObservacoes('');
@@ -1611,7 +3199,15 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
     const finalNomeOrcamento =
       nomeOrcamento.trim() || 'Orçamento de Materiais';
 
-    const sellerId = getSellerIdForUser(currentUserName) || initialOrcamento?.vendedorId;
+    const resolvedConsultora =
+      initialOrcamento?.consultoraName ||
+      (initialOrcamento as any)?.responsavel ||
+      currentUserName ||
+      consultoraName;
+    const sellerId =
+      initialOrcamento?.vendedorId ||
+      getSellerIdForUser(resolvedConsultora) ||
+      getSellerIdForUser(currentUserName);
 
     const orcamentoData: SavedOrcamento = {
       id: orcId,
@@ -1620,7 +3216,7 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
       clientType: clientType || initialOrcamento?.clientType,
       clientContact: clientContact || initialOrcamento?.clientContact || currentClient?.phone || currentClient?.whatsapp || (currentClient as any)?.celular || '',
       nomeOrcamento: finalNomeOrcamento,
-      consultoraName: initialOrcamento?.consultoraName || currentUserName || consultoraName,
+      consultoraName: resolvedConsultora,
       registeredBy: initialOrcamento?.registeredBy || currentUserName || consultoraName,
       vendedorId: sellerId,
       dataOrcamento,
@@ -1664,12 +3260,13 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
 
     window.dispatchEvent(new Event('fenix_orcamentos_updated'));
 
-    // 2. Sincronização automática e robusta com a aba Follow-up (novo card ou atualização sem duplicatas)
+    // 2. Sincronização automática e robusta com a aba Follow-up (novo card ou atualização 1:1 sem duplicatas)
     let followUpItemToSave: any = null;
     try {
       followUpItemToSave = await syncSingleOrcamentoToFollowUp(orcamentoData, {
         currentUser: currentUserName || consultoraName,
         isEdit: Boolean(initialOrcamento),
+        skipSupabaseSave: true,
       });
     } catch (fupErr) {
       console.warn('Erro ao sincronizar orçamento com Follow-up:', fupErr);
@@ -2376,27 +3973,40 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         <div className="flex items-center gap-2 p-1.5 bg-slate-100/90 rounded-2xl overflow-x-auto border border-slate-200/80">
           <button
             type="button"
+            onClick={() => setProductSubTab('rapido')}
+            className={`flex-1 min-w-[165px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+              productSubTab === 'rapido'
+                ? 'bg-white text-[#0057ff] shadow-sm border border-slate-200/60'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
+            }`}
+          >
+            <Calculator className="w-4 h-4" />
+            <span>1. Orçamento Rápido</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setProductSubTab('buscar')}
-            className={`flex-1 min-w-[160px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+            className={`flex-1 min-w-[155px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
               productSubTab === 'buscar'
                 ? 'bg-white text-[#0057ff] shadow-sm border border-slate-200/60'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
             }`}
           >
             <Search className="w-4 h-4" />
-            <span>1. Barra de Busca</span>
+            <span>2. Barra de Busca</span>
           </button>
 
           <button
             type="button"
             onClick={() => setProductSubTab('categorias')}
-            className={`flex-1 min-w-[160px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+            className={`flex-1 min-w-[165px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
               productSubTab === 'categorias'
                 ? 'bg-white text-[#0057ff] shadow-sm border border-slate-200/60'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
             }`}
           >
-            <span>2. Escolher Categoria</span>
+            <span>3. Escolher Categoria</span>
             {selectedCategoryId && (
               <span className="w-2 h-2 rounded-full bg-blue-500" />
             )}
@@ -2405,14 +4015,14 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
           <button
             type="button"
             onClick={() => setProductSubTab('produtos')}
-            className={`flex-1 min-w-[180px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+            className={`flex-1 min-w-[175px] py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
               productSubTab === 'produtos'
                 ? 'bg-white text-[#0057ff] shadow-sm border border-slate-200/60'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
             }`}
           >
             <Plus className="w-4 h-4" />
-            <span>3. Adicionar Produtos</span>
+            <span>4. Adicionar Produtos</span>
             {selectedProductCatalog ? (
               <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-700">
                 Puxado ✓
@@ -2422,7 +4032,388 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         </div>
 
         {/* ======================================================== */}
-        {/* ABA 1: BARRA DE BUSCA COM DROPDOWN IMEDIATO EMBAIXO */}
+        {/* ABA 1: ORÇAMENTO RÁPIDO */}
+        {/* ======================================================== */}
+        {productSubTab === 'rapido' && (
+          <form onSubmit={handleGenerateQuickBudget} className="space-y-4 animate-in fade-in-50 duration-200">
+            <div className="bg-blue-50/50 p-4 rounded-2xl border border-blue-100/80 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs sm:text-sm font-bold text-slate-800 flex items-center gap-1.5">
+                    <Calculator className="w-4 h-4 text-[#0057ff]" />
+                    Orçamento Rápido de Piso e Rodapé
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Informe as metragens e selecione os produtos do cadastro. Os valores da tabela {getOfficialPriceTableLabel(priceTable)} são aplicados automaticamente ao inserir no orçamento.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuickPisoSqm('');
+                    setQuickRodapeMl('');
+                    resetQuickRodapeConversionRefs();
+                    setQuickPisoType('colado');
+                    setQuickRodapeHeight('07cm');
+                    setQuickIncluirInsumosPiso('sim');
+                    setQuickIncluirInsumosRodape('sim');
+                    setQuickIsGroundFloor('nao');
+                  }}
+                  className="text-xs font-bold text-slate-500 hover:text-[#0057ff] flex items-center gap-1 cursor-pointer self-start sm:self-auto"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Limpar</span>
+                </button>
+              </div>
+
+              {/* Linha 1: Metragens e Tipos */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-3.5">
+                {/* Metragem do piso (m²) */}
+                <div className="lg:col-span-3 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Metragem do piso (m²)
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={quickPisoSqm}
+                    onChange={(e) => setQuickPisoSqm(e.target.value)}
+                    placeholder="Ex: 50"
+                    className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                  />
+                </div>
+
+                {/* Rodapé (ml) */}
+                <div className="lg:col-span-2 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Rodapé (ml)
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={quickRodapeMl}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setQuickRodapeMl(val);
+                      if (quickRodapeDebounceRef.current) {
+                        clearTimeout(quickRodapeDebounceRef.current);
+                        quickRodapeDebounceRef.current = null;
+                      }
+                      const parsed = parsePtBrNumeric(val);
+                      if (
+                        quickRodapeLastBarrasRef.current !== null &&
+                        Math.abs(parsed - quickRodapeLastBarrasRef.current) <= 0.005
+                      ) {
+                        return;
+                      }
+                      quickRodapeLastBarrasRef.current = null;
+                      if (!val.trim() || parsed <= 0) {
+                        quickRodapeRequestedMlRef.current = null;
+                        return;
+                      }
+                      quickRodapeRequestedMlRef.current = parsed;
+                      quickRodapeDebounceRef.current = setTimeout(() => {
+                        quickRodapeDebounceRef.current = null;
+                        resolveQuickRodapeConversion(val, true);
+                      }, 650);
+                    }}
+                    onBlur={() => {
+                      if (quickRodapeDebounceRef.current) {
+                        clearTimeout(quickRodapeDebounceRef.current);
+                        quickRodapeDebounceRef.current = null;
+                      }
+                      resolveQuickRodapeConversion(quickRodapeMl, true);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        if (quickRodapeDebounceRef.current) {
+                          clearTimeout(quickRodapeDebounceRef.current);
+                          quickRodapeDebounceRef.current = null;
+                        }
+                        resolveQuickRodapeConversion(quickRodapeMl, true);
+                      }
+                    }}
+                    placeholder="Ex: 80"
+                    className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
+                  />
+                </div>
+
+                {/* Tipo de piso: Colado ou Clicado */}
+                <div className="lg:col-span-3 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Tipo de piso
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
+                    <button
+                      type="button"
+                      onClick={() => setQuickPisoType('colado')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickPisoType === 'colado'
+                          ? 'bg-[#0057ff] text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Colado
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQuickPisoType('clicado')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickPisoType === 'clicado'
+                          ? 'bg-[#0057ff] text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Clicado
+                    </button>
+                  </div>
+                </div>
+
+                {/* Rodapé: 07 cm, 10 cm, 12 cm ou 15 cm */}
+                <div className="lg:col-span-4 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Rodapé
+                  </label>
+                  <div className="grid grid-cols-4 gap-1 bg-white p-1 rounded-xl border border-slate-300 h-11">
+                    {(['07cm', '10cm', '12cm', '15cm'] as QuickBudgetRodapeHeight[]).map(
+                      (heightKey) => {
+                        const label = heightKey.replace('cm', ' cm');
+                        const isActive = quickRodapeHeight === heightKey;
+                        return (
+                          <button
+                            key={heightKey}
+                            type="button"
+                            onClick={() => setQuickRodapeHeight(heightKey)}
+                            className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                              isActive
+                                ? 'bg-[#0057ff] text-white shadow-xs'
+                                : 'text-slate-600 hover:bg-slate-100'
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        );
+                      }
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Linha 2: Perguntas Sim / Não */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+                {/* Incluir insumos do piso? */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Incluir insumos do piso?
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
+                    <button
+                      type="button"
+                      onClick={() => setQuickIncluirInsumosPiso('sim')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIncluirInsumosPiso === 'sim'
+                          ? 'bg-[#0057ff] text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Sim
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQuickIncluirInsumosPiso('nao')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIncluirInsumosPiso === 'nao'
+                          ? 'bg-slate-800 text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Não
+                    </button>
+                  </div>
+                </div>
+
+                {/* Incluir insumos do rodapé? */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    Incluir insumos do rodapé?
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
+                    <button
+                      type="button"
+                      onClick={() => setQuickIncluirInsumosRodape('sim')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIncluirInsumosRodape === 'sim'
+                          ? 'bg-[#0057ff] text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Sim
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQuickIncluirInsumosRodape('nao')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIncluirInsumosRodape === 'nao'
+                          ? 'bg-slate-800 text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Não
+                    </button>
+                  </div>
+                </div>
+
+                {/* O ambiente é térreo? (padrão obrigatório: Não) */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700 block">
+                    O ambiente é térreo?
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-slate-300 h-11">
+                    <button
+                      type="button"
+                      onClick={() => setQuickIsGroundFloor('sim')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIsGroundFloor === 'sim'
+                          ? 'bg-amber-600 text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Sim
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQuickIsGroundFloor('nao')}
+                      className={`rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        quickIsGroundFloor === 'nao'
+                          ? 'bg-slate-800 text-white shadow-xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      Não
+                    </button>
+                  </div>
+                  {quickIsGroundFloor === 'sim' && quickIncluirInsumosPiso === 'sim' && (
+                    <p className="text-[11px] font-semibold text-amber-700">
+                      Primer Antiumidade será incluído (rendimento 5 m²/un).
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* Produtos consultados diretamente do catálogo do CRM (sem exibição de preços na seleção) */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                <div className="bg-white rounded-xl border border-slate-200/90 p-3 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                      Piso ({quickPisoType === 'colado' ? 'Colado' : 'Clicado'})
+                    </span>
+                    {activeQuickPisoProduct && (
+                      <span className="text-[10px] font-bold text-slate-400 uppercase">
+                        {activeQuickPisoProduct.category}
+                      </span>
+                    )}
+                  </div>
+                  {quickPisoCandidates.length > 0 ? (
+                    <select
+                      value={activeQuickPisoProduct?.id || ''}
+                      onChange={(e) =>
+                        setQuickSelectedPisoByType((prev) => ({
+                          ...prev,
+                          [quickPisoType]: e.target.value,
+                        }))
+                      }
+                      className="w-full h-9 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-[#0057ff] cursor-pointer"
+                    >
+                      {quickPisoCandidates.map((prod) => (
+                        <option key={prod.id} value={prod.id}>
+                          {prod.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <p className="text-xs text-rose-600 font-semibold">
+                      Nenhum piso {quickPisoType} da categoria Piso Vinílico encontrado no cadastro.
+                    </p>
+                  )}
+                  {quickBudgetPreview.reqPiso > 0 && activeQuickPisoProduct && (
+                    <p className="text-[11px] font-medium text-slate-600">
+                      Cálculo:{' '}
+                      <strong className="text-slate-900">
+                        {quickBudgetPreview.pisoBoxes
+                          ? `${quickBudgetPreview.pisoBoxes} ${quickBudgetPreview.pisoBoxes === 1 ? 'caixa' : 'caixas'} (${quickBudgetPreview.pisoEffectiveDisplay} m²)`
+                          : `${quickBudgetPreview.pisoEffectiveDisplay} m²`}
+                      </strong>
+                    </p>
+                  )}
+                </div>
+
+                <div className="bg-white rounded-xl border border-slate-200/90 p-3 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                      Rodapé configurado ({quickRodapeHeight.replace('cm', ' cm')})
+                    </span>
+                    {activeQuickRodapeProduct && (
+                      <span className="text-[10px] font-bold text-slate-400 uppercase">
+                        {activeQuickRodapeProduct.category}
+                      </span>
+                    )}
+                  </div>
+                  {quickRodapeCandidates.length > 0 ? (
+                    <select
+                      value={activeQuickRodapeProduct?.id || ''}
+                      onChange={(e) =>
+                        setQuickSelectedRodapeByHeight((prev) => ({
+                          ...prev,
+                          [quickRodapeHeight]: e.target.value,
+                        }))
+                      }
+                      className="w-full h-9 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-[#0057ff] cursor-pointer"
+                    >
+                      {quickRodapeCandidates.map((prod) => (
+                        <option key={prod.id} value={prod.id}>
+                          {prod.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <p className="text-xs text-rose-600 font-semibold">
+                      Nenhum rodapé de {quickRodapeHeight.replace('cm', ' cm')} encontrado no cadastro.
+                    </p>
+                  )}
+                  {quickBudgetPreview.reqRodape > 0 && activeQuickRodapeProduct && (
+                    <p className="text-[11px] font-medium text-slate-600">
+                      Solicitado: <strong className="text-slate-900">{quickBudgetPreview.reqRodapeDisplay} ml</strong> •{' '}
+                      <strong className="text-slate-900">
+                        {quickBudgetPreview.rodapeBarras}{' '}
+                        {quickBudgetPreview.rodapeBarras === 1 ? 'barra' : 'barras'} (
+                        {quickBudgetPreview.rodapeEffectiveMlDisplay} ml)
+                      </strong>
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                <p className="text-xs text-slate-500">
+                  {quickBudgetPreview.reqPiso > 0 && quickBudgetPreview.pisoYield
+                    ? `Insumos do piso calculados sobre ${formatSqmPtBr(quickBudgetPreview.reqPiso)} m² solicitados.`
+                    : 'Preencha ao menos uma metragem (piso ou rodapé) para gerar.'}
+                </p>
+                <button
+                  type="submit"
+                  className="h-11 px-6 rounded-xl bg-[#0057ff] hover:bg-[#0048db] text-white font-bold text-sm shadow-md shadow-blue-500/20 flex items-center justify-center gap-2 transition-all cursor-pointer shrink-0"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Gerar Orçamento</span>
+                </button>
+              </div>
+            </div>
+          </form>
+        )}
+
+        {/* ======================================================== */}
+        {/* ABA 2: BARRA DE BUSCA COM DROPDOWN IMEDIATO EMBAIXO */}
         {/* ======================================================== */}
         {productSubTab === 'buscar' && (
           <div className="space-y-3 animate-in fade-in-50 duration-200">
@@ -2905,7 +4896,8 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                   <input
                     type="text"
                     value={newSubtitulo || ''}
-                    onChange={(e) => setNewSubtitulo(e.target.value)}
+                    onChange={(e) => handlePisoDetalheInputChange(e.target.value)}
+                    onBlur={handlePisoDetalheInputBlur}
                     placeholder="Ex: cor, quantidade de caixas, lote..."
                     className="w-full h-11 rounded-xl border border-slate-300 bg-white px-3 text-xs sm:text-sm text-slate-800 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs placeholder:text-slate-400"
                     title="Preencha manualmente informações como cor, quantidade de caixas, lote, réguas, etc."
@@ -2927,29 +4919,68 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                       const val = e.target.value;
                       setNewQtd(val);
                       if (isCurrentProductRodape) {
-                        rodapeConvertedRef.current = false;
                         if (rodapeDebounceTimerRef.current) {
                           clearTimeout(rodapeDebounceTimerRef.current);
+                          rodapeDebounceTimerRef.current = null;
+                        }
+                        const explicitBars = parseBarCountFromInput(val);
+                        if (explicitBars && explicitBars > 0) {
+                          const barLen = extractBarLengthFromProductName(selectedProductCatalog, 2.4);
+                          rodapeLastBarrasRef.current = explicitBars;
+                          rodapeRequestedMlRef.current = Math.round(explicitBars * barLen * 100) / 100;
+                          return;
+                        }
+                        const parsedVal = parsePtBrNumeric(val);
+                        if (
+                          rodapeLastBarrasRef.current !== null &&
+                          Math.abs(parsedVal - rodapeLastBarrasRef.current) <= 0.005
+                        ) {
+                          return;
+                        }
+                        rodapeLastBarrasRef.current = null;
+                        if (!val.trim() || parsedVal <= 0) {
+                          rodapeRequestedMlRef.current = null;
+                          return;
                         }
                         rodapeDebounceTimerRef.current = setTimeout(() => {
+                          rodapeDebounceTimerRef.current = null;
                           triggerRodapeQuantityConversion(val);
-                        }, 700);
+                        }, 650);
+                      } else if (isCurrentProductPiso && isSquareMeterUnit(newUnid) && currentPisoBoxYield) {
+                        handlePisoQuantityInputChange(val);
                       }
                     }}
                     onBlur={() => {
                       if (isCurrentProductRodape) {
                         if (rodapeDebounceTimerRef.current) {
                           clearTimeout(rodapeDebounceTimerRef.current);
+                          rodapeDebounceTimerRef.current = null;
                         }
-                        triggerRodapeQuantityConversion();
+                        triggerRodapeQuantityConversion(newQtd);
+                      } else if (isCurrentProductPiso && isSquareMeterUnit(newUnid) && currentPisoBoxYield) {
+                        if (pisoQtdDebounceRef.current) {
+                          clearTimeout(pisoQtdDebounceRef.current);
+                          pisoQtdDebounceRef.current = null;
+                        }
+                        applyPisoFromQuantity(newQtd, true);
                       }
                     }}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter' && isCurrentProductRodape) {
-                        if (rodapeDebounceTimerRef.current) {
-                          clearTimeout(rodapeDebounceTimerRef.current);
+                      if (e.key === 'Enter') {
+                        if (isCurrentProductRodape) {
+                          e.preventDefault();
+                          if (rodapeDebounceTimerRef.current) {
+                            clearTimeout(rodapeDebounceTimerRef.current);
+                            rodapeDebounceTimerRef.current = null;
+                          }
+                          triggerRodapeQuantityConversion(newQtd);
+                        } else if (isCurrentProductPiso && isSquareMeterUnit(newUnid) && currentPisoBoxYield) {
+                          if (pisoQtdDebounceRef.current) {
+                            clearTimeout(pisoQtdDebounceRef.current);
+                            pisoQtdDebounceRef.current = null;
+                          }
+                          applyPisoFromQuantity(newQtd, true);
                         }
-                        triggerRodapeQuantityConversion();
                       }
                     }}
                     className="w-full h-11 rounded-xl border border-slate-300 bg-white px-2 text-center text-xs sm:text-sm font-extrabold text-slate-900 outline-none focus:border-[#0057ff] focus:ring-2 focus:ring-blue-500/10 shadow-2xs"
@@ -3098,11 +5129,76 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
                       <td className="py-2 px-3 text-center" onClick={(e) => e.stopPropagation()}>
                         <input
                           type="text"
-                          value={item.qtd || ''}
-                          onChange={(e) =>
-                            handleItemQtdChange(item.id, e.target.value)
+                          value={
+                            itemQtdDrafts[item.id] !== undefined
+                              ? itemQtdDrafts[item.id]
+                              : (item.qtd || '')
                           }
-                          className="w-14 h-8 text-center font-bold text-slate-900 border border-slate-200 rounded-lg outline-none focus:border-blue-500"
+                          onFocus={() => {
+                            setItemQtdDrafts((prev) =>
+                              prev[item.id] !== undefined
+                                ? prev
+                                : { ...prev, [item.id]: item.qtd || '' }
+                            );
+                          }}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setItemQtdDrafts((prev) => ({ ...prev, [item.id]: val }));
+                            if (isRodapeProduct(item.descricao)) {
+                              const existingTimer = tableRodapeDebounceMapRef.current.get(item.id);
+                              if (existingTimer) {
+                                clearTimeout(existingTimer);
+                                tableRodapeDebounceMapRef.current.delete(item.id);
+                              }
+                              const trimmed = val.trim();
+                              const explicit = parseBarCountFromInput(trimmed);
+                              const parsed = parsePtBrNumeric(trimmed);
+                              if ((explicit && explicit > 0) || parsed > 0) {
+                                const timer = setTimeout(() => {
+                                  tableRodapeDebounceMapRef.current.delete(item.id);
+                                  handleItemQtdChange(item.id, val);
+                                  setItemQtdDrafts((prev) => {
+                                    if (prev[item.id] === undefined) return prev;
+                                    const next = { ...prev };
+                                    delete next[item.id];
+                                    return next;
+                                  });
+                                }, 650);
+                                tableRodapeDebounceMapRef.current.set(item.id, timer);
+                              }
+                            } else {
+                              handleItemQtdChange(item.id, val);
+                            }
+                          }}
+                          onBlur={() => {
+                            if (isRodapeProduct(item.descricao)) {
+                              const existingTimer = tableRodapeDebounceMapRef.current.get(item.id);
+                              if (existingTimer) {
+                                clearTimeout(existingTimer);
+                                tableRodapeDebounceMapRef.current.delete(item.id);
+                              }
+                              const draftVal = itemQtdDrafts[item.id];
+                              if (
+                                draftVal !== undefined &&
+                                draftVal.trim() !== '' &&
+                                draftVal !== item.qtd
+                              ) {
+                                handleItemQtdChange(item.id, draftVal);
+                              }
+                            }
+                            setItemQtdDrafts((prev) => {
+                              if (prev[item.id] === undefined) return prev;
+                              const next = { ...prev };
+                              delete next[item.id];
+                              return next;
+                            });
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              (e.target as HTMLInputElement).blur();
+                            }
+                          }}
+                          className="w-16 h-8 text-center font-bold text-slate-900 border border-slate-200 rounded-lg outline-none focus:border-blue-500"
                         />
                       </td>
                       <td className="py-2 px-4">
@@ -3869,6 +5965,25 @@ export const OrcamentoScreen: React.FC<OrcamentoScreenProps> = ({
         currentUserName={currentUserName}
         initialName={cadastrarInitialName}
         priceTableTier={priceTable}
+      />
+
+      {/* Modal de Confirmação de Insumos para Piso Vinílico Colado */}
+      <ModalIncluirInsumosPiso
+        isOpen={Boolean(pendingPisoPrompt)}
+        plan={pendingPisoPrompt?.plan || null}
+        onCancel={() => setPendingPisoPrompt(null)}
+        onConfirmPisoOnly={() => commitPisoPrompt(false)}
+        onConfirmWithInsumos={() => commitPisoPrompt(true)}
+      />
+
+      {/* Modal de Confirmação de Insumos para Rodapé */}
+      <ModalIncluirInsumosRodape
+        isOpen={Boolean(pendingRodapePrompt)}
+        plan={pendingRodapePrompt?.plan || null}
+        hidePrices={Boolean(pendingRodapePrompt?.preserveQuickTab)}
+        onCancel={() => setPendingRodapePrompt(null)}
+        onConfirmRodapeOnly={() => commitRodapePrompt(null)}
+        onConfirmWithInsumos={(selection) => commitRodapePrompt(selection)}
       />
     </div>
   );

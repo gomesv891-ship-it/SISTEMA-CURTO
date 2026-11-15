@@ -191,15 +191,6 @@ export const SHEET_SCHEMAS: Record<string, string[]> = {
     'tags',
     'updatedAt',
   ],
-  CHAT: [
-    'id',
-    'remetente',
-    'destinatario',
-    'mensagem',
-    'dataHora',
-    'lida',
-    'tipo',
-  ],
   CONFIGURACOES: [
     'chave',
     'valor',
